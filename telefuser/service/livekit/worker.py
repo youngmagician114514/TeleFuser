@@ -15,6 +15,7 @@ from telefuser.utils.logging import logger
 from .config import LiveKitServeConfig
 from .data_protocol import TF_CONTROL_TOPIC, normalize_control_message
 from .media_bridge import split_chunk_media
+from .metric_facts import build_observability_payload
 from .pipeline_adapter import LiveKitPipelineAdapter
 from .room_client import LiveKitRoomClient, RoomClient
 from .schemas import SessionStatus
@@ -325,19 +326,10 @@ class LiveKitWorker:
                 break
             model_output_callback = getattr(self.event_sink, "on_model_output", None)
             if callable(model_output_callback) and self._pipeline_session_id is not None:
-                chunk_data_for_metrics = chunk.get("data") if isinstance(chunk.get("data"), dict) else chunk
-                scheduler = (
-                    chunk_data_for_metrics.get("scheduler") if isinstance(chunk_data_for_metrics, dict) else None
-                )
                 model_output_callback(
                     self.worker_id,
                     self._pipeline_session_id,
-                    {
-                        "type": chunk.get("type"),
-                        "fps": chunk_data_for_metrics.get("fps", chunk.get("fps", self.config.default_fps)),
-                        "scheduler": dict(scheduler) if isinstance(scheduler, dict) else {},
-                        "frame_count": len(frames),
-                    },
+                    build_observability_payload(chunk, frame_count=len(frames)),
                 )
             decoded_ready_at = chunk.get("timestamp")
             publish_started_at = time.time()

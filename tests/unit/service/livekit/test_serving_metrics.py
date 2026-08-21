@@ -129,6 +129,42 @@ def test_serving_metrics_render_scheduler_pipeline_slo_and_no_session_id_labels(
     }
 
 
+def test_serving_metrics_accepts_generic_status_measurements() -> None:
+    runtime = _runtime()
+    created = runtime.create_session(SessionCreateRequest(identity="controller", config={"fps": 12}))
+    runtime.on_pipeline_session(created.record.session_id, "pipeline-session-1")
+    runtime.on_session_status(created.record.session_id, "running")
+
+    runtime.on_model_output(
+        "worker-0",
+        "pipeline-session-1",
+        {
+            "type": "status",
+            "stage": "chunk_sent",
+            "fps": 12,
+            "measurement": {
+                "frames": 12,
+                "compute_seconds": 0.7,
+                "phases": {
+                    "encode_actor_seconds": 0.1,
+                    "denoise_worker_seconds": 0.5,
+                    "decode_worker_seconds": 0.1,
+                },
+            },
+            "runtime_metrics": {"first_chunk_seconds": 1.2},
+            "scheduler_metrics": {"first_output_latency_seconds": 0.8},
+        },
+    )
+
+    rendered = runtime.prometheus_metrics()
+
+    assert "telefuser_serving_chunk_latency_seconds_count 1" in rendered
+    assert 'telefuser_serving_pipeline_stage_latency_seconds_bucket{le="0.1",stage="vae_encode"} 1' in rendered
+    assert 'telefuser_serving_pipeline_stage_latency_seconds_bucket{le="0.5",stage="dit"} 1' in rendered
+    assert 'telefuser_serving_pipeline_stage_latency_seconds_bucket{le="0.1",stage="vae_decode"} 1' in rendered
+    assert 'telefuser_serving_slo_chunks_total{result="met"} 1' in rendered
+
+
 def test_serving_metrics_records_migration_errors() -> None:
     runtime = _runtime()
     runtime._serving_metrics.record_migration(success=False, error="CUDA out of memory")
@@ -299,3 +335,25 @@ def test_serving_metrics_distinguish_native_taew_batch_from_dit_batch() -> None:
     assert "telefuser_serving_worker_taew_decode_mode" in rendered
     assert "telefuser_serving_taew_decode_synchronized_items_total{mode=" not in rendered
     assert "telefuser_serving_taew_decode_serial_fallback_items_total{mode=" not in rendered
+
+
+def test_serving_metrics_prune_terminal_session_runtime_facts() -> None:
+    runtime = _runtime()
+    created = runtime.create_session(SessionCreateRequest(identity="controller", config={"fps": 12}))
+    runtime.on_pipeline_session(created.record.session_id, "pipeline-session-1")
+    runtime.on_model_output(
+        "worker-0",
+        "pipeline-session-1",
+        {"type": "status", "runtime_metrics": {"active": 1}},
+    )
+
+    runtime._finish_session(created.record.session_id)
+    summary = runtime.serving_metrics_snapshot()["summary"]
+
+    assert summary["frame_credit"] == {
+        "tracked_sessions": 0,
+        "queued_frames": 0,
+        "publisher_unsubmitted_frames": 0,
+        "total_frames": 0,
+    }
+    assert runtime._serving_metrics._session_runtime_metrics == {}

@@ -15,6 +15,8 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from .metric_facts import extract_serving_output_facts, merge_scalar_maps
+
 if TYPE_CHECKING:
     from .runtime import LiveKitServeRuntime
 
@@ -81,6 +83,8 @@ class LiveKitServingMetrics:
         self._histograms: dict[tuple[str, tuple[tuple[str, str], ...]], _Histogram] = {}
         self._pending_action_at: dict[str, float] = {}
         self._frame_events: deque[tuple[float, str, int]] = deque()
+        self._worker_runtime_metrics: dict[str, dict[str, object]] = {}
+        self._session_runtime_metrics: dict[str, dict[str, object]] = {}
 
     def record_admission(self, result: str) -> None:
         self._inc("telefuser_serving_session_admissions_total", {"result": result})
@@ -121,58 +125,48 @@ class LiveKitServingMetrics:
         runtime_metrics: dict[str, Any] | None = None,
         session_runtime_metrics: dict[str, Any] | None = None,
     ) -> None:
-        """Ingest a model output before network transport and frame pacing."""
-        del worker_id, runtime_metrics, session_runtime_metrics
-        if not isinstance(payload, dict):
-            return
-        if payload.get("type") == "error":
+        """Ingest bounded facts from media chunks and model status messages."""
+        facts = extract_serving_output_facts(
+            payload,
+            runtime_metrics=runtime_metrics,
+            session_runtime_metrics=session_runtime_metrics,
+        )
+        if facts.kind == "error":
             self._inc("telefuser_serving_model_outputs_total", {"result": "error"})
-            self._record_error(str(payload.get("error", "model output error")))
+            error = payload.get("error") if isinstance(payload, dict) else None
+            self._record_error(str(error or "model output error"))
             return
-        if payload.get("type") != "chunk":
+        if facts.kind not in {"chunk", "status"}:
+            return
+        if facts.kind == "status" and not facts.has_metrics:
             return
 
-        scheduler = payload.get("scheduler")
-        if not isinstance(scheduler, dict):
-            nested = payload.get("data")
-            scheduler = (
-                nested.get("scheduler")
-                if isinstance(nested, dict) and isinstance(nested.get("scheduler"), dict)
-                else {}
-            )
-        frames = payload.get("frames")
-        if not isinstance(frames, (list, tuple)):
-            nested = payload.get("data")
-            frames = nested.get("frames") if isinstance(nested, dict) else None
-        if isinstance(frames, (list, tuple)):
-            frame_count = len(frames)
-        else:
-            frame_count = int(self._nonnegative(payload.get("frame_count")) or 0)
+        scheduler = facts.scheduler
         batch_size = self._positive(scheduler.get("batch_size"), default=1.0)
         compute_seconds = self._nonnegative(scheduler.get("compute_seconds"))
         queue_wait_seconds = self._nonnegative(scheduler.get("queue_wait_seconds"))
         taew_decode = self._taew_decode_measurement(scheduler)
-
         with self._lock:
-            self._inc_locked("telefuser_serving_model_outputs_total", {"result": "chunk"})
-            self._inc_locked("telefuser_serving_chunks_total", {"result": "processed"})
-            # Every member observes the same batch. Fractional counting makes
-            # the total exactly one per coalesced execution after all members.
-            self._inc_locked("telefuser_serving_batches_total", {}, amount=1.0 / batch_size)
-            self._inc_locked("telefuser_serving_batch_items_total", {})
-            self._observe_locked("telefuser_serving_batch_size", {}, batch_size, buckets=_BATCH_BUCKETS)
-            if taew_decode is not None:
-                mode, items, invocations = taew_decode
-                # Each session output carries the same batch-level facts.  Count
-                # one logical item per output and split native decoder calls
-                # across those items, so a DiT B=2 serial fallback contributes
-                # two TAeW invocations while a synchronized decode contributes one.
-                self._inc_locked(f"telefuser_serving_taew_decode_{mode}_items_total", {})
-                self._inc_locked(
-                    f"telefuser_serving_taew_decode_{mode}_executions_total",
-                    {},
-                    amount=invocations / items,
-                )
+            if facts.worker_metrics:
+                self._worker_runtime_metrics.setdefault(worker_id, {}).update(facts.worker_metrics)
+            if facts.session_metrics:
+                self._session_runtime_metrics.setdefault(pipeline_session_id, {}).update(facts.session_metrics)
+            if facts.kind == "chunk":
+                self._inc_locked("telefuser_serving_model_outputs_total", {"result": "chunk"})
+                self._inc_locked("telefuser_serving_chunks_total", {"result": "processed"})
+                # Every member observes the same batch; fractional counting keeps
+                # one batch total for a coalesced execution.
+                self._inc_locked("telefuser_serving_batches_total", {}, amount=1.0 / batch_size)
+                self._inc_locked("telefuser_serving_batch_items_total", {})
+                self._observe_locked("telefuser_serving_batch_size", {}, batch_size, buckets=_BATCH_BUCKETS)
+                if taew_decode is not None:
+                    mode, items, invocations = taew_decode
+                    self._inc_locked(f"telefuser_serving_taew_decode_{mode}_items_total", {})
+                    self._inc_locked(
+                        f"telefuser_serving_taew_decode_{mode}_executions_total",
+                        {},
+                        amount=invocations / items,
+                    )
             if compute_seconds is not None:
                 self._observe_locked("telefuser_serving_chunk_latency_seconds", {}, compute_seconds)
             if queue_wait_seconds is not None:
@@ -190,10 +184,13 @@ class LiveKitServingMetrics:
                 if value is not None:
                     self._observe_locked("telefuser_serving_pipeline_stage_latency_seconds", {"stage": stage}, value)
 
-            fps = self._session_fps(runtime, pipeline_session_id, payload)
+            fps_payload = dict(payload)
+            if facts.fps is not None and fps_payload.get("fps") is None:
+                fps_payload["fps"] = facts.fps
+            fps = self._session_fps(runtime, pipeline_session_id, fps_payload)
             elapsed = (compute_seconds or 0.0) + (queue_wait_seconds or 0.0)
-            if frame_count and fps is not None and elapsed > 0:
-                budget = frame_count / fps
+            if facts.frame_count and fps is not None and elapsed > 0:
+                budget = facts.frame_count / fps
                 self._observe_locked("telefuser_serving_slo_budget_seconds", {}, budget)
                 self._inc_locked(
                     "telefuser_serving_slo_chunks_total",
@@ -259,11 +256,24 @@ class LiveKitServingMetrics:
         snapshot_fn = getattr(runtime.worker_pool, "turboserve_snapshot", None)
         routing = snapshot_fn() if callable(snapshot_fn) else {}
         routing = routing if isinstance(routing, dict) else {}
-        worker_metrics = routing.get("worker_runtime_metrics", {})
-        worker_metrics = worker_metrics if isinstance(worker_metrics, dict) else {}
-        session_metrics = routing.get("session_runtime_metrics", {})
-        session_metrics = session_metrics if isinstance(session_metrics, dict) else {}
-        frame_credit_sessions = tuple(values for values in session_metrics.values() if isinstance(values, dict))
+        active_pipeline_session_ids = {
+            record.pipeline_session_id
+            for record in records
+            if record.pipeline_session_id is not None and record.status not in _TERMINAL_STATUSES
+        }
+        with self._lock:
+            for key in tuple(self._session_runtime_metrics):
+                if key not in active_pipeline_session_ids:
+                    self._session_runtime_metrics.pop(key, None)
+            local_worker_metrics = {key: dict(value) for key, value in self._worker_runtime_metrics.items()}
+            local_session_metrics = {key: dict(value) for key, value in self._session_runtime_metrics.items()}
+        worker_metrics = self._merge_runtime_maps(routing.get("worker_runtime_metrics"), local_worker_metrics)
+        session_metrics = self._merge_runtime_maps(routing.get("session_runtime_metrics"), local_session_metrics)
+        frame_credit_sessions = tuple(
+            values
+            for key, values in session_metrics.items()
+            if key in active_pipeline_session_ids and isinstance(values, dict)
+        )
         frame_credit = {
             "tracked_sessions": int(
                 sum(bool(values.get("publisher_frame_tracking_enabled", 0)) for values in frame_credit_sessions)
@@ -337,7 +347,7 @@ class LiveKitServingMetrics:
         ):
             gauge(
                 "telefuser_serving_frame_credit_frames",
-                "Frames retained between ABot output and LiveKit capture_frame",
+                "Frames retained between model output and LiveKit capture_frame",
                 value,
                 {"state": state},
             )
@@ -421,22 +431,22 @@ class LiveKitServingMetrics:
                     (
                         "taew_decode_items",
                         "telefuser_serving_worker_taew_decode_items",
-                        "Logical chunks in the latest TAeW LightVAE decode",
+                        "Logical chunks in the latest model-specific decoder decode",
                     ),
                     (
                         "taew_decode_batch_size",
                         "telefuser_serving_worker_taew_decode_batch_size",
-                        "Effective native batch size in the latest TAeW LightVAE decode",
+                        "Effective native batch size in the latest model-specific decoder decode",
                     ),
                     (
                         "taew_decode_invocations",
                         "telefuser_serving_worker_taew_decode_invocations",
-                        "Native TAeW LightVAE decode calls in the latest model batch",
+                        "Native model-specific decoder decode calls in the latest model batch",
                     ),
                     (
                         "taew_decode_mode",
                         "telefuser_serving_worker_taew_decode_mode",
-                        "TAeW decode mode: 0 singleton, 1 synchronized batch, 2 safe serial fallback",
+                        "model decoder mode: 0 singleton, 1 synchronized batch, 2 safe serial fallback",
                     ),
                 ):
                     value = self._nonnegative(values.get(metric_key))
@@ -461,7 +471,7 @@ class LiveKitServingMetrics:
                         )
         gauge(
             "telefuser_serving_scheduler_mode_info",
-            "One for the ABot scheduler mode selected by each worker",
+            "One for the scheduler mode reported by each worker",
             1,
             {"mode": scheduler_mode},
         )
@@ -481,7 +491,7 @@ class LiveKitServingMetrics:
         if taew_executions:
             gauge(
                 "telefuser_serving_taew_decode_mean_native_batch_size",
-                "Mean effective native TAeW LightVAE batch size across observed decoder calls",
+                "Mean effective native model-specific decoder batch size across observed decoder calls",
                 taew_items / taew_executions,
             )
 
@@ -524,6 +534,17 @@ class LiveKitServingMetrics:
                 },
             },
         }
+
+    @staticmethod
+    def _merge_runtime_maps(*values: object) -> dict[str, dict[str, object]]:
+        merged: dict[str, dict[str, object]] = {}
+        for value in values:
+            if not isinstance(value, dict):
+                continue
+            for key, facts in value.items():
+                if isinstance(facts, dict):
+                    merged.setdefault(str(key), {}).update(merge_scalar_maps(facts))
+        return merged
 
     def _session_fps(
         self, runtime: LiveKitServeRuntime, pipeline_session_id: str, payload: dict[str, Any]
@@ -672,19 +693,19 @@ class LiveKitServingMetrics:
             "telefuser_serving_sessions_finished_total": "Terminal sessions grouped by outcome",
             "telefuser_serving_slo_chunks_total": "Chunks grouped by whether their FPS-derived budget was met",
             "telefuser_serving_taew_decode_serial_fallback_executions_total": (
-                "Native TAeW LightVAE decode calls made after safe serial fallback"
+                "Native model-specific decoder decode calls made after safe serial fallback"
             ),
             "telefuser_serving_taew_decode_serial_fallback_items_total": (
                 "Logical session chunks decoded through safe TAeW serial fallback"
             ),
             "telefuser_serving_taew_decode_singleton_executions_total": (
-                "Native TAeW LightVAE decode calls for singleton chunks"
+                "Native model-specific decoder decode calls for singleton chunks"
             ),
             "telefuser_serving_taew_decode_singleton_items_total": (
-                "Logical singleton session chunks decoded by TAeW LightVAE"
+                "Logical singleton session chunks decoded by model-specific decoder"
             ),
             "telefuser_serving_taew_decode_synchronized_executions_total": (
-                "Native synchronized TAeW LightVAE decode calls"
+                "Native synchronized model-specific decoder decode calls"
             ),
             "telefuser_serving_taew_decode_synchronized_items_total": (
                 "Logical session chunks decoded in synchronized native TAeW batches"
