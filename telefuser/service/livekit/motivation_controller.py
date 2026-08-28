@@ -14,6 +14,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from pathlib import Path
 
 from .async_migration import (
     AsyncMigrationBackend,
@@ -24,8 +25,11 @@ from .async_migration import (
 from .motivation_scheduler import (
     ActionJob,
     DispatchCandidate,
+    GpuSchedulingState,
     MotivationScheduler,
+    MotivationSchedulerConfig,
     SessionSchedulingState,
+    load_motivation_profiles_csv,
 )
 
 
@@ -71,6 +75,65 @@ class MotivationRuntimeController:
         self._owns_search_executor = False
         self._clock = clock
         self._lock = threading.RLock()
+
+    @classmethod
+    def from_offline_table(
+        cls,
+        profile_path: str | Path,
+        *,
+        gpu_states: Iterable[GpuSchedulingState],
+        dispatch: DispatchCallback,
+        scheduler_config: MotivationSchedulerConfig | None = None,
+        migration_manager: AsyncMigrationManager | None = None,
+        migration_backend_factory: MigrationBackendFactory | None = None,
+        search_executor: SearchExecutor | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> "MotivationRuntimeController":
+        """Build an opt-in controller from the measured offline profile CSV."""
+        policy_config = scheduler_config or MotivationSchedulerConfig()
+        profile_table = load_motivation_profiles_csv(
+            profile_path,
+            max_batch_size=policy_config.max_batch_size,
+        )
+        scheduler = MotivationScheduler(
+            profile_table,
+            config=policy_config,
+            clock=clock,
+        )
+        registered = 0
+        for gpu_state in gpu_states:
+            scheduler.add_gpu(gpu_state)
+            registered += 1
+        if registered == 0:
+            raise ValueError("at least one GPU state is required")
+        return cls(
+            scheduler,
+            dispatch=dispatch,
+            migration_manager=migration_manager,
+            migration_backend_factory=migration_backend_factory,
+            search_executor=search_executor,
+            clock=clock,
+        )
+
+    def on_gpu_registered(
+        self,
+        gpu_id: str,
+        *,
+        memory_free_gb: float,
+        free_at: float = 0.0,
+        available: bool = True,
+        version: int = 0,
+    ) -> GpuSchedulingState:
+        """Register one GPU at the worker-start boundary."""
+        state = GpuSchedulingState(
+            gpu_id=gpu_id,
+            free_at=free_at,
+            memory_free_gb=memory_free_gb,
+            available=available,
+            version=version,
+        )
+        self.scheduler.add_gpu(state)
+        return state
 
     def on_session_registered(
         self,

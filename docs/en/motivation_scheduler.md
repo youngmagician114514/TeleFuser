@@ -94,13 +94,31 @@ The next runtime integration layer should feed migration estimates into
 current batch, and call `commit()` only after the target reports `ready`.
 ## Runtime bridge
 
-`MotivationRuntimeController` is an opt-in bridge around the policy core. Use
-`on_session_registered()` and `on_session_departed()` at the room lifecycle
-boundary, then forward action and GPU events with `on_action()` and
-`on_gpu_update()`. It starts at most one migration per scheduling turn,
-validates the candidate again after ownership changes, and hands a
-`DispatchLease` to a worker callback. The default ABot/SlackServe services are
-unchanged until a runtime supplies this controller and an executor callback.
+`MotivationRuntimeController` is an opt-in bridge around the policy core. A
+runtime can construct it directly, or load the measured table and register
+worker GPUs in one step:
+
+```python
+from telefuser.service.livekit import (
+    GpuSchedulingState,
+    MotivationRuntimeController,
+)
+
+controller = MotivationRuntimeController.from_offline_table(
+    "/path/to/profile_evaluated.csv",
+    gpu_states=[GpuSchedulingState("gpu-0", memory_free_gb=80.0)],
+    dispatch=execute_lease,
+)
+```
+
+Use `on_session_registered()` and `on_session_departed()` at the room
+lifecycle boundary, then forward action and GPU events with `on_action()` and
+`on_gpu_update()`. For a worker-start event after construction,
+`on_gpu_registered()` provides the equivalent registration hook. The
+controller starts at most one migration per scheduling turn, validates the
+candidate again after ownership changes, and hands a `DispatchLease` to a
+worker callback. The default ABot/SlackServe services are unchanged until a
+runtime supplies this controller and an executor callback.
 
 For overlap with an active GPU invocation, call `search_async()` at the
 current completion boundary and later pass its result to

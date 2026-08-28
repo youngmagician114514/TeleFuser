@@ -3,6 +3,8 @@ from __future__ import annotations
 import concurrent.futures
 import threading
 
+import pytest
+
 from telefuser.service.livekit.async_migration import AsyncMigrationManager, MigrationRequest
 from telefuser.service.livekit.motivation_controller import MotivationRuntimeController
 from telefuser.service.livekit.motivation_scheduler import (
@@ -58,6 +60,41 @@ def test_delayed_async_search_follows_scheduler_timeline() -> None:
     candidate = future.result(timeout=1.0)
     assert candidate is not None
     assert candidate.job_ids == (scheduler.session("s").pending_action.job_id,)
+
+
+def test_controller_can_build_from_offline_profile_table(tmp_path) -> None:
+    profile_path = tmp_path / "profile.csv"
+    profile_path.write_text(
+        "B,S,W,rho,precision,latency_ms,latency_p95_ms,memory_GB,Q_world,config\n"
+        "1,4,18,0,bf16,400,420,20,0.68,b1_s4_w18\n"
+        "4,4,18,0,bf16,1400,1450,50,0.67,b4_s4_w18\n",
+        encoding="utf-8",
+    )
+    controller = MotivationRuntimeController.from_offline_table(
+        profile_path,
+        gpu_states=[GpuSchedulingState("gpu-0", memory_free_gb=80.0)],
+        dispatch=lambda lease: None,
+    )
+
+    controller.on_session_registered("s", owner_gpu="gpu-0", now=0.0)
+    job, invalidated = controller.on_action("s", ["W"], now=0.0)
+
+    assert job is not None
+    assert invalidated is True
+    assert controller.scheduler.profile_provider.profiles_for(batch_size=1, gpu_id="gpu-0")[0].quality == pytest.approx(0.68)
+
+
+def test_controller_registers_gpu_at_worker_start() -> None:
+    scheduler = MotivationScheduler(
+        StaticMotivationProfileTable([MotivationProfile(1, "high", 0.4, 0.68, 20.0)])
+    )
+    controller = MotivationRuntimeController(scheduler, dispatch=lambda lease: None)
+
+    state = controller.on_gpu_registered("gpu-0", memory_free_gb=80.0)
+    controller.on_session_registered("s", owner_gpu="gpu-0", now=0.0)
+
+    assert state.gpu_id == "gpu-0"
+    assert scheduler.gpus()[0].memory_free_gb == pytest.approx(80.0)
 
 
 def test_controller_forwards_session_lifecycle_events() -> None:
