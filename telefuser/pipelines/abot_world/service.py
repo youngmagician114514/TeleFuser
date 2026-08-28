@@ -100,6 +100,10 @@ class _ABotWorldLiveKitSession:
     lock: threading.RLock = field(default_factory=threading.RLock)
     in_flight: bool = False
     ready_since: float | None = None
+    # Motivation dispatches are one action job per selected session. The
+    # bridge sets this marker so the worker emits exactly one chunk rather than
+    # free-running on a held control state.
+    motivation_one_shot: bool = False
     next_playout_deadline: float = field(default_factory=time.monotonic)
     created_at: float = field(default_factory=time.monotonic)
     output_queue_high_watermark: int = 0
@@ -534,6 +538,10 @@ class ABotWorldLiveKitService:
             else:
                 raise ValueError(f"Unsupported ABot control message type: {message_type}")
             now = time.monotonic()
+            motivation = chunk.get("motivation")
+            state.motivation_one_shot = (
+                isinstance(motivation, dict) and bool(motivation.get("one_shot"))
+            )
             state.last_control_at = now
             state.ready_since = now if state.controls else None
             # A newly reactivated session should not wait behind an old playout
@@ -547,6 +555,18 @@ class ABotWorldLiveKitService:
             else:
                 self._workload_detector.record_idle(session_id, now)
             self._scheduler_condition.notify_all()
+
+    def push_batch(self, items: Sequence[tuple[str, dict]]) -> None:
+        """Apply a policy-selected control batch atomically at the service boundary.
+
+        ``push_chunk`` retains the public single-session API. This method is
+        used by an external global scheduler so the internal ABot condition
+        cannot observe only the first member of a selected batch and dispatch
+        it before the remaining controls arrive.
+        """
+        with self._scheduler_condition:
+            for session_id, chunk in items:
+                self.push_chunk(session_id, chunk)
 
     async def pull_chunks(self, session_id: str) -> AsyncGenerator[dict, None]:
         """Yield preview and generated frames in per-session sequence order."""
@@ -1676,6 +1696,14 @@ class ABotWorldLiveKitService:
                         state.pacing_ready_at = completed_at
                     state.ready_since = completed_at if state.controls else None
                     self._finish_dispatch_session_trace(trace, state, frames)
+                # A policy lease represents one model invocation. Clear the
+                # service-local held controls before exposing output to the
+                # bridge, so a next heartbeat cannot be accidentally erased.
+                with state.lock:
+                    if state.motivation_one_shot:
+                        state.controls.clear()
+                        state.ready_since = None
+                        state.motivation_one_shot = False
                 self._put_output(state, payload)
             self._emit_dispatch_trace(
                 selected_at=selected_at,

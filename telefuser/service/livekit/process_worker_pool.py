@@ -222,6 +222,18 @@ class ProcessLiveKitWorkerPool:
             self._session_workers.pop(record.session_id, None)
             raise
 
+    def dispatch_batch(self, lease: Any, payloads: list[tuple[str, dict]]) -> None:
+        """Send a policy-selected batch to the owning child process."""
+        del lease
+        grouped: dict[str, list[tuple[str, dict]]] = {}
+        for session_id, chunk in payloads:
+            worker_id = self._session_workers.get(session_id)
+            if worker_id is None:
+                raise RuntimeError(f"Session {session_id!r} is not assigned to a live worker")
+            grouped.setdefault(worker_id, []).append((session_id, dict(chunk)))
+        for worker_id, items in grouped.items():
+            self._send(worker_id, {"type": "dispatch_batch", "items": items})
+
     async def stop_session(self, session_id: str) -> None:
         """Stop a child-owned room and wait for model-state cleanup."""
         worker_id = self._session_workers.get(session_id)
@@ -725,6 +737,9 @@ async def _run_process_worker(
                             events=events,
                         )
                     )
+                elif command_type == "dispatch_batch":
+                    items = [(str(session_id), dict(chunk)) for session_id, chunk in command["items"]]
+                    worker.dispatch_batch(items)
                 elif command_type == "stop_session":
                     session_id = command["session_id"]
                     await worker.stop_session(session_id)

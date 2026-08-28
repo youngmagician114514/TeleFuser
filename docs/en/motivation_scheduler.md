@@ -120,6 +120,33 @@ candidate again after ownership changes, and hands a `DispatchLease` to a
 worker callback. The default ABot/SlackServe services are unchanged until a
 runtime supplies this controller and an executor callback.
 
+`MotivationExecutionBridge` is the opt-in execution adapter for the LiveKit
+runtime. Construct a controller from the offline table with GPU identifiers
+matching the LiveKit worker identifiers (`worker-0`, `worker-1`, ...), then pass
+it as `motivation_controller=` to `LiveKitServeRuntime`. The
+`telefuser stream-serve` entrypoint exposes the same wiring with
+`--motivation-profile /path/to/profile_evaluated.csv`; it initializes one
+scheduler GPU per configured worker and accepts `--motivation-max-batch-size`
+and `--motivation-memory-free-gb` for the policy-side limits. The bridge
+intercepts
+normalized action messages, keeps only the latest unreleased controls, releases
+one action job per configured heartbeat, and forwards a reserved batch through
+`WorkerPool.dispatch_batch()`. A batch is applied atomically at the ABot
+service boundary and carries the selected profile metadata. ABot marks that
+control as a one-shot lease, so its worker-local scheduler emits one chunk
+instead of free-running until the normal control timeout. The lease is
+completed when every selected session emits a `chunk` model-output event; an
+empty control state still reaches ABot to stop new admission, and `stop`/`reset`
+retain their normal lifecycle behavior. Plain `process` workers are rejected
+for this mode because their child-side control callback cannot be synchronously
+intercepted; use `in-process` or `process-nccl`.
+
+The current ABot model exposes a fixed checkpoint/runtime fidelity. The bridge
+records the selected offline `fidelity` in the dispatch metadata and enforces
+its batch and placement decision, but changing denoising steps or KV-window
+geometry still requires a model-specific runtime implementation; those fields
+are not silently changed by the generic adapter.
+
 For overlap with an active GPU invocation, call `search_async()` at the
 current completion boundary and later pass its result to
 `dispatch_candidate()`. The background task only computes a snapshot;

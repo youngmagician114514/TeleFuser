@@ -93,6 +93,19 @@ sudo apt-get install -y coturn
 curl -sSL https://get.livekit.io | bash
 ```
 
+The motivation scheduler is an opt-in policy execution mode. A caller can construct
+`MotivationRuntimeController.from_offline_table(...)` with one GPU state per
+worker and pass it to `LiveKitServeRuntime(motivation_controller=...)`.
+`MotivationExecutionBridge` then owns action release, global B/c/g selection,
+one-shot ABot control dispatch, and output completion. It is supported by
+`in-process` and `process-nccl`; plain `process` mode remains on its child-local
+control path and is intentionally rejected for this mode. For a command-line
+run, add `--motivation-profile /path/to/profile_evaluated.csv`; the optional
+`--motivation-max-batch-size` and `--motivation-memory-free-gb` flags set the
+policy limits. The profile's `max_batch_size` should match
+`TELEFUSER_ABOT_MAX_BATCH_SIZE` so the worker does not split a policy-selected
+batch. The default runtime without a controller is unchanged.
+
 The checked-in browser demo forces TCP TURN relay. Run the following development-only stack in four terminals:
 
 ```bash

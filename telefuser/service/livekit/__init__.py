@@ -10,6 +10,7 @@ from .async_migration import (
 )
 from .config import LiveKitServeConfig
 from .motivation_controller import DispatchLease, MotivationRuntimeController
+from .motivation_execution import MotivationExecutionBridge, release_on_control_state
 from .motivation_scheduler import (
     ActionJob,
     DispatchCandidate,
@@ -40,6 +41,8 @@ __all__ = [
     "MigrationRequest",
     "MotivationProfile",
     "MotivationRuntimeController",
+    "MotivationExecutionBridge",
+    "release_on_control_state",
     "MotivationScheduler",
     "MotivationSchedulerConfig",
     "RouterMigrationBackend",

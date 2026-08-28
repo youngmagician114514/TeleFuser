@@ -57,6 +57,27 @@ class TurboServePipelineRouter:
             raise KeyError(f"Unknown routed pipeline session {pipeline_session_id!r}")
         self._backends[worker_id].push_chunk(pipeline_session_id, chunk)
 
+    def push_batch(self, items: list[tuple[str, dict[str, Any]]]) -> None:
+        """Route one policy batch atomically per backend when supported."""
+        grouped: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+        for pipeline_session_id, chunk in items:
+            with self._lock:
+                pending = self._pending_chunks.get(pipeline_session_id)
+                worker_id = self._routes.get(pipeline_session_id)
+            if pending is not None:
+                pending.append(dict(chunk))
+                continue
+            if worker_id is None:
+                raise KeyError(f"Unknown routed pipeline session {pipeline_session_id!r}")
+            grouped.setdefault(worker_id, []).append((pipeline_session_id, chunk))
+        for worker_id, backend_items in grouped.items():
+            push_batch = getattr(self._backends[worker_id], "push_batch", None)
+            if callable(push_batch):
+                push_batch(backend_items)
+            else:
+                for pipeline_session_id, chunk in backend_items:
+                    self._backends[worker_id].push_chunk(pipeline_session_id, chunk)
+
     async def pull_chunks(self, pipeline_session_id: str) -> AsyncGenerator[dict, None]:
         """Continue on a new backend after the source generator closes during commit."""
         while True:
@@ -258,6 +279,9 @@ class TurboServeWorkerPipelineView:
 
     def push_chunk(self, pipeline_session_id: str, chunk: dict[str, Any]) -> None:
         self._router.push_chunk(pipeline_session_id, chunk)
+
+    def push_batch(self, items: list[tuple[str, dict[str, Any]]]) -> None:
+        self._router.push_batch(items)
 
     async def pull_chunks(self, pipeline_session_id: str) -> AsyncGenerator[dict, None]:
         async for chunk in self._router.pull_chunks(pipeline_session_id):

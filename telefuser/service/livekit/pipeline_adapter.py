@@ -44,6 +44,15 @@ class LiveKitPipelineAdapter:
     def push_chunk(self, session_id: str, chunk: dict) -> None:
         self.stream_service.push_chunk(session_id, chunk)
 
+    def push_batch(self, items: list[tuple[str, dict]]) -> None:
+        """Apply policy-selected controls while holding the service boundary."""
+        push_batch = getattr(self.stream_service, "push_batch", None)
+        if callable(push_batch):
+            push_batch(items)
+            return
+        for session_id, chunk in items:
+            self.stream_service.push_chunk(session_id, chunk)
+
     async def pull_chunks(self, session_id: str) -> AsyncGenerator[dict, None]:
         async for chunk in self.stream_service.pull_chunks(session_id):
             yield chunk

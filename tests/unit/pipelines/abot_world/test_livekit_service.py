@@ -326,6 +326,32 @@ def test_default_scheduler_coalesces_compatible_sessions() -> None:
     service.stop()
 
 
+def test_motivation_one_shot_control_emits_one_chunk() -> None:
+    service, pipeline = _service(output_queue_size=4, max_batch_size=1, control_idle_timeout=30)
+    service.configure_session_capacity(1)
+    session_id = _create(service, "motivation-one-shot")
+    state = service._session(session_id)
+    assert state is not None
+    try:
+        assert _take_and_notify(service, state)["type"] == "preview"
+        service.push_chunk(
+            session_id,
+            {
+                "type": "control_state",
+                "controls": ["KeyW"],
+                "motivation": {"job_id": "session:action:1", "one_shot": True},
+            },
+        )
+        assert _take_and_notify(service, state)["type"] == "chunk"
+        time.sleep(0.05)
+        assert len(pipeline.generate_calls) == 1
+        with state.lock:
+            assert state.controls == set()
+            assert state.motivation_one_shot is False
+    finally:
+        service.stop()
+
+
 def test_round_robin_remains_single_session_ablation() -> None:
     service, pipeline = _service(output_queue_size=4, scheduler_mode="round_robin")
     service.configure_session_capacity(2)

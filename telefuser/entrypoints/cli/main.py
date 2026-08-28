@@ -192,6 +192,26 @@ def serve(
     default=False,
     help="Skip security validation (not recommended for production)",
 )
+@click.option(
+    "--motivation-profile",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False),
+    help="Offline profile CSV that enables the opt-in global Motivation scheduler",
+)
+@click.option(
+    "--motivation-memory-free-gb",
+    default=80.0,
+    type=float,
+    show_default=True,
+    help="Scheduler-visible free memory per worker when Motivation mode is enabled",
+)
+@click.option(
+    "--motivation-max-batch-size",
+    default=4,
+    type=click.IntRange(min=1, max=4),
+    show_default=True,
+    help="Maximum Motivation candidate batch size",
+)
 def stream_serve(
     pipe_path: str,
     host: str,
@@ -217,6 +237,9 @@ def stream_serve(
     worker_mode: str,
     security_level: str,
     skip_validation: bool,
+    motivation_profile: str | None,
+    motivation_memory_free_gb: float,
+    motivation_max_batch_size: int,
 ) -> None:
     """Start the LiveKit-backed TeleFuser stream server.
 
@@ -261,6 +284,9 @@ def stream_serve(
         worker_mode=worker_mode.lower(),
         skip_validation=skip_validation,
         security_level=security_level,
+        motivation_profile=motivation_profile,
+        motivation_memory_free_gb=motivation_memory_free_gb,
+        motivation_max_batch_size=motivation_max_batch_size,
     )
 
 

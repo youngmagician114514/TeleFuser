@@ -218,6 +218,9 @@ class _ProcessPipelineAdapter:
     def push_chunk(self, session_id: str, chunk: dict) -> None:
         self._pool.push_model_chunk(session_id, chunk)
 
+    def push_batch(self, items: list[tuple[str, dict]]) -> None:
+        self._pool.push_model_batch(items)
+
     async def pull_chunks(self, session_id: str):
         async for chunk in self._pool.pull_model_chunks(session_id):
             yield chunk
@@ -264,6 +267,10 @@ class _ParentTransportSink:
         callback = getattr(self.pool._event_sink, "on_control_received", None)
         if callable(callback):
             callback(worker_id, session_id)
+
+    def on_control_message(self, worker_id: str, session_id: str, chunk: dict) -> bool:
+        callback = getattr(self.pool._event_sink, "on_control_message", None)
+        return bool(callback(worker_id, session_id, chunk)) if callable(callback) else False
 
     def on_chunk_published(
         self, worker_id: str, session_id: str, frames: int, first_frame_at: float | None = None
@@ -350,6 +357,21 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         self._transport_tasks[record.session_id] = task
         task.add_done_callback(lambda done, sid=record.session_id: self._transport_task_done(sid, done))
 
+    def dispatch_batch(self, lease: Any, payloads: list[tuple[str, dict]]) -> None:
+        """Send a policy-selected batch through the parent transport routes."""
+        del lease
+        grouped: dict[str, list[tuple[str, dict]]] = {}
+        for session_id, chunk in payloads:
+            runner = self._transport_workers.get(session_id)
+            if runner is None or runner.pipeline_session_id is None:
+                raise RuntimeError(f"Session {session_id!r} has no active model transport")
+            worker_id = self._pipeline_routes.get(runner.pipeline_session_id)
+            if worker_id is None:
+                raise RuntimeError(f"Session {session_id!r} has no model route")
+            grouped.setdefault(worker_id, []).append((runner.pipeline_session_id, dict(chunk)))
+        for worker_id, items in grouped.items():
+            self._send(worker_id, {"type": "model_push_batch", "items": items})
+
     async def stop_session(self, session_id: str) -> None:
         runner = self._transport_workers.get(session_id)
         task = self._transport_tasks.get(session_id)
@@ -389,6 +411,20 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
             self._pipeline_routes[session_id],
             {"type": "model_push", "session_id": session_id, "chunk": dict(chunk)},
         )
+
+    def push_model_batch(self, items: list[tuple[str, dict]]) -> None:
+        """Forward a batch to one child command so its service sees one update turn."""
+        grouped: dict[str, list[tuple[str, dict]]] = {}
+        for session_id, chunk in items:
+            if session_id in self._migrating_controls:
+                self._migrating_controls[session_id].append(dict(chunk))
+                continue
+            worker_id = self._pipeline_routes.get(session_id)
+            if worker_id is None:
+                raise KeyError(f"Unknown model session {session_id!r}")
+            grouped.setdefault(worker_id, []).append((session_id, dict(chunk)))
+        for worker_id, grouped_items in grouped.items():
+            self._send(worker_id, {"type": "model_push_batch", "items": grouped_items})
 
     def enable_publisher_frame_tracking(self, session_id: str) -> bool:
         return bool(self._publisher_frame_tracking.get(session_id, False))
@@ -1063,6 +1099,10 @@ async def _run_nccl_model_worker(
                     )
                 elif kind == "model_push":
                     adapter.push_chunk(command["session_id"], command["chunk"])
+                elif kind == "model_push_batch":
+                    adapter.push_batch(
+                        [(str(session_id), dict(chunk)) for session_id, chunk in command["items"]]
+                    )
                 elif kind == "model_publisher_frame_progress":
                     adapter.report_publisher_frame_progress(
                         command["session_id"],

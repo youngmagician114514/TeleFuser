@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Protocol
+from collections.abc import Sequence
+from typing import Any, Protocol
 
 from telefuser.utils.logging import logger
 
@@ -22,6 +23,7 @@ class WorkerPool(Protocol):
     async def start(self, *, skip_validation: bool = False) -> None: ...
 
     def start_session(self, record: SessionRecord) -> None: ...
+    def dispatch_batch(self, lease: Any, payloads: Sequence[tuple[str, dict]]) -> None: ...
     async def stop_session(self, session_id: str) -> None: ...
     async def aclose(self) -> None: ...
 
@@ -80,6 +82,27 @@ class InProcessLiveKitWorkerPool:
         self._tasks[record.session_id] = task
         self._task_workers[record.session_id] = record.worker_id
         task.add_done_callback(lambda done: self._on_task_done(record.session_id, done))
+
+    def dispatch_batch(self, lease: Any, payloads: Sequence[tuple[str, dict]]) -> None:
+        """Dispatch one policy-selected batch through its owning workers."""
+        del lease
+        grouped: dict[str, list[tuple[str, dict]]] = {}
+        for session_id, chunk in payloads:
+            worker_id = self._task_workers.get(session_id)
+            if worker_id is None:
+                raise RuntimeError(f"Session {session_id!r} is not assigned to an active worker")
+            grouped.setdefault(worker_id, []).append((session_id, dict(chunk)))
+        for worker_id, items in grouped.items():
+            worker = self._workers[worker_id]
+            dispatch_batch = getattr(worker, "dispatch_batch", None)
+            if callable(dispatch_batch):
+                dispatch_batch(items)
+                continue
+            dispatch_controls = getattr(worker, "dispatch_controls", None)
+            if not callable(dispatch_controls):
+                raise RuntimeError(f"Worker {worker_id!r} does not support policy dispatch")
+            for session_id, chunk in items:
+                dispatch_controls(session_id, chunk)
 
     async def stop_session(self, session_id: str) -> None:
         """Request an active session to stop and wait for cleanup."""

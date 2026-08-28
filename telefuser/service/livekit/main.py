@@ -13,6 +13,8 @@ from telefuser.utils.logging import logger
 
 from .app import create_livekit_app
 from .config import LiveKitServeConfig
+from .motivation_controller import MotivationRuntimeController
+from .motivation_scheduler import GpuSchedulingState, MotivationSchedulerConfig
 from .runtime import LiveKitServeRuntime
 
 
@@ -42,6 +44,9 @@ def run_stream_server(
     worker_mode: str | None = None,
     skip_validation: bool = False,
     security_level: str | None = None,
+    motivation_profile: str | None = None,
+    motivation_memory_free_gb: float = 80.0,
+    motivation_max_batch_size: int = 4,
 ) -> None:
     """Run the LiveKit-backed streaming HTTP API."""
     config_kwargs: dict[str, Any] = _drop_none(
@@ -72,11 +77,25 @@ def run_stream_server(
     config = LiveKitServeConfig(**config_kwargs)
     config.require_livekit_credentials()
 
+    motivation_controller = None
+    if motivation_profile is not None:
+        gpu_states = [
+            GpuSchedulingState(f"worker-{index}", memory_free_gb=motivation_memory_free_gb)
+            for index in range(config.num_workers)
+        ]
+        motivation_controller = MotivationRuntimeController.from_offline_table(
+            motivation_profile,
+            gpu_states=gpu_states,
+            dispatch=lambda _lease: None,
+            scheduler_config=MotivationSchedulerConfig(max_batch_size=motivation_max_batch_size),
+        )
+
     runtime = LiveKitServeRuntime(
         config=config,
         pipeline_file=pipe_path,
         skip_validation=skip_validation,
         security_level=security_level,
+        motivation_controller=motivation_controller,
     )
     app = create_livekit_app(runtime)
 

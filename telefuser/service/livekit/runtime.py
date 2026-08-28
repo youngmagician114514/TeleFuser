@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from telefuser.service.security.security_validator import SecurityLevel
@@ -12,6 +13,8 @@ from telefuser.utils.logging import logger
 
 from .config import LiveKitServeConfig
 from .metrics import LiveKitServingMetrics
+from .motivation_controller import MotivationRuntimeController
+from .motivation_execution import MotivationExecutionBridge, release_on_control_state
 from .multi_session_worker import MultiSessionLiveKitWorker as LiveKitWorker
 from .nccl_process_worker_pool import NCCLProcessLiveKitWorkerPool
 from .pipeline_adapter import LiveKitPipelineAdapter
@@ -68,6 +71,8 @@ class LiveKitServeRuntime:
         worker_pool: WorkerPool | None = None,
         skip_validation: bool = False,
         security_level: SecurityLevel | str | None = None,
+        motivation_controller: MotivationRuntimeController | None = None,
+        motivation_release_policy: Callable[[dict], bool] | None = None,
     ) -> None:
         self.config = config
         self.pipeline_file = pipeline_file
@@ -85,6 +90,16 @@ class LiveKitServeRuntime:
         )
         self.skip_validation = skip_validation
         self.security_level = security_level
+        if motivation_controller is not None and config.worker_mode == "process":
+            raise ValueError("Motivation execution requires in-process or process-nccl workers")
+        self._motivation_bridge: MotivationExecutionBridge | None = None
+        if motivation_controller is not None:
+            self._validate_motivation_workers(motivation_controller)
+            self._motivation_bridge = MotivationExecutionBridge(
+                motivation_controller,
+                dispatch=self._dispatch_motivation_batch,
+                release_policy=motivation_release_policy or release_on_control_state,
+            )
         self.worker_pool = worker_pool or self._create_worker_pool()
         self._started = False
         self._closing = False
@@ -259,9 +274,19 @@ class LiveKitServeRuntime:
     def on_pipeline_session(self, session_id: str, pipeline_session_id: str) -> None:
         """Record the pipeline session created by a worker."""
         self.registry.set_pipeline_session(session_id, pipeline_session_id)
+        bridge = self._motivation_bridge
+        if bridge is not None:
+            record = self.registry.require(session_id)
+            if record.worker_id is None:
+                raise RuntimeError(f"Motivation session {session_id!r} has no worker owner")
+            bridge.register_session(session_id, owner_gpu=record.worker_id)
+            bridge.register_pipeline_session(session_id, pipeline_session_id)
 
     def on_session_finished(self, worker_id: str, session_id: str, error: str | None = None) -> None:
         """Release capacity after a worker session exits."""
+        bridge = self._motivation_bridge
+        if bridge is not None:
+            bridge.on_session_departed(session_id)
         del worker_id
         record = self._finish_session(session_id, error=error)
         self._serving_metrics.record_session_finished(record.status, error=error)
@@ -269,6 +294,11 @@ class LiveKitServeRuntime:
     def on_control_received(self, worker_id: str, session_id: str) -> None:
         """Record a validated controller action entering the serving pipeline."""
         self._serving_metrics.on_control_received(worker_id, session_id)
+
+    def on_control_message(self, worker_id: str, session_id: str, chunk: dict) -> bool:
+        """Let the opt-in motivation bridge own action release and dispatch."""
+        bridge = self._motivation_bridge
+        return bool(bridge is not None and bridge.on_control_message(worker_id, session_id, chunk))
 
     def on_chunk_published(
         self,
@@ -302,6 +332,9 @@ class LiveKitServeRuntime:
             runtime_metrics=runtime_metrics,
             session_runtime_metrics=session_runtime_metrics,
         )
+        bridge = self._motivation_bridge
+        if bridge is not None:
+            bridge.on_model_output(worker_id, session_id, payload)
 
     def prometheus_metrics(self) -> str:
         """Render runtime, scheduler, session, and pipeline serving metrics."""
@@ -352,6 +385,7 @@ class LiveKitServeRuntime:
             "worker_mode": self.config.worker_mode,
             "queue_size": self.config.queue_size,
             "autoscaling_enabled": self.config.autoscaling_enabled,
+            "motivation_scheduler_enabled": self._motivation_bridge is not None,
             **health.model_dump(),
         }
         if capacity_profiles:
@@ -425,6 +459,8 @@ class LiveKitServeRuntime:
                     await self._autoscale_task
                 self._autoscale_task = None
             await self.worker_pool.aclose()
+            if self._motivation_bridge is not None:
+                self._motivation_bridge.close()
             for record in self.registry.list_records():
                 if record.status not in TERMINAL_SESSION_STATUSES:
                     self._finish_session(record.session_id, error="runtime closed")
@@ -433,6 +469,22 @@ class LiveKitServeRuntime:
                 self._started = False
                 self._closing = False
                 self._closed = True
+
+    def _validate_motivation_workers(self, controller: MotivationRuntimeController) -> None:
+        worker_ids = {state.worker_id for state in self.scheduler.workers()}
+        controller_gpu_ids = {state.gpu_id for state in controller.scheduler.gpus()}
+        missing = sorted(worker_ids - controller_gpu_ids)
+        if missing:
+            raise ValueError(
+                "Motivation controller must register every LiveKit worker GPU; "
+                f"missing {', '.join(missing)}"
+            )
+
+    def _dispatch_motivation_batch(self, lease, payloads) -> None:
+        dispatch = getattr(self.worker_pool, "dispatch_batch", None)
+        if not callable(dispatch):
+            raise RuntimeError("Configured worker pool does not support motivation dispatch")
+        dispatch(lease, payloads)
 
     def _create_worker_pool(self) -> WorkerPool:
         security_level = self.security_level

@@ -41,6 +41,10 @@ class _SessionWorkerEventSink:
         if callable(callback):
             callback(worker_id, session_id)
 
+    def on_control_message(self, worker_id: str, session_id: str, chunk: dict) -> bool:
+        callback = getattr(self._owner.event_sink, "on_control_message", None)
+        return bool(callback(worker_id, session_id, chunk)) if callable(callback) else False
+
     def on_chunk_published(
         self, worker_id: str, session_id: str, frames: int, first_frame_at: float | None = None
     ) -> None:
@@ -149,6 +153,28 @@ class MultiSessionLiveKitWorker:
             self._sessions.pop(record.session_id, None)
             self._session_worker_statuses.pop(record.session_id, None)
             self._publish_aggregate_worker_status()
+
+    def dispatch_controls(self, session_id: str, chunk: dict) -> None:
+        """Inject one policy-selected control into a retained room session."""
+        runner = self._sessions.get(session_id)
+        if runner is None:
+            raise RuntimeError(f"Worker {self.worker_id} has no active session {session_id!r}")
+        runner.dispatch_controls(session_id, chunk)
+
+    def dispatch_batch(self, items: list[tuple[str, dict]]) -> None:
+        """Dispatch a policy-selected batch to retained room sessions."""
+        routes: list[tuple[str, dict]] = []
+        for session_id, chunk in items:
+            runner = self._sessions.get(session_id)
+            if runner is None or runner.pipeline_session_id is None:
+                raise RuntimeError(f"Worker {self.worker_id} has no ready session {session_id!r}")
+            routes.append((runner.pipeline_session_id, chunk))
+        push_batch = getattr(self.pipeline_adapter, "push_batch", None)
+        if callable(push_batch):
+            push_batch(routes)
+            return
+        for session_id, chunk in items:
+            self.dispatch_controls(session_id, chunk)
 
     async def stop_session(self, session_id: str) -> None:
         """Request one retained session to stop without affecting its peers."""

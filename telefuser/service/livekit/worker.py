@@ -37,6 +37,7 @@ class WorkerEventSink(Protocol):
     def on_pipeline_session(self, session_id: str, pipeline_session_id: str) -> None: ...
     def on_session_finished(self, worker_id: str, session_id: str, error: str | None = None) -> None: ...
     def on_control_received(self, worker_id: str, session_id: str) -> None: ...
+    def on_control_message(self, worker_id: str, session_id: str, chunk: dict[str, Any]) -> bool: ...
     def on_chunk_published(
         self, worker_id: str, session_id: str, frames: int, first_frame_at: float | None = None
     ) -> None: ...
@@ -70,6 +71,10 @@ class NullWorkerEventSink:
 
     def on_control_received(self, worker_id: str, session_id: str) -> None:
         return None
+
+    def on_control_message(self, worker_id: str, session_id: str, chunk: dict[str, Any]) -> bool:
+        del worker_id, session_id, chunk
+        return False
 
     def on_chunk_published(
         self, worker_id: str, session_id: str, frames: int, first_frame_at: float | None = None
@@ -208,6 +213,20 @@ class LiveKitWorker:
             await self._close_active_session()
             self.event_sink.on_session_finished(self.worker_id, record.session_id, error)
 
+    @property
+    def pipeline_session_id(self) -> str | None:
+        """Return the active pipeline-session identifier, if initialized."""
+        return self._pipeline_session_id
+
+    def dispatch_controls(self, session_id: str, chunk: dict[str, Any]) -> None:
+        """Inject a policy-selected control into the active pipeline session."""
+        if self._active_session_id != session_id:
+            raise RuntimeError(f"Worker {self.worker_id} has no active session {session_id!r}")
+        pipeline_session_id = self._pipeline_session_id
+        if pipeline_session_id is None:
+            raise RuntimeError(f"Session {session_id!r} has not created its pipeline state yet")
+        self.pipeline_adapter.push_chunk(pipeline_session_id, chunk)
+
     async def stop_session(self, session_id: str) -> None:
         """Request the active session to stop."""
         if self._active_session_id != session_id:
@@ -297,6 +316,9 @@ class LiveKitWorker:
         control_callback = getattr(self.event_sink, "on_control_received", None)
         if callable(control_callback):
             control_callback(self.worker_id, record.session_id)
+        intercept_callback = getattr(self.event_sink, "on_control_message", None)
+        if callable(intercept_callback) and intercept_callback(self.worker_id, record.session_id, chunk):
+            return
         self.pipeline_adapter.push_chunk(self._pipeline_session_id, chunk)
         if chunk.get("type") == "stop":
             self._stop_event.set()

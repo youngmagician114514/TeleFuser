@@ -76,6 +76,19 @@ class MotivationRuntimeController:
         self._clock = clock
         self._lock = threading.RLock()
 
+    def set_dispatch_callback(self, dispatch: DispatchCallback) -> None:
+        """Replace the execution callback owned by a runtime integration.
+
+        The policy controller is useful on its own, but a LiveKit runtime may
+        need to install its worker-pool adapter after constructing the policy
+        from an offline profile. Replacing the callback is synchronized with
+        reservation/dispatch and does not change scheduler state.
+        """
+        if not callable(dispatch):
+            raise TypeError("dispatch callback must be callable")
+        with self._lock:
+            self.dispatch = dispatch
+
     @classmethod
     def from_offline_table(
         cls,
