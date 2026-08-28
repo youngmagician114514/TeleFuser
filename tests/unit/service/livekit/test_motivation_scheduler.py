@@ -63,7 +63,7 @@ def test_action_arriving_while_running_waits_for_next_slot() -> None:
     next_job, invalidated = scheduler.submit_action("s", ["J"], now=0.1, release=True)
 
     assert next_job is not None
-    assert invalidated is False
+    assert invalidated is True
     assert scheduler.session("s").in_flight == first
     assert scheduler.session("s").pending_action == next_job
 

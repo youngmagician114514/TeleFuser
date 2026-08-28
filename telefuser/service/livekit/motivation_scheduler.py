@@ -255,16 +255,17 @@ class SessionSchedulingState:
         """Update the latest controls and optionally release an action job.
 
         Empty controls and non-release heartbeat updates do not create jobs.
-        The return value reports whether the session transitioned from having
-        no pending/in-flight job to having a pending action job.  That is the
-        only transition that must invalidate an in-progress global search.
+        The return value reports whether the session's ready queue transitioned
+        from no pending action to a pending action.  An in-flight job does not
+        occupy that ready slot, so an action arriving during execution still
+        invalidates a search while leaving the running job untouched.
         """
         self.advance_to(now)
         canonical = tuple(sorted({str(control) for control in controls if str(control)}))
         self.latest_controls = canonical
         if not release or not canonical or self.departed:
             return False
-        had_job = self.pending_action is not None or self.in_flight is not None
+        had_pending = self.pending_action is not None
         self.state_version += 1
         self.pending_action = ActionJob(
             job_id=job_id,
@@ -274,7 +275,7 @@ class SessionSchedulingState:
             created_at=now,
             state_version=self.state_version,
         )
-        return not had_job
+        return not had_pending
 
     def create_idle_job(self, *, job_id: str, now: float) -> ActionJob | None:
         """Create one idle sentinel if no action or idle output is pending."""
