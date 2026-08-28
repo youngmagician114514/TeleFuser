@@ -19,6 +19,7 @@ from .motivation_scheduler import (
     MotivationSchedulerConfig,
     SessionSchedulingState,
     StaticMotivationProfileTable,
+    load_motivation_profiles_csv,
 )
 from .pipeline_router import TurboServePipelineRouter, TurboServeWorkerPipelineView
 from .turboserve import (
@@ -42,6 +43,7 @@ __all__ = [
     "MotivationScheduler",
     "MotivationSchedulerConfig",
     "RouterMigrationBackend",
+    "load_motivation_profiles_csv",
     "SessionSchedulingState",
     "StaticMotivationProfileTable",
     "TurboServePipelineRouter",

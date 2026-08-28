@@ -13,12 +13,14 @@ unit tests.
 
 from __future__ import annotations
 
+import csv
 import itertools
 import math
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal, Protocol
 
 EPSILON = 1e-9
@@ -61,6 +63,64 @@ class MotivationProfile:
             not math.isfinite(self.p95_seconds) or self.p95_seconds <= 0
         ):
             raise ValueError("p95_seconds must be positive and finite when supplied")
+
+
+def load_motivation_profiles_csv(
+    path: str | Path,
+    *,
+    max_batch_size: int = 4,
+    gpu_id: str | None = None,
+    output_seconds: float = 1.0,
+) -> StaticMotivationProfileTable:
+    """Load the measured offline-table rows used by the policy.
+
+    The loader accepts the ABot profile schema directly.  ``Q_world`` is the
+    preferred quality column; if it is empty, the mean of available
+    ``Q_action``, ``Q_temporal`` and ``Q_visual`` values is used.  The rows are
+    tagged as homogeneous (or with ``gpu_id`` when supplied), so GPU-specific
+    measurements can coexist with shared fallback rows.
+    """
+    if not 1 <= max_batch_size <= 4:
+        raise ValueError("max_batch_size must be in [1, 4]")
+    if output_seconds <= 0 or not math.isfinite(output_seconds):
+        raise ValueError("output_seconds must be positive and finite")
+    rows: list[MotivationProfile] = []
+    with Path(path).open(newline="", encoding="utf-8") as handle:
+        for raw in csv.DictReader(handle):
+            batch_size = int(raw["B"])
+            if batch_size > max_batch_size:
+                continue
+            latency_ms = float(raw["latency_ms"])
+            p95_raw = raw.get("latency_p95_ms", "")
+            p95_ms = float(p95_raw) if p95_raw not in {None, ""} else latency_ms
+            memory_gb = float(raw["memory_GB"])
+            quality_raw = raw.get("Q_world", "")
+            if quality_raw in {None, ""}:
+                quality_values = [
+                    float(raw[key])
+                    for key in ("Q_action", "Q_temporal", "Q_visual")
+                    if raw.get(key, "") not in {None, ""}
+                ]
+                if not quality_values:
+                    raise ValueError(f"profile row {raw.get('config', '<unknown>')} has no quality value")
+                quality = sum(quality_values) / len(quality_values)
+            else:
+                quality = float(quality_raw)
+            rows.append(
+                MotivationProfile(
+                    batch_size=batch_size,
+                    fidelity=str(raw.get("config") or f"b{batch_size}"),
+                    latency_seconds=latency_ms / 1000.0,
+                    p95_seconds=p95_ms / 1000.0,
+                    quality=quality,
+                    memory_gb=memory_gb,
+                    output_seconds=output_seconds,
+                    gpu_id=gpu_id,
+                )
+            )
+    if not rows:
+        raise ValueError(f"no profiles with batch size <= {max_batch_size} found in {path}")
+    return StaticMotivationProfileTable(rows)
 
 
 class MotivationProfileProvider(Protocol):

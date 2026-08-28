@@ -14,6 +14,7 @@ from telefuser.service.livekit.motivation_scheduler import (
     MotivationScheduler,
     MotivationSchedulerConfig,
     StaticMotivationProfileTable,
+    load_motivation_profiles_csv,
 )
 
 
@@ -155,3 +156,21 @@ def test_async_migration_requires_ready_before_atomic_commit() -> None:
     completed = manager.commit("s")
     assert completed.state == "completed"
     assert backend.committed is True
+
+
+def test_profile_loader_reads_abot_offline_table(tmp_path) -> None:
+    profile_path = tmp_path / "profile.csv"
+    profile_path.write_text(
+        "B,S,W,rho,precision,latency_ms,latency_p95_ms,memory_GB,Q_action,Q_temporal,Q_visual,Q_world,config\n"
+        "1,4,18,0,bf16,400,410,28,0.4,0.8,0.9,,b1_s4_w18_rho0_bf16\n"
+        "4,4,18,0,bf16,1400,1450,50,0.5,0.8,0.9,0.7,b4_s4_w18_rho0_bf16\n"
+        "8,4,18,0,bf16,2600,2700,74,0.5,0.8,0.9,0.65,b8_s4_w18_rho0_bf16\n",
+        encoding="utf-8",
+    )
+
+    table = load_motivation_profiles_csv(profile_path, max_batch_size=4)
+
+    assert [row.batch_size for row in table.profiles_for(batch_size=1, gpu_id="gpu-0")] == [1]
+    assert table.profiles_for(batch_size=1, gpu_id="gpu-0")[0].quality == pytest.approx(0.7)
+    assert table.profiles_for(batch_size=4, gpu_id="gpu-0")[0].quality == pytest.approx(0.7)
+    assert table.profiles_for(batch_size=8, gpu_id="gpu-0") == ()
