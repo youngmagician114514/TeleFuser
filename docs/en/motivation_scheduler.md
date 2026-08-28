@@ -5,6 +5,23 @@ for the ABot-World motivation.  It is deliberately independent of CUDA and
 LiveKit transport so that the same candidate search can be tested with the
 offline profile table and then driven by a real worker adapter.
 
+Measured ABot rows can be loaded directly with:
+
+```python
+from telefuser.service.livekit import load_motivation_profiles_csv
+
+profiles = load_motivation_profiles_csv(
+    "/path/to/profile_evaluated.csv",
+    max_batch_size=4,
+    output_seconds=1.0,
+)
+```
+
+The loader reads `B`, `latency_ms`, `latency_p95_ms`, `memory_GB`, and
+`Q_world` from the offline table; when `Q_world` is empty it averages the
+available component quality columns. Rows with `B > 4` are ignored by the
+default policy bound.
+
 ## State and job semantics
 
 The control plane keeps one `SessionSchedulingState` per retained session:
