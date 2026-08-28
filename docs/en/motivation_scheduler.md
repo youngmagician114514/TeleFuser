@@ -38,6 +38,12 @@ the one-second heartbeat window) changes the latest controls but creates no
 job.  Action jobs are considered before idle jobs globally.  An idle sentinel
 cannot be regenerated until its generated video has been consumed.
 
+A release that replaces an existing pending action only changes that session's
+job version; it does not invalidate an unrelated global search.  If there is no
+pending action, the new action creates a ready slot and invalidates the global
+candidate, even when an older job is still in flight.  The in-flight job is
+never cancelled.
+
 `SessionSchedulingState.advance_to()` consumes slack independently of the
 latest controls.  Once frames enter the consumer queue, releasing the controls
 does not stop playback.  An explicitly paused consumer can set
