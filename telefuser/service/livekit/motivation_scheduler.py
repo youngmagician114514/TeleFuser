@@ -625,6 +625,27 @@ class MotivationScheduler:
             self._sessions[session_id].mark_departed(now=observed_at)
             self._epoch += 1
 
+    def commit_migration(
+        self,
+        session_id: str,
+        *,
+        target_gpu: str,
+        now: float | None = None,
+    ) -> None:
+        """Commit scheduler ownership after the migration backend switches state."""
+        observed_at = self._clock() if now is None else now
+        with self._lock:
+            self._advance_to(observed_at)
+            if target_gpu not in self._gpus:
+                raise KeyError(f"unknown target GPU {target_gpu!r}")
+            state = self._sessions[session_id]
+            if state.in_flight is not None:
+                raise RuntimeError(f"cannot migrate session {session_id!r} while a job is in flight")
+            state.owner_gpu = target_gpu
+            state.migration_target_gpu = None
+            state.migration_ready_at = observed_at
+            self._epoch += 1
+
     def set_migration_ready(
         self,
         session_id: str,

@@ -9,6 +9,7 @@ from .async_migration import (
     RouterMigrationBackend,
 )
 from .config import LiveKitServeConfig
+from .motivation_controller import DispatchLease, MotivationRuntimeController
 from .motivation_scheduler import (
     ActionJob,
     DispatchCandidate,
@@ -32,10 +33,12 @@ __all__ = [
     "ActionJob",
     "AsyncMigrationManager",
     "DispatchCandidate",
+    "DispatchLease",
     "GpuSchedulingState",
     "MigrationRecord",
     "MigrationRequest",
     "MotivationProfile",
+    "MotivationRuntimeController",
     "MotivationScheduler",
     "MotivationSchedulerConfig",
     "RouterMigrationBackend",

@@ -69,3 +69,10 @@ quiesce/import/ownership-commit protocol.
 The next runtime integration layer should feed migration estimates into
 `MigrationEstimator`, reserve target memory, start the transfer during the
 current batch, and call `commit()` only after the target reports `ready`.
+## Runtime bridge
+
+`MotivationRuntimeController` is an opt-in bridge around the policy core. It
+forwards action and GPU events, starts at most one migration per scheduling
+turn, validates the candidate again after ownership changes, and hands a
+`DispatchLease` to a worker callback. The default ABot/SlackServe services are
+unchanged until a runtime supplies this controller and an executor callback.

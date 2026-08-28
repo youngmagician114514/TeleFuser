@@ -1,0 +1,238 @@
+"""Runtime bridge from LiveKit events to the motivation policy core.
+
+The controller is intentionally opt-in.  Existing TeleFuser services keep
+their worker-local scheduling behavior until a caller supplies this bridge and
+a worker dispatch callback.  This makes the migration from heuristic serving
+to the global policy incremental and testable.
+"""
+
+from __future__ import annotations
+
+import math
+import threading
+import time
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+
+from .async_migration import (
+    AsyncMigrationBackend,
+    AsyncMigrationManager,
+    MigrationRecord,
+    MigrationRequest,
+)
+from .motivation_scheduler import (
+    ActionJob,
+    DispatchCandidate,
+    MotivationScheduler,
+)
+
+
+@dataclass(frozen=True)
+class DispatchLease:
+    """Reserved policy decision handed to a worker executor."""
+
+    candidate: DispatchCandidate
+    jobs: tuple[ActionJob, ...]
+    reserved_at: float
+
+
+DispatchCallback = Callable[[DispatchLease], None]
+MigrationBackendFactory = Callable[[MigrationRequest], AsyncMigrationBackend]
+
+
+class MotivationRuntimeController:
+    """Connect event callbacks, global search, migration, and execution.
+
+    ``schedule_once`` is safe to call from an event loop or a background
+    scheduler thread.  It starts at most one migration per call, allowing the
+    next invocation to observe readiness without blocking another GPU.  A
+    candidate with a remote owner is therefore prepared first and dispatched
+    only after migration commits and the candidate is searched again.
+    """
+
+    def __init__(
+        self,
+        scheduler: MotivationScheduler,
+        *,
+        dispatch: DispatchCallback,
+        migration_manager: AsyncMigrationManager | None = None,
+        migration_backend_factory: MigrationBackendFactory | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.scheduler = scheduler
+        self.dispatch = dispatch
+        self.migration_manager = migration_manager
+        self.migration_backend_factory = migration_backend_factory
+        self._clock = clock
+        self._lock = threading.RLock()
+
+    def on_action(
+        self,
+        session_id: str,
+        controls: Iterable[str],
+        *,
+        now: float | None = None,
+        release: bool = True,
+    ) -> tuple[ActionJob | None, bool]:
+        """Forward one action update and preserve empty-to-nonempty semantics."""
+        return self.scheduler.submit_action(
+            session_id,
+            controls,
+            now=self._observed(now),
+            release=release,
+        )
+
+    def on_gpu_update(
+        self,
+        gpu_id: str,
+        *,
+        free_at: float | None = None,
+        memory_free_gb: float | None = None,
+        available: bool | None = None,
+        now: float | None = None,
+    ) -> None:
+        """Publish worker timing facts and invalidate stale searches."""
+        self.scheduler.update_gpu(
+            gpu_id,
+            free_at=free_at,
+            memory_free_gb=memory_free_gb,
+            available=available,
+            now=self._observed(now),
+        )
+
+    def on_migration_ready(
+        self,
+        session_id: str,
+        *,
+        target_gpu: str,
+        ready_at: float,
+        now: float | None = None,
+    ) -> None:
+        """Publish an externally observed migration-ready timestamp."""
+        self.scheduler.set_migration_ready(
+            session_id,
+            target_gpu=target_gpu,
+            ready_at=ready_at,
+            now=self._observed(now),
+        )
+
+    def schedule_once(
+        self,
+        *,
+        now: float | None = None,
+        wait_seconds: float = 0.0,
+    ) -> DispatchLease | None:
+        """Search globally and dispatch one current candidate if possible.
+
+        A remote candidate first starts or completes asynchronous migration.  A
+        fresh search is required after ownership changes, so no stale
+        candidate is reserved across the migration boundary.
+        """
+        observed_at = self._observed(now)
+        with self._lock:
+            candidate = self.scheduler.find_best(
+                now=observed_at,
+                wait_seconds=wait_seconds,
+                include_wait=True,
+            )
+            if candidate is None or candidate.wait:
+                return None
+            if candidate.migration_count:
+                if not self._prepare_migration(candidate, now=observed_at):
+                    return None
+                # ``_prepare_migration`` commits at most one transfer.  Search
+                # again on the next event so owner/version validation remains
+                # strict and the target GPU can be re-evaluated.
+                return None
+            if not self.scheduler.validate(candidate, now=observed_at):
+                return None
+            jobs = tuple(
+                self.scheduler.session(session_id).ready_job(include_idle=True)
+                for session_id in candidate.session_ids
+            )
+            if any(job is None for job in jobs):
+                return None
+            lease = DispatchLease(
+                candidate=candidate,
+                jobs=tuple(job for job in jobs if job is not None),
+                reserved_at=observed_at,
+            )
+            self.scheduler.reserve(candidate, now=observed_at)
+            self.dispatch(lease)
+            return lease
+
+    def on_completion(
+        self,
+        lease: DispatchLease,
+        *,
+        completed_at: float | None = None,
+        quality: float | None = None,
+    ) -> tuple[ActionJob, ...]:
+        """Commit worker completion and release the profile memory reservation."""
+        return self.scheduler.complete(
+            lease.candidate,
+            completed_at=self._observed(completed_at),
+            quality=quality,
+        )
+
+    def poll_migrations(self, *, now: float | None = None) -> tuple[MigrationRecord, ...]:
+        """Poll active transfers and return records that became ready/completed."""
+        if self.migration_manager is None:
+            return ()
+        records: list[MigrationRecord] = []
+        for record in self.migration_manager.active():
+            records.append(self.migration_manager.poll(record.request.session_id, now=self._observed(now)))
+        return tuple(records)
+
+    def _prepare_migration(self, candidate: DispatchCandidate, *, now: float) -> bool:
+        if self.migration_manager is None or self.migration_backend_factory is None:
+            # A policy caller that has no migration backend must not silently
+            # execute a remote-state candidate.  It can still use local GPU
+            # candidates by supplying a migration-disabled estimator/config.
+            return False
+        assert candidate.gpu_id is not None
+        for session_id in candidate.session_ids:
+            state = self.scheduler.session(session_id)
+            if state.owner_gpu == candidate.gpu_id:
+                continue
+            active = next(
+                (
+                    record
+                    for record in self.migration_manager.active()
+                    if record.request.session_id == session_id
+                ),
+                None,
+            )
+            if active is None:
+                request = MigrationRequest(
+                    session_id=session_id,
+                    source_gpu=state.owner_gpu,
+                    target_gpu=candidate.gpu_id,
+                    requested_at=now,
+                    estimated_ready_at=max(now, candidate.start_at),
+                )
+                self.migration_manager.begin(
+                    request,
+                    self.migration_backend_factory(request),
+                )
+                self.scheduler.set_migration_ready(
+                    session_id,
+                    target_gpu=candidate.gpu_id,
+                    ready_at=request.estimated_ready_at,
+                    now=now,
+                )
+                return False
+            record = self.migration_manager.poll(session_id, now=now)
+            if record.state != "ready":
+                return False
+            self.migration_manager.commit(session_id, now=now)
+            self.scheduler.commit_migration(session_id, target_gpu=candidate.gpu_id, now=now)
+            return False
+        return True
+
+    def _observed(self, now: float | None) -> float:
+        observed = self._clock() if now is None else now
+        if not math.isfinite(observed) or observed < 0:
+            raise ValueError("observed time must be finite and non-negative")
+        return observed
+
