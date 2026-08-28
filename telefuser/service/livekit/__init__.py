@@ -2,7 +2,23 @@
 
 from __future__ import annotations
 
+from .async_migration import (
+    AsyncMigrationManager,
+    MigrationRecord,
+    MigrationRequest,
+    RouterMigrationBackend,
+)
 from .config import LiveKitServeConfig
+from .motivation_scheduler import (
+    ActionJob,
+    DispatchCandidate,
+    GpuSchedulingState,
+    MotivationProfile,
+    MotivationScheduler,
+    MotivationSchedulerConfig,
+    SessionSchedulingState,
+    StaticMotivationProfileTable,
+)
 from .pipeline_router import TurboServePipelineRouter, TurboServeWorkerPipelineView
 from .turboserve import (
     TurboServeAutoscalingController,
@@ -13,6 +29,18 @@ from .turboserve import (
 
 __all__ = [
     "LiveKitServeConfig",
+    "ActionJob",
+    "AsyncMigrationManager",
+    "DispatchCandidate",
+    "GpuSchedulingState",
+    "MigrationRecord",
+    "MigrationRequest",
+    "MotivationProfile",
+    "MotivationScheduler",
+    "MotivationSchedulerConfig",
+    "RouterMigrationBackend",
+    "SessionSchedulingState",
+    "StaticMotivationProfileTable",
     "TurboServePipelineRouter",
     "TurboServeWorkerPipelineView",
     "TurboServeAutoscalingController",

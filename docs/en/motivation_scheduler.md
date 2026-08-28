@@ -1,0 +1,71 @@
+# Motivation scheduler control plane
+
+`telefuser.service.livekit.motivation_scheduler` is the policy-side scheduler
+for the ABot-World motivation.  It is deliberately independent of CUDA and
+LiveKit transport so that the same candidate search can be tested with the
+offline profile table and then driven by a real worker adapter.
+
+## State and job semantics
+
+The control plane keeps one `SessionSchedulingState` per retained session:
+
+- one pending action job (a newer released action replaces the older pending
+  state);
+- an in-flight job that is never cancelled by a later action;
+- one pending idle sentinel, plus the duration of an idle video not yet
+  consumed;
+- playout slack, playback state, quality EMA, owner GPU, and migration state.
+
+An action update with no release (for example, an intermediate state change in
+the one-second heartbeat window) changes the latest controls but creates no
+job.  Action jobs are considered before idle jobs globally.  An idle sentinel
+cannot be regenerated until its generated video has been consumed.
+
+`SessionSchedulingState.advance_to()` consumes slack independently of the
+latest controls.  Once frames enter the consumer queue, releasing the controls
+does not stop playback.  An explicitly paused consumer can set
+`playback_active=False`.
+
+## Candidate search
+
+`MotivationScheduler.find_best()` enumerates, for every available GPU:
+
+1. one ready job per session;
+2. all batch sizes from one through `max_batch_size` (capped at four);
+3. only batches with the same compatibility key;
+4. every fidelity row in the offline profile provider;
+5. migration readiness and target memory constraints;
+6. a deliberate wait candidate.
+
+The score uses the simulator's `U(P)=min(P, cap)` utility over every
+non-departed session.  The candidate duration includes the predicted GPU free
+time and migration-ready time.  Selected sessions receive the profile's
+output duration and their quality EMA is updated with the profile's offline
+quality.  The fairness check uses the predicted system mean quality and
+`fairness_delta`.
+
+The returned candidate captures the scheduler epoch, per-session state
+versions, and GPU version.  `reserve()` validates all of them, so a search run
+asynchronously while a GPU is computing cannot dispatch stale action state or
+ownership.
+
+## Asynchronous migration
+
+`async_migration.AsyncMigrationManager` exposes a backend-neutral state machine:
+
+```text
+precopied -> ready -> committing -> completed
+                         └────────> failed
+precopied/ready ────────> aborted
+```
+
+A true backend can pre-copy KV state while the source computes and perform a
+short final delta copy at a chunk boundary.  `RouterMigrationBackend` is a
+compatibility adapter for the current blocking `TurboServePipelineRouter`:
+the router operation runs in a private thread, so the scheduler is not
+blocked, while the router still preserves its existing boundary-safe
+quiesce/import/ownership-commit protocol.
+
+The next runtime integration layer should feed migration estimates into
+`MigrationEstimator`, reserve target memory, start the transfer during the
+current batch, and call `commit()` only after the target reports `ready`.
