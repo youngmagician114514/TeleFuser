@@ -142,12 +142,32 @@ class MotivationRuntimeController:
                 )
                 self._owns_search_executor = True
             executor = self._search_executor
-        return executor.submit(
-            self.scheduler.find_best,
-            now=observed_at,
-            wait_seconds=wait_seconds,
-            include_wait=True,
-        )
+        def search() -> DispatchCandidate | None:
+            # The task may start after an event callback has advanced policy
+            # time.  Search from the scheduler's current timeline rather than
+            # failing with a backwards-time error; dispatch_candidate still
+            # rejects the captured epoch if the state changed meanwhile.
+            search_at = max(observed_at, self.scheduler.current_time)
+            try:
+                return self.scheduler.find_best(
+                    now=search_at,
+                    wait_seconds=wait_seconds,
+                    include_wait=True,
+                )
+            except ValueError as exc:
+                # A concurrent event can advance the scheduler between the
+                # time read above and find_best acquiring its lock. Retry at
+                # the newer timeline; any semantic change is still caught by
+                # the candidate epoch check at dispatch time.
+                if "monotonic" not in str(exc):
+                    raise
+                return self.scheduler.find_best(
+                    now=self.scheduler.current_time,
+                    wait_seconds=wait_seconds,
+                    include_wait=True,
+                )
+
+        return executor.submit(search)
 
     def schedule_once(
         self,

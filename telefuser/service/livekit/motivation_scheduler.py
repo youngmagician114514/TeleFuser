@@ -529,6 +529,12 @@ class MotivationScheduler:
         with self._lock:
             return self._epoch
 
+    @property
+    def current_time(self) -> float:
+        """Return the latest monotonic policy time observed by the scheduler."""
+        with self._lock:
+            return self._now
+
     def add_gpu(self, state: GpuSchedulingState) -> None:
         """Register or replace a scheduler-visible GPU snapshot."""
         with self._lock:

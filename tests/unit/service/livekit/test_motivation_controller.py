@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import threading
 
 from telefuser.service.livekit.async_migration import AsyncMigrationManager, MigrationRequest
@@ -17,6 +18,46 @@ def _make_scheduler() -> MotivationScheduler:
     scheduler = MotivationScheduler(StaticMotivationProfileTable(profiles))
     scheduler.add_gpu(GpuSchedulingState("gpu-0", free_at=0.0, memory_free_gb=80.0))
     return scheduler
+
+
+class _DeferredExecutor(concurrent.futures.Executor):
+    def __init__(self) -> None:
+        self._function = None
+        self._future: concurrent.futures.Future[object] | None = None
+
+    def submit(self, fn, /, *args, **kwargs):
+        if args or kwargs:
+            raise AssertionError("test executor only supports the wrapped search closure")
+        self._function = fn
+        self._future = concurrent.futures.Future()
+        return self._future
+
+    def run(self) -> None:
+        assert self._function is not None and self._future is not None
+        try:
+            self._future.set_result(self._function())
+        except BaseException as exc:
+            self._future.set_exception(exc)
+
+
+def test_delayed_async_search_follows_scheduler_timeline() -> None:
+    scheduler = _make_scheduler()
+    scheduler.register_session("s", owner_gpu="gpu-0", now=0.0)
+    scheduler.submit_action("s", ["W"], now=0.0)
+    executor = _DeferredExecutor()
+    controller = MotivationRuntimeController(
+        scheduler,
+        dispatch=lambda lease: None,
+        search_executor=executor,
+    )
+
+    future = controller.search_async(now=0.0)
+    scheduler.submit_action("s", ["D"], now=0.1, release=True)
+    executor.run()
+
+    candidate = future.result(timeout=1.0)
+    assert candidate is not None
+    assert candidate.job_ids == (scheduler.session("s").pending_action.job_id,)
 
 
 def test_controller_reserves_and_completes_local_dispatch() -> None:
