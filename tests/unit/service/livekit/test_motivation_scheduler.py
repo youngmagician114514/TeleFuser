@@ -121,6 +121,25 @@ def test_candidate_is_rejected_after_pending_job_version_changes() -> None:
         scheduler.reserve(candidate, now=0.1)
 
 
+def test_departure_keeps_reserved_job_until_completion() -> None:
+    scheduler = _scheduler()
+    scheduler.register_session("s", owner_gpu="gpu-0", now=0.0)
+    scheduler.submit_action("s", ["W"], now=0.0)
+    candidate = scheduler.find_best(now=0.0, include_wait=False)
+    assert candidate is not None
+    scheduler.reserve(candidate, now=0.0)
+
+    scheduler.mark_departed("s", now=0.1)
+    state = scheduler.session("s")
+    assert state.departed is True
+    assert state.in_flight is not None
+    completed = scheduler.complete(candidate, completed_at=0.4)
+
+    assert completed[0].job_id == candidate.job_ids[0]
+    assert state.in_flight is None
+    assert scheduler.gpus()[0].memory_free_gb == pytest.approx(80.0)
+
+
 def test_new_ready_session_invalidates_global_candidate() -> None:
     scheduler = _scheduler()
     scheduler.register_session("a", owner_gpu="gpu-0", now=0.0)

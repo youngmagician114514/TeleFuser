@@ -340,13 +340,17 @@ class SessionSchedulingState:
         return job
 
     def mark_departed(self, *, now: float) -> None:
-        """Drop future work while retaining completed accounting state."""
+        """Drop future work while allowing a reserved invocation to drain.
+
+        A departure can race with a GPU invocation that was already reserved.
+        Keep that in-flight job until the completion callback releases its GPU
+        reservation; only future pending jobs are discarded.
+        """
         self.advance_to(now)
         self.departed = True
         self.active = False
         self.pending_action = None
         self.pending_idle = None
-        self.in_flight = None
 
 
 @dataclass(frozen=True)
