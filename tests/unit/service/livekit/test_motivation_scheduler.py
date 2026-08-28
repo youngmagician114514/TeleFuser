@@ -121,6 +121,19 @@ def test_candidate_is_rejected_after_pending_job_version_changes() -> None:
         scheduler.reserve(candidate, now=0.1)
 
 
+def test_new_ready_session_invalidates_global_candidate() -> None:
+    scheduler = _scheduler()
+    scheduler.register_session("a", owner_gpu="gpu-0", now=0.0)
+    scheduler.register_session("b", owner_gpu="gpu-0", now=0.0)
+    scheduler.submit_action("a", ["W"], now=0.0)
+    candidate = scheduler.find_best(now=0.0, include_wait=False)
+    assert candidate is not None
+
+    scheduler.submit_action("b", ["D"], now=0.1, release=True)
+
+    assert scheduler.validate(candidate, now=0.1) is False
+
+
 class _FakeMigrationBackend:
     def __init__(self) -> None:
         self.ready_event = threading.Event()

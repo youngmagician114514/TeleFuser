@@ -938,6 +938,10 @@ class MotivationScheduler:
                 return candidate.snapshot_epoch == self._epoch
             if candidate.gpu_id is None or candidate.profile is None:
                 return False
+            # A new ready job can change the globally optimal batch even when
+            # none of the candidate's selected sessions changed.
+            if candidate.snapshot_epoch != self._epoch:
+                return False
             gpu = self._gpus.get(candidate.gpu_id)
             if gpu is None or not gpu.available or gpu.version != candidate.gpu_version:
                 return False
