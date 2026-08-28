@@ -25,6 +25,7 @@ from .motivation_scheduler import (
     ActionJob,
     DispatchCandidate,
     MotivationScheduler,
+    SessionSchedulingState,
 )
 
 
@@ -70,6 +71,32 @@ class MotivationRuntimeController:
         self._owns_search_executor = False
         self._clock = clock
         self._lock = threading.RLock()
+
+    def on_session_registered(
+        self,
+        session_id: str,
+        *,
+        owner_gpu: str,
+        now: float | None = None,
+        slack_seconds: float | None = None,
+        quality: float | None = None,
+        compatibility_key: Iterable[object] = (),
+        active: bool = True,
+    ) -> SessionSchedulingState:
+        """Register a retained session at the runtime event boundary."""
+        return self.scheduler.register_session(
+            session_id,
+            owner_gpu=owner_gpu,
+            now=self._observed(now),
+            slack_seconds=slack_seconds,
+            quality=quality,
+            compatibility_key=compatibility_key,
+            active=active,
+        )
+
+    def on_session_departed(self, session_id: str, *, now: float | None = None) -> None:
+        """Remove future policy work while retaining any in-flight job."""
+        self.scheduler.mark_departed(session_id, now=self._observed(now))
 
     def on_action(
         self,

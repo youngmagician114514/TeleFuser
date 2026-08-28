@@ -60,6 +60,19 @@ def test_delayed_async_search_follows_scheduler_timeline() -> None:
     assert candidate.job_ids == (scheduler.session("s").pending_action.job_id,)
 
 
+def test_controller_forwards_session_lifecycle_events() -> None:
+    scheduler = _make_scheduler()
+    controller = MotivationRuntimeController(scheduler, dispatch=lambda lease: None)
+
+    state = controller.on_session_registered("s", owner_gpu="gpu-0", now=0.0)
+    assert state.session_id == "s"
+    controller.on_action("s", ["W"], now=0.0)
+    controller.on_session_departed("s", now=0.1)
+
+    assert scheduler.session("s").departed is True
+    assert scheduler.session("s").pending_action is None
+
+
 def test_controller_reserves_and_completes_local_dispatch() -> None:
     scheduler = _make_scheduler()
     scheduler.register_session("s", owner_gpu="gpu-0", now=0.0)

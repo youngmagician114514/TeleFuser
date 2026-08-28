@@ -94,9 +94,11 @@ The next runtime integration layer should feed migration estimates into
 current batch, and call `commit()` only after the target reports `ready`.
 ## Runtime bridge
 
-`MotivationRuntimeController` is an opt-in bridge around the policy core. It
-forwards action and GPU events, starts at most one migration per scheduling
-turn, validates the candidate again after ownership changes, and hands a
+`MotivationRuntimeController` is an opt-in bridge around the policy core. Use
+`on_session_registered()` and `on_session_departed()` at the room lifecycle
+boundary, then forward action and GPU events with `on_action()` and
+`on_gpu_update()`. It starts at most one migration per scheduling turn,
+validates the candidate again after ownership changes, and hands a
 `DispatchLease` to a worker callback. The default ABot/SlackServe services are
 unchanged until a runtime supplies this controller and an executor callback.
 
