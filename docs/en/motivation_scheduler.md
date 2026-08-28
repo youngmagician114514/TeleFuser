@@ -93,3 +93,10 @@ forwards action and GPU events, starts at most one migration per scheduling
 turn, validates the candidate again after ownership changes, and hands a
 `DispatchLease` to a worker callback. The default ABot/SlackServe services are
 unchanged until a runtime supplies this controller and an executor callback.
+
+For overlap with an active GPU invocation, call `search_async()` at the
+current completion boundary and later pass its result to
+`dispatch_candidate()`. The background task only computes a snapshot;
+reservation and dispatch remain synchronous and are rejected if the global
+epoch, selected job version, owner, or GPU version changed. Call `close()`
+when the owning runtime shuts down.

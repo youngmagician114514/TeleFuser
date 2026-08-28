@@ -8,6 +8,7 @@ to the global policy incremental and testable.
 
 from __future__ import annotations
 
+import concurrent.futures
 import math
 import threading
 import time
@@ -38,6 +39,7 @@ class DispatchLease:
 
 DispatchCallback = Callable[[DispatchLease], None]
 MigrationBackendFactory = Callable[[MigrationRequest], AsyncMigrationBackend]
+SearchExecutor = concurrent.futures.Executor
 
 
 class MotivationRuntimeController:
@@ -57,12 +59,15 @@ class MotivationRuntimeController:
         dispatch: DispatchCallback,
         migration_manager: AsyncMigrationManager | None = None,
         migration_backend_factory: MigrationBackendFactory | None = None,
+        search_executor: SearchExecutor | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.scheduler = scheduler
         self.dispatch = dispatch
         self.migration_manager = migration_manager
         self.migration_backend_factory = migration_backend_factory
+        self._search_executor = search_executor
+        self._owns_search_executor = False
         self._clock = clock
         self._lock = threading.RLock()
 
@@ -116,13 +121,56 @@ class MotivationRuntimeController:
             now=self._observed(now),
         )
 
+    def search_async(
+        self,
+        *,
+        now: float | None = None,
+        wait_seconds: float = 0.0,
+    ) -> concurrent.futures.Future[DispatchCandidate | None]:
+        """Search in a background executor while the GPU runs another lease.
+
+        The returned future contains only a snapshot candidate.  It never
+        reserves a job; callers must pass the result to
+        :meth:`dispatch_candidate`, which performs the current-state check.
+        """
+        observed_at = self._observed(now)
+        with self._lock:
+            if self._search_executor is None:
+                self._search_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="telefuser-motivation-search",
+                )
+                self._owns_search_executor = True
+            executor = self._search_executor
+        return executor.submit(
+            self.scheduler.find_best,
+            now=observed_at,
+            wait_seconds=wait_seconds,
+            include_wait=True,
+        )
+
     def schedule_once(
         self,
         *,
         now: float | None = None,
         wait_seconds: float = 0.0,
     ) -> DispatchLease | None:
-        """Search globally and dispatch one current candidate if possible.
+        """Search synchronously and dispatch one current candidate if possible."""
+        observed_at = self._observed(now)
+        candidate = self.scheduler.find_best(
+            now=observed_at,
+            wait_seconds=wait_seconds,
+            include_wait=True,
+        )
+        return self.dispatch_candidate(candidate, now=observed_at) if candidate is not None else None
+
+    def dispatch_candidate(
+        self,
+        candidate: DispatchCandidate,
+        *,
+        now: float | None = None,
+    ) -> DispatchLease | None:
+        """Validate and dispatch a candidate produced by sync or async search.
 
         A remote candidate first starts or completes asynchronous migration.  A
         fresh search is required after ownership changes, so no stale
@@ -130,19 +178,13 @@ class MotivationRuntimeController:
         """
         observed_at = self._observed(now)
         with self._lock:
-            candidate = self.scheduler.find_best(
-                now=observed_at,
-                wait_seconds=wait_seconds,
-                include_wait=True,
-            )
-            if candidate is None or candidate.wait:
+            if candidate.wait:
                 return None
             if candidate.migration_count:
                 if not self._prepare_migration(candidate, now=observed_at):
                     return None
-                # ``_prepare_migration`` commits at most one transfer.  Search
-                # again on the next event so owner/version validation remains
-                # strict and the target GPU can be re-evaluated.
+                # ``_prepare_migration`` commits at most one transfer. Search
+                # again after the ownership/version boundary.
                 return None
             if not self.scheduler.validate(candidate, now=observed_at):
                 return None
@@ -160,6 +202,15 @@ class MotivationRuntimeController:
             self.scheduler.reserve(candidate, now=observed_at)
             self.dispatch(lease)
             return lease
+
+    def close(self) -> None:
+        """Release a controller-owned background search executor."""
+        with self._lock:
+            executor = self._search_executor if self._owns_search_executor else None
+            self._search_executor = None
+            self._owns_search_executor = False
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def on_completion(
         self,

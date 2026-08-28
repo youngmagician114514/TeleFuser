@@ -52,6 +52,22 @@ class _ReadyBackend:
         return None
 
 
+def test_async_search_candidate_is_revalidated_before_dispatch() -> None:
+    scheduler = _make_scheduler()
+    scheduler.register_session("s", owner_gpu="gpu-0", now=0.0)
+    scheduler.submit_action("s", ["W"], now=0.0)
+    leases = []
+    controller = MotivationRuntimeController(scheduler, dispatch=leases.append)
+
+    candidate = controller.search_async(now=0.0).result(timeout=2.0)
+    assert candidate is not None
+    scheduler.submit_action("s", ["D"], now=0.1, release=True)
+
+    assert controller.dispatch_candidate(candidate, now=0.1) is None
+    assert leases == []
+    controller.close()
+
+
 def test_controller_prepares_async_migration_before_remote_dispatch() -> None:
     profiles = [MotivationProfile(1, "high", 0.4, 0.68, 20.0)]
     scheduler = MotivationScheduler(StaticMotivationProfileTable(profiles))
