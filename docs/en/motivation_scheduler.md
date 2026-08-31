@@ -49,6 +49,14 @@ latest controls.  Once frames enter the consumer queue, releasing the controls
 does not stop playback.  An explicitly paused consumer can set
 `playback_active=False`.
 
+When the LiveKit runtime reports a session as running, the execution bridge
+materializes an idle sentinel if no action state is held. The bridge forwards
+that sentinel as a one-shot `control_state` with `controls=[]` and
+`motivation.kind="idle"`; the ABot service treats this as a valid no-new-action
+continuation and then clears the one-shot marker. A subsequent idle sentinel is
+created only after the generated chunk reaches the publisher, so an action never
+replaces an unconsumed idle video.
+
 ## Candidate search
 
 `MotivationScheduler.find_best()` enumerates, for every available GPU:

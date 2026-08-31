@@ -45,6 +45,39 @@ def test_bridge_releases_action_and_commits_on_model_output() -> None:
     assert lease.candidate.batch_size == 1
 
 
+def test_bridge_dispatches_idle_and_waits_for_published_video_before_next_idle() -> None:
+    now = [0.0]
+    controller = _controller()
+    dispatched = []
+    bridge = MotivationExecutionBridge(
+        controller,
+        dispatch=lambda lease, payloads: dispatched.append((lease, payloads)),
+        clock=lambda: now[0],
+    )
+    bridge.register_session("session-1", owner_gpu="gpu-0", now=0.0)
+    bridge.register_pipeline_session("session-1", "pipeline-1")
+
+    bridge.on_session_ready("session-1")
+    assert len(dispatched) == 1
+    idle_lease, idle_payloads = dispatched[0]
+    assert idle_lease.jobs[0].kind == "idle"
+    assert idle_payloads[0][1]["controls"] == []
+    assert idle_payloads[0][1]["motivation"]["kind"] == "idle"
+
+    bridge.on_model_output("worker-0", "pipeline-1", {"type": "chunk"})
+    assert controller.scheduler.session("session-1").idle_video_outstanding is True
+    assert len(dispatched) == 1
+
+    now[0] = 0.5
+    bridge.on_chunk_published("worker-0", "session-1", 12)
+    assert len(dispatched) == 1
+
+    now[0] = 1.1
+    bridge.on_chunk_published("worker-0", "session-1", 12)
+    assert len(dispatched) == 2
+    assert dispatched[1][0].jobs[0].kind == "idle"
+
+
 def test_bridge_applies_one_second_gate_to_default_control_states() -> None:
     now = [0.0]
     controller = _controller()

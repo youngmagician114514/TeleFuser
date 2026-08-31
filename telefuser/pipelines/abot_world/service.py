@@ -101,11 +101,12 @@ class _ABotWorldLiveKitSession:
     lock: threading.RLock = field(default_factory=threading.RLock)
     in_flight: bool = False
     ready_since: float | None = None
-    # Motivation dispatches are one action job per selected session. The
+    # Motivation dispatches are one bounded job per selected session. The
     # bridge sets this marker so the worker emits exactly one chunk rather than
-    # free-running on a held control state.
+    # free-running on a held control state; idle jobs use an empty action map.
     motivation_one_shot: bool = False
     motivation_job_id: str | None = None
+    motivation_kind: str | None = None
     motivation_fidelity: str | None = None
     next_playout_deadline: float = field(default_factory=time.monotonic)
     created_at: float = field(default_factory=time.monotonic)
@@ -545,6 +546,8 @@ class ABotWorldLiveKitService:
             state.motivation_one_shot = (
                 isinstance(motivation, dict) and bool(motivation.get("one_shot"))
             )
+            motivation_kind = str(motivation.get("kind", "")) if isinstance(motivation, dict) else ""
+            state.motivation_kind = motivation_kind if state.motivation_one_shot else None
             state.motivation_job_id = (
                 str(motivation.get("job_id"))
                 if state.motivation_one_shot and isinstance(motivation, dict) and motivation.get("job_id")
@@ -556,11 +559,12 @@ class ABotWorldLiveKitService:
                 else None
             )
             state.last_control_at = now
-            state.ready_since = now if state.controls else None
+            idle_one_shot = state.motivation_one_shot and state.motivation_kind == "idle"
+            state.ready_since = now if state.controls or idle_one_shot else None
             # A newly reactivated session should not wait behind an old playout
             # prediction. Existing active sessions keep their pacing deadline so
             # frequent control updates cannot force the scheduler to free-run.
-            if state.controls and not was_controlled:
+            if (state.controls and not was_controlled) or idle_one_shot:
                 state.pacing_ready_at = now
             state.control_event.set()
             if state.controls:
@@ -984,6 +988,8 @@ class ABotWorldLiveKitService:
                 "emitted_frames_after": None,
                 "frames": None,
                 "controls": sorted(str(key) for key, enabled in controls.items() if enabled),
+                "motivation_kind": state.motivation_kind,
+                "motivation_job_id": state.motivation_job_id,
                 "queue_wait_seconds": max(0.0, selected_at - ready_at),
                 "frame_credit_enabled": int(self._uses_publisher_frame_credit(state)),
                 "queued_video_frames": queued_video_frames,
@@ -1104,6 +1110,7 @@ class ABotWorldLiveKitService:
                             state.pipeline_session.lifecycle = ABotWorldSessionLifecycle.IDLE
                         if (
                             not state.controls
+                            and not state.motivation_one_shot
                             and not state.in_flight
                             and state.pipeline_session.is_resident
                             and now - state.last_control_at >= self.idle_suspension_seconds
@@ -1154,9 +1161,10 @@ class ABotWorldLiveKitService:
         for state in self._sessions.values():
             with state.lock:
                 lossless_blocked = state.config["delivery_mode"] == "lossless" and state.output_queue.full()
+                idle_one_shot = state.motivation_one_shot and state.motivation_kind == "idle"
                 if (
                     state.active
-                    and state.controls
+                    and (state.controls or idle_one_shot)
                     and not state.in_flight
                     and not state.migrating
                     and not lossless_blocked
@@ -1187,6 +1195,7 @@ class ABotWorldLiveKitService:
         next_wake_at: float | None = None
         for state in self._sessions.values():
             with state.lock:
+                idle_one_shot = state.motivation_one_shot and state.motivation_kind == "idle"
                 if state.active and state.controls:
                     control_expiry = state.last_control_at + state.control_idle_timeout
                     next_wake_at = control_expiry if next_wake_at is None else min(next_wake_at, control_expiry)
@@ -1202,7 +1211,12 @@ class ABotWorldLiveKitService:
                             else state.pacing_ready_at - self._pacing_coalescing_slack_seconds(state)
                         )
                         next_wake_at = pacing_wake if next_wake_at is None else min(next_wake_at, pacing_wake)
-                elif not state.in_flight and state.pipeline_session.is_resident and not state.controls:
+                elif (
+                    not state.in_flight
+                    and state.pipeline_session.is_resident
+                    and not state.controls
+                    and not idle_one_shot
+                ):
                     suspension_at = state.last_control_at + self.idle_suspension_seconds
                     next_wake_at = suspension_at if next_wake_at is None else min(next_wake_at, suspension_at)
         if next_wake_at is None:
@@ -1736,6 +1750,7 @@ class ABotWorldLiveKitService:
                         state.ready_since = None
                         state.motivation_one_shot = False
                         state.motivation_job_id = None
+                        state.motivation_kind = None
                         state.motivation_fidelity = None
                 self._put_output(state, payload)
             self._emit_dispatch_trace(

@@ -92,6 +92,27 @@ def test_idle_video_is_consumption_gated_and_does_not_get_overwritten() -> None:
     assert scheduler.create_idle_job("s", now=1.2) is None
 
 
+def test_action_drops_only_a_pending_idle_sentinel() -> None:
+    scheduler = _scheduler()
+    scheduler.register_session("s", owner_gpu="gpu-0", now=0.0)
+    idle = scheduler.create_idle_job("s", now=0.0)
+    assert idle is not None
+
+    action, _ = scheduler.submit_action("s", ["W"], now=0.1, release=True)
+
+    assert action is not None
+    assert scheduler.session("s").pending_idle is None
+
+
+def test_idle_is_not_inserted_while_latest_action_state_is_held() -> None:
+    scheduler = _scheduler()
+    scheduler.register_session("s", owner_gpu="gpu-0", now=0.0)
+    scheduler.submit_action("s", ["W"], now=0.0, release=True)
+
+    assert scheduler.create_idle_job("s", now=0.1) is None
+    assert scheduler.session("s").pending_idle is None
+
+
 def test_candidate_uses_global_slack_and_same_compatibility_key() -> None:
     scheduler = _scheduler(max_batch_size=4)
     scheduler.register_session("a", owner_gpu="gpu-0", now=0.0, slack_seconds=0.5, compatibility_key=(3,))

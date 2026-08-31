@@ -265,6 +265,11 @@ class SessionSchedulingState:
         self.latest_controls = canonical
         if not release or not canonical or self.departed:
             return False
+        # A not-yet-dispatched idle sentinel describes the old no-action state.
+        # A new action makes it stale and drops only that pending sentinel; an
+        # idle job already in flight is retained and its generated video remains
+        # protected from overwrite.
+        self.pending_idle = None
         had_pending = self.pending_action is not None
         self.state_version += 1
         self.pending_action = ActionJob(
@@ -280,7 +285,10 @@ class SessionSchedulingState:
     def create_idle_job(self, *, job_id: str, now: float) -> ActionJob | None:
         """Create one idle sentinel if no action or idle output is pending."""
         self.advance_to(now)
-        if self.departed or self.pending_action is not None:
+        # A held latest action state still represents user work even when its
+        # next heartbeat has not released a replacement job. Do not insert an
+        # idle continuation into that gap; the next action heartbeat must win.
+        if self.departed or self.latest_controls or self.pending_action is not None:
             return None
         if self.pending_idle is not None or self.in_flight is not None:
             return None

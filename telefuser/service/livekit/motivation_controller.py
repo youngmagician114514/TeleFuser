@@ -288,6 +288,7 @@ class MotivationRuntimeController:
     ) -> DispatchLease | None:
         """Search synchronously and dispatch one current candidate if possible."""
         observed_at = self._observed(now)
+        self._ensure_idle_jobs(now=observed_at)
         candidate = self.scheduler.find_best(
             now=observed_at,
             wait_seconds=wait_seconds,
@@ -312,6 +313,15 @@ class MotivationRuntimeController:
         if fallback is None:
             return None
         return self.dispatch_candidate(fallback, now=self.scheduler.current_time)
+
+    def _ensure_idle_jobs(self, *, now: float) -> None:
+        """Materialize at most one consumption-gated idle sentinel per session."""
+        if not self.scheduler.config.include_idle_jobs:
+            return
+        for state in self.scheduler.sessions():
+            if state.departed:
+                continue
+            self.scheduler.create_idle_job(state.session_id, now=now)
 
     def dispatch_candidate(
         self,

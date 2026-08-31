@@ -84,6 +84,7 @@ class MotivationExecutionBridge:
         self._pipeline_to_session: dict[str, str] = {}
         self._leases: dict[str, _LeaseProgress] = {}
         self._job_to_lease: dict[str, str] = {}
+        self._idle_wakeup_timers: dict[str, threading.Timer] = {}
         self._lease_sequence = 0
         self.controller.set_dispatch_callback(self._dispatch_lease)
 
@@ -103,6 +104,11 @@ class MotivationExecutionBridge:
 
         with self._lock:
             self._pipeline_to_session[pipeline_session_id] = session_id
+
+    def on_session_ready(self, session_id: str) -> None:
+        """Start policy work after the worker has replayed pre-connect input."""
+        del session_id
+        self._schedule()
 
     def on_control_message(self, worker_id: str, session_id: str, chunk: dict[str, Any]) -> bool:
         """Consume one normalized worker control and maybe release a job."""
@@ -171,11 +177,47 @@ class MotivationExecutionBridge:
         self.controller.on_completion(lease, completed_at=self._clock())
         self._schedule()
 
+    def on_chunk_published(
+        self,
+        worker_id: str,
+        session_id: str,
+        frames: int,
+        first_frame_at: float | None = None,
+    ) -> None:
+        """Wake idle scheduling after a generated chunk reaches the publisher."""
+        del worker_id, frames, first_frame_at
+        self._schedule()
+        try:
+            state = self.controller.scheduler.session(session_id)
+        except KeyError:
+            return
+        remaining = max(0.0, state.idle_video_remaining_seconds)
+        if remaining <= 1e-9:
+            self._schedule()
+            return
+        with self._lock:
+            previous = self._idle_wakeup_timers.pop(session_id, None)
+            if previous is not None:
+                previous.cancel()
+            timer = threading.Timer(remaining, self._idle_wakeup, args=(session_id,))
+            timer.daemon = True
+            self._idle_wakeup_timers[session_id] = timer
+            timer.start()
+
+    def _idle_wakeup(self, session_id: str) -> None:
+        """Re-run policy after the published idle chunk's playback duration."""
+        with self._lock:
+            self._idle_wakeup_timers.pop(session_id, None)
+        self._schedule()
+
     def on_session_departed(self, session_id: str, *, now: float | None = None) -> None:
         """Stop future policy work while allowing an in-flight lease to drain."""
 
         self.controller.on_session_departed(session_id, now=self._observed(now))
         with self._lock:
+            timer = self._idle_wakeup_timers.pop(session_id, None)
+            if timer is not None:
+                timer.cancel()
             # Keep the pipeline mapping until an in-flight output can commit
             # its reservation. The runtime owns final mapping cleanup.
             self._controls.pop(session_id, None)
@@ -184,6 +226,11 @@ class MotivationExecutionBridge:
     def close(self) -> None:
         """Close the controller's optional async-search executor."""
 
+        with self._lock:
+            timers = tuple(self._idle_wakeup_timers.values())
+            self._idle_wakeup_timers.clear()
+        for timer in timers:
+            timer.cancel()
         self.controller.close()
 
     def _dispatch_lease(self, lease: DispatchLease) -> None:
@@ -204,12 +251,8 @@ class MotivationExecutionBridge:
                 },
             )
             for job in lease.jobs
-            if job.kind == "action"
         )
         if not payloads:
-            # Idle sentinels are policy-side work.  A model-specific runtime
-            # may provide an idle executor later; never pretend that an idle
-            # marker generated a video by sending an empty action to ABot.
             return
         with self._lock:
             self._lease_sequence += 1

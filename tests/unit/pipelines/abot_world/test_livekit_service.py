@@ -363,6 +363,39 @@ def test_motivation_one_shot_control_emits_one_chunk() -> None:
         service.stop()
 
 
+def test_motivation_idle_one_shot_generates_empty_action_context() -> None:
+    service, pipeline = _service(output_queue_size=4, max_batch_size=1, control_idle_timeout=30)
+    service.configure_session_capacity(1)
+    session_id = _create(service, "motivation-idle-one-shot")
+    state = service._session(session_id)
+    assert state is not None
+    try:
+        assert _take_and_notify(service, state)["type"] == "preview"
+        service.push_chunk(
+            session_id,
+            {
+                "type": "control_state",
+                "controls": [],
+                "motivation": {
+                    "job_id": "session:idle:1",
+                    "kind": "idle",
+                    "fidelity": "b1_s2_w6_rho0_bf16",
+                    "one_shot": True,
+                },
+            },
+        )
+        payload = _take_and_notify(service, state)
+        assert payload["type"] == "chunk"
+        _wait_for(lambda: len(pipeline.generate_calls) == 1)
+        assert pipeline.generate_calls[0][1] == {}
+        with state.lock:
+            assert state.controls == set()
+            assert state.motivation_one_shot is False
+            assert state.motivation_kind is None
+    finally:
+        service.stop()
+
+
 def test_round_robin_remains_single_session_ablation() -> None:
     service, pipeline = _service(output_queue_size=4, scheduler_mode="round_robin")
     service.configure_session_capacity(2)

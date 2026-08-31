@@ -329,6 +329,11 @@ class LiveKitServeRuntime:
         """Apply a worker-reported public session state."""
         if self.registry.require(session_id).status not in TERMINAL_SESSION_STATUSES:
             self.registry.update_status(session_id, status, error=error)
+        # ``running`` is emitted after the worker has replayed any control that
+        # arrived before pipeline creation. Start the initial idle sentinel only
+        # at this boundary so it cannot race a pre-connect action.
+        if status == "running" and self._motivation_bridge is not None:
+            self._motivation_bridge.on_session_ready(session_id)
 
     def on_pipeline_session(self, session_id: str, pipeline_session_id: str) -> None:
         """Record the pipeline session created by a worker."""
@@ -373,6 +378,9 @@ class LiveKitServeRuntime:
             frames=frames,
             first_frame_at=first_frame_at,
         )
+        bridge = self._motivation_bridge
+        if bridge is not None:
+            bridge.on_chunk_published(worker_id, session_id, frames, first_frame_at)
 
     def on_model_output(
         self,
