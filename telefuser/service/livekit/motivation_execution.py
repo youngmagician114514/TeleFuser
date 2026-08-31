@@ -219,6 +219,10 @@ class MotivationExecutionBridge:
                 self._job_to_lease[job.job_id] = lease_id
         self.dispatch(lease, payloads)
 
+    def schedule_wakeup(self) -> None:
+        """Retry the policy after an external event completes."""
+        self._schedule()
+
     def _schedule(self) -> None:
         self.controller.schedule_once(now=self._clock())
 

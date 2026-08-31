@@ -74,6 +74,7 @@ class MotivationRuntimeController:
         self._search_executor = search_executor
         self._owns_search_executor = False
         self._clock = clock
+        self._migration_wakeup: Callable[[], None] | None = None
         self._lock = threading.RLock()
 
     def set_dispatch_callback(self, dispatch: DispatchCallback) -> None:
@@ -88,6 +89,13 @@ class MotivationRuntimeController:
             raise TypeError("dispatch callback must be callable")
         with self._lock:
             self.dispatch = dispatch
+
+    def set_migration_wakeup_callback(self, callback: Callable[[], None] | None) -> None:
+        """Install a callback that retries scheduling after async migration."""
+        if callback is not None and not callable(callback):
+            raise TypeError("migration wakeup callback must be callable or None")
+        with self._lock:
+            self._migration_wakeup = callback
 
     @classmethod
     def from_offline_table(
@@ -327,11 +335,18 @@ class MotivationRuntimeController:
             return lease
 
     def close(self) -> None:
-        """Release a controller-owned background search executor."""
+        """Release search resources and abort controller-owned migrations."""
         with self._lock:
             executor = self._search_executor if self._owns_search_executor else None
             self._search_executor = None
             self._owns_search_executor = False
+            self._migration_wakeup = None
+        if self.migration_manager is not None:
+            for record in self.migration_manager.active():
+                try:
+                    self.migration_manager.abort(record.request.session_id, reason="controller closed")
+                except (KeyError, RuntimeError):
+                    pass
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
 
@@ -385,16 +400,17 @@ class MotivationRuntimeController:
                     requested_at=now,
                     estimated_ready_at=max(now, candidate.start_at),
                 )
-                self.migration_manager.begin(
-                    request,
-                    self.migration_backend_factory(request),
-                )
+                backend = self.migration_backend_factory(request)
+                self.migration_manager.begin(request, backend)
                 self.scheduler.set_migration_ready(
                     session_id,
                     target_gpu=candidate.gpu_id,
                     ready_at=request.estimated_ready_at,
                     now=now,
                 )
+                add_done_callback = getattr(backend, "add_done_callback", None)
+                if callable(add_done_callback):
+                    add_done_callback(lambda _done: self._notify_migration_wakeup())
                 return False
             record = self.migration_manager.poll(session_id, now=now)
             if record.state != "ready":
@@ -403,6 +419,18 @@ class MotivationRuntimeController:
             self.scheduler.commit_migration(session_id, target_gpu=candidate.gpu_id, now=now)
             return False
         return True
+
+    def _notify_migration_wakeup(self) -> None:
+        with self._lock:
+            callback = self._migration_wakeup
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:
+            # A migration completion must never poison the worker future. The
+            # next control/GPU event will retry the policy search as well.
+            return
 
     def _observed(self, now: float | None) -> float:
         observed = self._clock() if now is None else now

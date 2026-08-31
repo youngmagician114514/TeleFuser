@@ -16,6 +16,7 @@ from PIL import Image
 from telefuser.core.config import WeightOffloadType
 from telefuser.models.wan22_video_vae import Wan22VideoVAEStreamingDecodeState
 
+from .fidelity import ABotWorldFidelity
 from .pipeline import ABotWorldPipeline
 from .taew_vae import ABotWorldTAEWDecodeState
 
@@ -159,12 +160,15 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
         session: ABotWorldInteractiveSession,
         actions: Mapping[str, bool] | None = None,
         control_latent_frames: int = 3,
+        *,
+        fidelity: ABotWorldFidelity | None = None,
     ) -> list[Image.Image]:
         """Generate one block through the same batch path used by concurrent serving."""
         return self.generate_next_blocks(
             [session],
             [actions],
             control_latent_frames=control_latent_frames,
+            fidelity=fidelity,
         )[0]
 
     @torch.inference_mode()
@@ -174,6 +178,7 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
         actions: Sequence[Mapping[str, bool] | None],
         *,
         control_latent_frames: int = 3,
+        fidelity: ABotWorldFidelity | None = None,
     ) -> list[list[Image.Image]]:
         """Generate one compatible causal block for every session in one model batch."""
         if not sessions or len(sessions) != len(actions):
@@ -197,6 +202,15 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
                     raise RuntimeError("ABot interactive session must be restored before generation")
 
         with self._execution_lock:
+            timestep_positions: tuple[int, ...] | None = None
+            if fidelity is not None:
+                self._apply_fidelity_locked(sessions, fidelity)
+                timestep_positions = fidelity.denoise_step_positions
+            else:
+                self._restore_default_fidelity_locked(sessions)
+            denoise_kwargs: dict[str, object] = {}
+            if timestep_positions is not None:
+                denoise_kwargs["timestep_positions"] = timestep_positions
             batch_started_at = time.monotonic()
             for session in sessions:
                 session.lifecycle = ABotWorldSessionLifecycle.ACTIVE
@@ -283,6 +297,7 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
                     current_start=start,
                     generator=sessions[0].generator,
                     scheduler=sessions[0].scheduler,
+                    **denoise_kwargs,
                 )
             elif start > 0:
                 assert batched_latent is not None and batched_prompt is not None and batched_action is not None
@@ -296,6 +311,7 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
                     current_starts=[session.next_latent_frame for session in sessions],
                     generators=[session.generator for session in sessions],
                     scheduler=sessions[0].scheduler,
+                    **denoise_kwargs,
                 )
                 if latents is None:
                     # Generic eager collate/scatter replaces cache tensors;
@@ -319,6 +335,7 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
                         start,
                         [session.generator for session in sessions],
                         sessions[0].scheduler,
+                        **denoise_kwargs,
                     )
                 else:
                     graph_batched_cache = True
@@ -338,6 +355,7 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
                         start,
                         sessions[0].generator,
                         sessions[0].scheduler,
+                        **denoise_kwargs,
                     )
                 else:
                     assert batched_latent is not None and batched_prompt is not None and batched_action is not None
@@ -351,6 +369,7 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
                         start,
                         [session.generator for session in sessions],
                         sessions[0].scheduler,
+                        **denoise_kwargs,
                     )
             if use_cuda_events:
                 denoise_finished.record()
@@ -408,6 +427,126 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
                 "total_seconds": time.monotonic() - batch_started_at,
             }
             return results
+
+    def _restore_default_fidelity_locked(
+        self, sessions: Sequence[ABotWorldInteractiveSession]
+    ) -> None:
+        """Restore the fixed ABot runtime before a non-policy dispatch."""
+        dit = getattr(self.denoise_stage, "dit", None)
+        set_window = getattr(dit, "set_causal_attention_window", None)
+        if not callable(set_window) or not hasattr(dit, "local_attn_size") or not hasattr(dit, "sink_size"):
+            return
+        old_window = int(dit.local_attn_size)
+        old_sink = int(dit.sink_size)
+        if old_window == 18 and old_sink == 6:
+            return
+        set_window(18, 6)
+        self.config.local_attn_size = 18
+        self.config.sink_size = 6
+        if not sessions:
+            return
+        frame_tokens = (
+            sessions[0].first_frame_latent.shape[-2] // dit.patch_size[1]
+        ) * (sessions[0].first_frame_latent.shape[-1] // dit.patch_size[2])
+        for session in sessions:
+            self._release_cuda_graph(session.session_id)
+            self._resize_self_cache(
+                session.self_cache,
+                frame_tokens=frame_tokens,
+                old_window=old_window,
+                old_sink=old_sink,
+                new_window=18,
+                new_sink=6,
+            )
+
+    def apply_fidelity(
+        self,
+        sessions: Sequence[ABotWorldInteractiveSession],
+        fidelity: ABotWorldFidelity,
+    ) -> None:
+        """Apply a scheduler-selected KV window to resident sessions."""
+        with self._execution_lock:
+            self._apply_fidelity_locked(sessions, fidelity)
+
+    def _apply_fidelity_locked(
+        self,
+        sessions: Sequence[ABotWorldInteractiveSession],
+        fidelity: ABotWorldFidelity,
+    ) -> None:
+        if not isinstance(fidelity, ABotWorldFidelity):
+            raise TypeError("fidelity must be an ABotWorldFidelity")
+        dit = self.denoise_stage.dit
+        old_window = int(dit.local_attn_size)
+        old_sink = int(dit.sink_size)
+        dit.set_causal_attention_window(fidelity.local_attn_size, fidelity.sink_size)
+        self.config.local_attn_size = fidelity.local_attn_size
+        self.config.sink_size = fidelity.sink_size
+        if not sessions:
+            return
+        frame_tokens = (
+            sessions[0].first_frame_latent.shape[-2] // dit.patch_size[1]
+        ) * (sessions[0].first_frame_latent.shape[-1] // dit.patch_size[2])
+        for session in sessions:
+            self._release_cuda_graph(session.session_id)
+            self._resize_self_cache(
+                session.self_cache,
+                frame_tokens=frame_tokens,
+                old_window=old_window,
+                old_sink=old_sink,
+                new_window=fidelity.local_attn_size,
+                new_sink=fidelity.sink_size,
+            )
+
+    @staticmethod
+    def _resize_self_cache(
+        cache: list[dict[str, Any]],
+        *,
+        frame_tokens: int,
+        old_window: int,
+        old_sink: int,
+        new_window: int,
+        new_sink: int,
+    ) -> None:
+        """Resize K/V rows while retaining the chronological prefix and tail."""
+        del old_window, old_sink  # valid length is carried by cache metadata
+        new_capacity = new_window * frame_tokens
+        for layer in cache:
+            key = layer.get("k")
+            value = layer.get("v")
+            if not isinstance(key, torch.Tensor) or not isinstance(value, torch.Tensor):
+                continue
+            old_capacity = key.shape[1]
+            local_end = layer.get("local_end_index", 0)
+            valid = int(local_end.item()) if isinstance(local_end, torch.Tensor) else int(local_end)
+            valid = max(0, min(valid, old_capacity))
+            if old_capacity == new_capacity:
+                if isinstance(local_end, torch.Tensor):
+                    local_end.fill_(valid)
+                continue
+            new_key = torch.zeros((key.shape[0], new_capacity, *key.shape[2:]), dtype=key.dtype, device=key.device)
+            new_value = torch.zeros(
+                (value.shape[0], new_capacity, *value.shape[2:]), dtype=value.dtype, device=value.device
+            )
+            if valid <= new_capacity:
+                if valid:
+                    new_key[:, :valid].copy_(key[:, :valid])
+                    new_value[:, :valid].copy_(value[:, :valid])
+                retained = valid
+            else:
+                sink_tokens = min(new_sink * frame_tokens, new_capacity)
+                tail_tokens = new_capacity - sink_tokens
+                if sink_tokens:
+                    new_key[:, :sink_tokens].copy_(key[:, :sink_tokens])
+                    new_value[:, :sink_tokens].copy_(value[:, :sink_tokens])
+                if tail_tokens:
+                    new_key[:, sink_tokens:].copy_(key[:, -tail_tokens:])
+                    new_value[:, sink_tokens:].copy_(value[:, -tail_tokens:])
+                retained = new_capacity
+            layer["k"] = new_key
+            layer["v"] = new_value
+            local_end_value = layer.get("local_end_index")
+            if isinstance(local_end_value, torch.Tensor):
+                local_end_value.fill_(retained)
 
     @staticmethod
     def _collate_caches(

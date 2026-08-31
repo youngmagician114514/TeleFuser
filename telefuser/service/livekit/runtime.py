@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import threading
 from collections.abc import Callable
@@ -11,6 +12,7 @@ from dataclasses import dataclass
 from telefuser.service.security.security_validator import SecurityLevel
 from telefuser.utils.logging import logger
 
+from .async_migration import AsyncMigrationManager, MigrationRequest
 from .config import LiveKitServeConfig
 from .metrics import LiveKitServingMetrics
 from .motivation_controller import MotivationRuntimeController
@@ -46,6 +48,52 @@ from .turboserve import (
     TurboServeWorkerLoad,
 )
 from .worker_pool import InProcessLiveKitWorkerPool, WorkerPool
+
+
+class _RuntimeMigrationBackend:
+    """Adapt the runtime's async worker-pool migration to the policy backend."""
+
+    def __init__(
+        self,
+        runtime: "LiveKitServeRuntime",
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        self._runtime = runtime
+        self._loop = loop
+        self._future: concurrent.futures.Future[object] | None = None
+        self._callbacks: list[Callable[[object], None]] = []
+
+    def begin(self, request: MigrationRequest) -> concurrent.futures.Future[object]:
+        self._future = asyncio.run_coroutine_threadsafe(
+            self._runtime.migrate_session(request.session_id, request.target_gpu),
+            self._loop,
+        )
+        for callback in self._callbacks:
+            self._future.add_done_callback(callback)
+        self._callbacks.clear()
+        return self._future
+
+    @staticmethod
+    def ready(operation: object) -> bool:
+        return isinstance(operation, concurrent.futures.Future) and operation.done()
+
+    @staticmethod
+    def commit(operation: object) -> None:
+        if not isinstance(operation, concurrent.futures.Future):
+            raise TypeError("runtime migration operation is not a Future")
+        operation.result()
+
+    @staticmethod
+    def abort(operation: object) -> None:
+        if isinstance(operation, concurrent.futures.Future):
+            operation.cancel()
+
+    def add_done_callback(self, callback: Callable[[object], None]) -> None:
+        """Expose future completion without leaking it into policy state."""
+        if self._future is None:
+            self._callbacks.append(callback)
+        else:
+            self._future.add_done_callback(callback)
 
 
 @dataclass(frozen=True)
@@ -93,6 +141,7 @@ class LiveKitServeRuntime:
         if motivation_controller is not None and config.worker_mode == "process":
             raise ValueError("Motivation execution requires in-process or process-nccl workers")
         self._motivation_bridge: MotivationExecutionBridge | None = None
+        self._motivation_loop: asyncio.AbstractEventLoop | None = None
         if motivation_controller is not None:
             self._validate_motivation_workers(motivation_controller)
             self._motivation_bridge = MotivationExecutionBridge(
@@ -162,6 +211,16 @@ class LiveKitServeRuntime:
             groups = [gpu_id for group in worker_groups for gpu_id in group]
             if len(groups) != len(set(groups)):
                 raise ValueError("worker_gpu_map assigns a GPU to more than one worker")
+        if self._motivation_bridge is not None:
+            self._motivation_loop = asyncio.get_running_loop()
+            controller = self._motivation_bridge.controller
+            if controller.migration_manager is None:
+                controller.migration_manager = AsyncMigrationManager()
+            if controller.migration_backend_factory is None:
+                controller.migration_backend_factory = lambda _request: _RuntimeMigrationBackend(
+                    self, self._motivation_loop
+                )
+            controller.set_migration_wakeup_callback(self._motivation_bridge.schedule_wakeup)
         await self.worker_pool.start(skip_validation=self.skip_validation)
         with self._lock:
             self._started = True
@@ -458,9 +517,10 @@ class LiveKitServeRuntime:
                 with contextlib.suppress(asyncio.CancelledError):
                     await self._autoscale_task
                 self._autoscale_task = None
-            await self.worker_pool.aclose()
             if self._motivation_bridge is not None:
+                self._motivation_bridge.controller.set_migration_wakeup_callback(None)
                 self._motivation_bridge.close()
+            await self.worker_pool.aclose()
             for record in self.registry.list_records():
                 if record.status not in TERMINAL_SESSION_STATUSES:
                     self._finish_session(record.session_id, error="runtime closed")

@@ -742,6 +742,7 @@ class ABotWorldDenoisingStage(BaseStage):
         current_starts: Sequence[int],
         generators: Sequence[torch.Generator],
         scheduler: FlowMatchScheduler,
+        timestep_positions: Sequence[int] | None = None,
     ) -> torch.Tensor | None:
         """Run an exact B=2/3 cohort through a persistent CUDA-Graph arena.
 
@@ -750,6 +751,13 @@ class ABotWorldDenoisingStage(BaseStage):
         successfully produced a real continuation, so a failed capture cannot
         corrupt their retained caches.
         """
+        # Runtime-selected fidelity uses eager denoising with an explicit
+        # subset of the four official sampler positions. CUDA Graph captures
+        # are tied to the default four-step/static-window path.
+        if timestep_positions is not None:
+            self._set_cuda_graph_last_metrics(eligible=False)
+            return None
+
         if not self._is_cuda_graph_batched_eligible(
             latent,
             prompt_emb,
@@ -884,6 +892,7 @@ class ABotWorldDenoisingStage(BaseStage):
         current_start: int,
         generator: torch.Generator,
         scheduler: FlowMatchScheduler,
+        timestep_positions: Sequence[int] | None = None,
     ) -> torch.Tensor:
         """Use a graph replay for an eligible retained-session continuation.
 
@@ -892,6 +901,21 @@ class ABotWorldDenoisingStage(BaseStage):
         therefore an unsupported PyTorch or attention backend safely falls
         back to the existing eager implementation.
         """
+        if timestep_positions is not None:
+            self._set_cuda_graph_last_metrics(eligible=False)
+            return self._denoise_block(
+                latent,
+                prompt_emb,
+                action_context,
+                None,
+                self_cache,
+                cross_cache,
+                current_start,
+                generator,
+                scheduler,
+                timestep_positions=timestep_positions,
+            )
+
         state = self._cuda_graph_states.get(session_id)
         if state is not None and state.matches(latent, prompt_emb, action_context, self_cache, cross_cache):
             output, replays = state.run(
@@ -930,6 +954,7 @@ class ABotWorldDenoisingStage(BaseStage):
                 current_start,
                 generator,
                 scheduler,
+                timestep_positions=timestep_positions,
             )
 
         self_backup: list[dict[str, Any]] | None = None
@@ -992,6 +1017,7 @@ class ABotWorldDenoisingStage(BaseStage):
                 current_start,
                 generator,
                 scheduler,
+                timestep_positions=timestep_positions,
             )
         self._cuda_graph_states[session_id] = captured
         self._cuda_graph_captures += 1
@@ -1010,6 +1036,8 @@ class ABotWorldDenoisingStage(BaseStage):
         current_start: int,
         generator: torch.Generator | Sequence[torch.Generator],
         scheduler: FlowMatchScheduler,
+        *,
+        timestep_positions: Sequence[int] | None = None,
     ) -> torch.Tensor:
         current = latent
         batch, _, frames, height, width = current.shape
@@ -1018,7 +1046,17 @@ class ABotWorldDenoisingStage(BaseStage):
             current = current.clone()
             current[:, :, :1].copy_(first_frame_latent)
         frame_tokens = (height // self.dit.patch_size[1]) * (width // self.dit.patch_size[2])
-        timesteps = self._official_denoising_timesteps(scheduler).to(device=self.device)
+        timesteps = self._official_denoising_timesteps(scheduler)
+        if timestep_positions is not None:
+            positions = tuple(int(position) for position in timestep_positions)
+            if not positions or min(positions) < 0 or max(positions) >= len(timesteps):
+                raise ValueError(
+                    f"invalid ABot denoising timestep positions {positions}; "
+                    f"expected indices in [0, {len(timesteps) - 1}]"
+                )
+            indices = torch.tensor(positions, device=timesteps.device, dtype=torch.long)
+            timesteps = timesteps.index_select(0, indices)
+        timesteps = timesteps.to(device=self.device)
         for index, current_timestep in enumerate(timesteps):
             timestep = torch.full((batch, frames), current_timestep, dtype=timesteps.dtype, device=self.device)
             if replace_first:

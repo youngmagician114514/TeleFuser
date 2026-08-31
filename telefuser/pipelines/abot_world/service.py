@@ -21,6 +21,7 @@ from typing import Any
 import torch
 from PIL import Image
 
+from telefuser.pipelines.abot_world.fidelity import ABotWorldFidelity
 from telefuser.pipelines.abot_world.interactive import (
     ABotWorldInteractivePipeline,
     ABotWorldInteractiveSession,
@@ -104,6 +105,8 @@ class _ABotWorldLiveKitSession:
     # bridge sets this marker so the worker emits exactly one chunk rather than
     # free-running on a held control state.
     motivation_one_shot: bool = False
+    motivation_job_id: str | None = None
+    motivation_fidelity: str | None = None
     next_playout_deadline: float = field(default_factory=time.monotonic)
     created_at: float = field(default_factory=time.monotonic)
     output_queue_high_watermark: int = 0
@@ -541,6 +544,16 @@ class ABotWorldLiveKitService:
             motivation = chunk.get("motivation")
             state.motivation_one_shot = (
                 isinstance(motivation, dict) and bool(motivation.get("one_shot"))
+            )
+            state.motivation_job_id = (
+                str(motivation.get("job_id"))
+                if state.motivation_one_shot and isinstance(motivation, dict) and motivation.get("job_id")
+                else None
+            )
+            state.motivation_fidelity = (
+                str(motivation.get("fidelity"))
+                if state.motivation_one_shot and isinstance(motivation, dict) and motivation.get("fidelity")
+                else None
             )
             state.last_control_at = now
             state.ready_since = now if state.controls else None
@@ -1559,6 +1572,7 @@ class ABotWorldLiveKitService:
             position_key,
             local_end,
             tuple(session.first_frame_latent.shape),
+            state.motivation_fidelity or "",
             session.lifecycle == ABotWorldSessionLifecycle.SUSPENDED,
         )
 
@@ -1576,6 +1590,8 @@ class ABotWorldLiveKitService:
         model_started_at: float | None = None
         model_started_wall_time: float | None = None
         control_latent_frames: int | None = None
+        fidelity: ABotWorldFidelity | None = None
+        executed_motivation_job_ids = [state.motivation_job_id for state in batch]
         session_traces = [
             self._new_dispatch_session_trace(state, applied_controls, selected_at=selected_at)
             for state, applied_controls in zip(batch, controls)
@@ -1588,21 +1604,33 @@ class ABotWorldLiveKitService:
             if len(frame_counts) != 1:
                 raise RuntimeError("ABot scheduler selected an incompatible latent-frame batch")
             control_latent_frames = next(iter(frame_counts))
+            fidelity_names = {state.motivation_fidelity for state in batch}
+            if len(fidelity_names) > 1:
+                raise RuntimeError("ABot scheduler selected an incompatible fidelity batch")
+            fidelity_name = next(iter(fidelity_names))
+            if fidelity_name:
+                fidelity = ABotWorldFidelity.from_profile_name(fidelity_name)
             model_started_at = time.monotonic()
             model_started_wall_time = time.time()
             if len(batch) == 1:
+                generate_kwargs = {"control_latent_frames": control_latent_frames}
+                if fidelity is not None:
+                    generate_kwargs["fidelity"] = fidelity
                 results = [
                     self.pipeline.generate_next_block(
                         batch[0].pipeline_session,
                         controls[0],
-                        control_latent_frames=control_latent_frames,
+                        **generate_kwargs,
                     )
                 ]
             else:
+                generate_kwargs = {"control_latent_frames": control_latent_frames}
+                if fidelity is not None:
+                    generate_kwargs["fidelity"] = fidelity
                 results = self.pipeline.generate_next_blocks(
                     [state.pipeline_session for state in batch],
                     list(controls),
-                    control_latent_frames=control_latent_frames,
+                    **generate_kwargs,
                 )
         except Exception as exc:
             completed_at = time.monotonic()
@@ -1647,7 +1675,9 @@ class ABotWorldLiveKitService:
             self._batch_count += 1
             self._batch_item_count += len(batch)
             self._maximum_batch_size = max(self._maximum_batch_size, len(batch))
-            for trace, state, frames, applied_controls in zip(session_traces, batch, results, controls):
+            for trace, state, frames, applied_controls, executed_job_id in zip(
+                session_traces, batch, results, controls, executed_motivation_job_ids
+            ):
                 with state.lock:
                     queue_wait = max(0.0, selected_at - (state.ready_since or selected_at))
                     state.total_queue_wait_seconds += queue_wait
@@ -1663,6 +1693,7 @@ class ABotWorldLiveKitService:
                         "frames": frames,
                         "scheduler": {
                             "batch_size": len(batch),
+                            "fidelity": fidelity.name if fidelity is not None else None,
                             "queue_wait_seconds": round(queue_wait, 6),
                             "compute_seconds": round(completed_at - selected_at, 6),
                             **self._last_stage_metrics,
@@ -1700,10 +1731,12 @@ class ABotWorldLiveKitService:
                 # service-local held controls before exposing output to the
                 # bridge, so a next heartbeat cannot be accidentally erased.
                 with state.lock:
-                    if state.motivation_one_shot:
+                    if state.motivation_one_shot and state.motivation_job_id == executed_job_id:
                         state.controls.clear()
                         state.ready_since = None
                         state.motivation_one_shot = False
+                        state.motivation_job_id = None
+                        state.motivation_fidelity = None
                 self._put_output(state, payload)
             self._emit_dispatch_trace(
                 selected_at=selected_at,

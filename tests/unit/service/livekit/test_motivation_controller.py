@@ -125,6 +125,32 @@ def test_controller_reserves_and_completes_local_dispatch() -> None:
     assert controller.on_completion(lease, completed_at=0.4)[0].session_id == "s"
 
 
+class _CallbackBackend:
+    def __init__(self) -> None:
+        self.future: concurrent.futures.Future[object] = concurrent.futures.Future()
+        self.committed = False
+
+    def begin(self, request: MigrationRequest) -> concurrent.futures.Future[object]:
+        del request
+        return self.future
+
+    @staticmethod
+    def ready(operation: object) -> bool:
+        return isinstance(operation, concurrent.futures.Future) and operation.done()
+
+    def commit(self, operation: object) -> None:
+        assert operation is self.future
+        self.future.result()
+        self.committed = True
+
+    def abort(self, operation: object) -> None:
+        if isinstance(operation, concurrent.futures.Future):
+            operation.cancel()
+
+    def add_done_callback(self, callback) -> None:
+        self.future.add_done_callback(callback)
+
+
 class _ReadyBackend:
     def __init__(self) -> None:
         self.ready_event = threading.Event()
@@ -189,3 +215,28 @@ def test_controller_prepares_async_migration_before_remote_dispatch() -> None:
     assert lease is not None
     assert lease.candidate.gpu_id == "gpu-1"
     assert leases == [lease]
+
+
+def test_async_migration_completion_wakes_policy_search() -> None:
+    profiles = [MotivationProfile(1, "high", 0.4, 0.68, 20.0)]
+    scheduler = MotivationScheduler(StaticMotivationProfileTable(profiles))
+    scheduler.add_gpu(GpuSchedulingState("gpu-0", free_at=10.0, memory_free_gb=80.0))
+    scheduler.add_gpu(GpuSchedulingState("gpu-1", free_at=0.0, memory_free_gb=80.0))
+    scheduler.register_session("s", owner_gpu="gpu-0", now=0.0)
+    scheduler.submit_action("s", ["W"], now=0.0)
+    manager = AsyncMigrationManager(clock=lambda: 0.0)
+    backend = _CallbackBackend()
+    controller = MotivationRuntimeController(
+        scheduler,
+        dispatch=lambda lease: None,
+        migration_manager=manager,
+        migration_backend_factory=lambda request: backend,
+    )
+    woken = threading.Event()
+    controller.set_migration_wakeup_callback(woken.set)
+
+    assert controller.schedule_once(now=0.0) is None
+    backend.future.set_result(None)
+
+    assert woken.wait(timeout=1.0)
+    controller.close()

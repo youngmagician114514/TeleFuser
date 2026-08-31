@@ -141,11 +141,21 @@ retain their normal lifecycle behavior. Plain `process` workers are rejected
 for this mode because their child-side control callback cannot be synchronously
 intercepted; use `in-process` or `process-nccl`.
 
-The current ABot model exposes a fixed checkpoint/runtime fidelity. The bridge
-records the selected offline `fidelity` in the dispatch metadata and enforces
-its batch and placement decision, but changing denoising steps or KV-window
-geometry still requires a model-specific runtime implementation; those fields
-are not silently changed by the generic adapter.
+For ABot-World, the bridge now applies the selected offline `fidelity` at the
+model boundary. Standard dense BF16 profiles (`rho0_bf16`) map S=4/3/2 to
+`(0,1,2,3)`/`(0,2,3)`/`(0,3)` official sampler positions and W=18/12/6 to
+the corresponding causal KV capacity (with sink frames W/3). Sessions in one
+batch must carry the same fidelity. Changing W resizes the retained K/V rows
+while preserving the chronological prefix and newest rolling tail. Dynamic
+fidelity intentionally uses eager denoising; the fixed-shape CUDA Graph path is
+invalidated for that dispatch and is retained for the ordinary default path.
+Unsupported sparse-attention or non-BF16 profile names are rejected explicitly.
+
+At runtime startup, `in-process` and `process-nccl` pools automatically provide
+the controller with an asynchronous migration backend. A remote-GPU candidate
+starts `LiveKitServeRuntime.migrate_session()` without blocking the serving
+loop; completion wakes the controller, which revalidates ownership and searches
+again before dispatch.
 
 For overlap with an active GPU invocation, call `search_async()` at the
 current completion boundary and later pass its result to

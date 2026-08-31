@@ -55,6 +55,7 @@ class _FakePipeline:
             )
         )
         self.generate_calls: list[tuple[str, dict[str, bool]]] = []
+        self.fidelity_calls: list[object] = []
         self.call_times: list[float] = []
         self.frames_per_chunk = 1
         self.batch_sizes: list[int] = []
@@ -86,8 +87,10 @@ class _FakePipeline:
         controls: dict[str, bool],
         *,
         control_latent_frames: int,
+        fidelity: object | None = None,
     ) -> list[Image.Image]:
         assert control_latent_frames == 3
+        self.fidelity_calls.append(fidelity)
         self.generate_calls.append((session.session_id, controls))
         self.call_times.append(time.monotonic())
         self.batch_sizes.append(1)
@@ -103,7 +106,9 @@ class _FakePipeline:
         controls: list[dict[str, bool]],
         *,
         control_latent_frames: int,
+        fidelity: object | None = None,
     ) -> list[list[Image.Image]]:
+        self.fidelity_calls.append(fidelity)
         self.batch_sizes.append(len(sessions))
         results = []
         for session, state in zip(sessions, controls):
@@ -339,12 +344,18 @@ def test_motivation_one_shot_control_emits_one_chunk() -> None:
             {
                 "type": "control_state",
                 "controls": ["KeyW"],
-                "motivation": {"job_id": "session:action:1", "one_shot": True},
+                "motivation": {
+                    "job_id": "session:action:1",
+                    "fidelity": "b1_s2_w6_rho0_bf16",
+                    "one_shot": True,
+                },
             },
         )
         assert _take_and_notify(service, state)["type"] == "chunk"
         time.sleep(0.05)
         assert len(pipeline.generate_calls) == 1
+        assert pipeline.fidelity_calls[0].name == "b1_s2_w6_rho0_bf16"
+        assert pipeline.fidelity_calls[0].denoise_step_positions == (0, 3)
         with state.lock:
             assert state.controls == set()
             assert state.motivation_one_shot is False
