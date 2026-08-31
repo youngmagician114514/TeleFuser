@@ -9,6 +9,7 @@ objects; workers and pipeline adapters remain the ownership boundary.
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 import time
@@ -20,6 +21,8 @@ from .motivation_controller import DispatchLease, MotivationRuntimeController
 
 ControlDispatch = Callable[[DispatchLease, Sequence[tuple[str, dict[str, Any]]]], None]
 ReleasePolicy = Callable[[dict[str, Any]], bool]
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -217,14 +220,85 @@ class MotivationExecutionBridge:
             )
             for job in lease.jobs:
                 self._job_to_lease[job.job_id] = lease_id
-        self.dispatch(lease, payloads)
+        try:
+            self.dispatch(lease, payloads)
+        except Exception:
+            # A transport can disappear between candidate validation and the
+            # parent queue write while a browser tears down. Keep the failure
+            # visible at the policy boundary instead of silently losing it.
+            logger.exception(
+                "Motivation dispatch failed: lease=%s sessions=%s gpu=%s",
+                lease_id,
+                [session_id for session_id, _ in payloads],
+                lease.candidate.gpu_id,
+            )
+            raise
 
     def schedule_wakeup(self) -> None:
         """Retry the policy after an external event completes."""
         self._schedule()
 
     def _schedule(self) -> None:
-        self.controller.schedule_once(now=self._clock())
+        try:
+            lease = self.controller.schedule_once(now=self._clock())
+        except Exception:
+            logger.exception("Motivation scheduling callback failed")
+            return
+        if lease is not None:
+            logger.debug(
+                "Motivation lease dispatched: jobs=%s gpu=%s fidelity=%s",
+                len(lease.jobs),
+                lease.candidate.gpu_id,
+                lease.candidate.fidelity,
+            )
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return bounded policy state for diagnosing scheduling progress."""
+        with self._lock:
+            leases = {
+                lease_id: {
+                    "session_ids": sorted(progress.pending_session_ids),
+                    "job_ids": [job.job_id for job in progress.lease.jobs],
+                    "gpu_id": progress.lease.candidate.gpu_id,
+                    "fidelity": progress.lease.candidate.fidelity,
+                    "reserved_at": progress.lease.reserved_at,
+                }
+                for lease_id, progress in self._leases.items()
+            }
+            controls = {session_id: sorted(values) for session_id, values in self._controls.items()}
+            next_release_at = dict(self._next_release_at)
+        sessions = {}
+        for state in self.controller.scheduler.sessions():
+            sessions[state.session_id] = {
+                "owner_gpu": state.owner_gpu,
+                "departed": state.departed,
+                "pending_action": state.pending_action.job_id if state.pending_action else None,
+                "pending_idle": state.pending_idle.job_id if state.pending_idle else None,
+                "in_flight": state.in_flight.job_id if state.in_flight else None,
+                "latest_controls": list(state.latest_controls),
+                "state_version": state.state_version,
+                "slack_seconds": state.slack_seconds,
+                "quality_ema": state.quality_ema,
+                "migration_target_gpu": state.migration_target_gpu,
+            }
+        migration_manager = self.controller.migration_manager
+        return {
+            "epoch": self.controller.scheduler.epoch,
+            "current_time": self.controller.scheduler.current_time,
+            "leases": leases,
+            "sessions": sessions,
+            "controls": controls,
+            "next_release_at": next_release_at,
+            "active_migrations": [
+                {
+                    "session_id": record.request.session_id,
+                    "source_gpu": record.request.source_gpu,
+                    "target_gpu": record.request.target_gpu,
+                    "state": record.state,
+                }
+                for record in (migration_manager.active() if migration_manager is not None else ())
+            ],
+        }
 
     def _heartbeat_window_allows(self, session_id: str, observed_at: float) -> bool:
         """Release the first input immediately, then at most once per heartbeat."""

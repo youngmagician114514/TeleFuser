@@ -449,6 +449,8 @@ class LiveKitServeRuntime:
         }
         if capacity_profiles:
             metadata["session_capacity"] = capacity_profiles
+        if self._motivation_bridge is not None:
+            metadata["motivation_scheduler"] = self._motivation_bridge.snapshot()
         snapshot = getattr(self.worker_pool, "turboserve_snapshot", None)
         if callable(snapshot) and (routing := snapshot()) is not None:
             metadata["turboserve_routing"] = routing

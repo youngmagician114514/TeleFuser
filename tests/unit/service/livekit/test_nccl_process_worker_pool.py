@@ -335,6 +335,22 @@ def test_latest_parent_queue_replacement_rebates_source_publisher_credit() -> No
     ]
 
 
+def test_late_control_for_released_route_is_dropped() -> None:
+    pool = _pool()
+    sent: list[tuple[str, dict[str, Any]]] = []
+    pool._send = lambda worker_id, command: sent.append((worker_id, command))
+
+    pool.push_model_chunk("pipeline-finished", {"type": "stop"})
+    pool.push_model_batch(
+        [
+            ("pipeline-finished", {"type": "reset"}),
+            ("pipeline-current", {"type": "control"}),
+        ]
+    )
+
+    assert sent == []
+
+
 def test_migration_drain_waits_for_child_queue_and_publisher_frames(monkeypatch) -> None:
     async def run() -> None:
         pool = _pool()

@@ -33,6 +33,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from telefuser.service.livekit.room_client import livekit_connection_slot
+
 _CONTROL_TOPIC = "tf.control"
 _METRICS_TOPIC = "tf.metrics"
 _STATUS_TOPIC = "tf.status"
@@ -720,7 +722,8 @@ class LiveKitWaveSession:
                 self.record_event("room_disconnected", session=self.logical_id, reason=str(reason))
 
         options = self.rtc.RoomOptions(auto_subscribe=True, connect_timeout=self.scenario.connect_timeout_seconds)
-        await room.connect(livekit_url, token, options)
+        async with livekit_connection_slot():
+            await room.connect(livekit_url, token, options)
         self.connected = True
         self.connected_at = time.perf_counter()
         self.record_event(

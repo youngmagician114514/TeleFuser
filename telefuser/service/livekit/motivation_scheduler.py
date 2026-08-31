@@ -717,6 +717,18 @@ class MotivationScheduler:
             state.migration_ready_at = observed_at
             self._epoch += 1
 
+    def clear_migration(self, session_id: str, *, now: float | None = None) -> None:
+        """Clear a failed asynchronous migration and permit a fresh search."""
+        observed_at = self._clock() if now is None else now
+        with self._lock:
+            self._advance_to(observed_at)
+            state = self._sessions[session_id]
+            if state.migration_target_gpu is None and state.migration_ready_at == 0.0:
+                return
+            state.migration_target_gpu = None
+            state.migration_ready_at = 0.0
+            self._epoch += 1
+
     def set_migration_ready(
         self,
         session_id: str,
@@ -813,6 +825,8 @@ class MotivationScheduler:
         gpu_states: Sequence[GpuSchedulingState] | None = None,
         wait_seconds: float = 0.0,
         include_wait: bool = True,
+        allow_migrations: bool = True,
+        exclude_session_ids: Iterable[str] = (),
     ) -> DispatchCandidate | None:
         """Enumerate and score all feasible candidates in a global snapshot.
 
@@ -821,9 +835,10 @@ class MotivationScheduler:
         non-departed sessions in its slack utility, not just selected members.
         """
         observed_at = self._clock() if now is None else now
+        excluded = set(exclude_session_ids)
         with self._lock:
             self._advance_to(observed_at)
-            ready = self._ready_jobs()
+            ready = tuple(item for item in self._ready_jobs() if item[0].session_id not in excluded)
             if gpu_states is not None:
                 gpus = tuple(gpu_states)
             else:
@@ -855,7 +870,8 @@ class MotivationScheduler:
                                     for state in states
                                 )
                                 if any(
-                                    estimate.required and not self.config.migration_enabled
+                                    estimate.required
+                                    and (not self.config.migration_enabled or not allow_migrations)
                                     for estimate in estimates
                                 ):
                                     continue

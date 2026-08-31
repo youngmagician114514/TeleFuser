@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import weakref
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from typing import Any, Protocol
 
 import numpy as np
@@ -16,6 +19,39 @@ DataMessageHandler = Callable[[bytes | str | dict[str, Any], str, str], None]
 _VIDEO_MAX_BITRATE = 8_000_000
 
 _VIDEO_ENCODER_MIN_MAX_FRAMERATE = 30.0
+
+# The LiveKit Python SDK's native FFI client is process-global. In particular,
+# Room.connect() starts a native connection and then waits for a callback that
+# must be acknowledged by a second FFI request. Concurrent handshakes in one
+# event loop can leave one callback waiting behind another and eventually make
+# the native room handle expire. Keep the gate per event loop so independent
+# TeleFuser processes remain fully parallel while one process performs one
+# connect/ready handshake at a time.
+_LIVEKIT_CONNECT_LOCKS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = weakref.WeakKeyDictionary()
+_LIVEKIT_CONNECT_LOCKS_GUARD = threading.Lock()
+
+
+def _livekit_connect_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    with _LIVEKIT_CONNECT_LOCKS_GUARD:
+        lock = _LIVEKIT_CONNECT_LOCKS.get(loop)
+        if lock is None:
+            lock = asyncio.Lock()
+            _LIVEKIT_CONNECT_LOCKS[loop] = lock
+        return lock
+
+
+@asynccontextmanager
+async def livekit_connection_slot():
+    """Serialize native LiveKit room connection handshakes per event loop.
+
+    The context is intentionally small: it covers only the SDK connect/ready
+    exchange, not media publication or steady-state room activity. Callers in
+    another process or another event loop do not contend for this slot.
+    """
+
+    async with _livekit_connect_lock():
+        yield
 
 
 class RoomClient(Protocol):
@@ -62,7 +98,8 @@ class LiveKitRoomClient:
             identity = getattr(participant, "identity", "") if participant is not None else ""
             on_data(packet.data, packet.topic or "", identity)
 
-        await room.connect(url, token)
+        async with livekit_connection_slot():
+            await room.connect(url, token)
 
     async def wait_for_participant(self, identity: str, *, timeout_s: float) -> None:
         """Wait until a specific remote participant has joined the room."""
@@ -175,7 +212,8 @@ class LiveKitRoomClient:
                 await self._audio_source.aclose()
         finally:
             try:
-                await room.disconnect()
+                async with livekit_connection_slot():
+                    await room.disconnect()
             finally:
                 self._room = None
                 self._video_source = None

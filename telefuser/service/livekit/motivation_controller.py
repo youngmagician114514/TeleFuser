@@ -293,7 +293,25 @@ class MotivationRuntimeController:
             wait_seconds=wait_seconds,
             include_wait=True,
         )
-        return self.dispatch_candidate(candidate, now=observed_at) if candidate is not None else None
+        if candidate is None:
+            return None
+        lease = self.dispatch_candidate(candidate, now=observed_at)
+        if lease is not None or candidate.wait or not candidate.migration_count:
+            return lease
+        # A migration is deliberately asynchronous. While it is preparing (or
+        # waiting behind another transfer), keep dispatching feasible jobs that
+        # already have their state on the selected GPU. Otherwise one stalled
+        # pre-copy candidate can block every unrelated session globally.
+        fallback = self.scheduler.find_best(
+            now=self.scheduler.current_time,
+            wait_seconds=wait_seconds,
+            include_wait=False,
+            allow_migrations=False,
+            exclude_session_ids=candidate.session_ids,
+        )
+        if fallback is None:
+            return None
+        return self.dispatch_candidate(fallback, now=self.scheduler.current_time)
 
     def dispatch_candidate(
         self,
@@ -311,13 +329,16 @@ class MotivationRuntimeController:
         with self._lock:
             if candidate.wait:
                 return None
+            # Validate before touching migration state. A remote candidate can
+            # become stale while its asynchronous copy is running; committing
+            # that stale ownership would race an in-flight action job.
+            if not self.scheduler.validate(candidate, now=observed_at):
+                return None
             if candidate.migration_count:
                 if not self._prepare_migration(candidate, now=observed_at):
                     return None
                 # ``_prepare_migration`` commits at most one transfer. Search
                 # again after the ownership/version boundary.
-                return None
-            if not self.scheduler.validate(candidate, now=observed_at):
                 return None
             jobs = tuple(
                 self.scheduler.session(session_id).ready_job(include_idle=True)
@@ -418,7 +439,10 @@ class MotivationRuntimeController:
                     # Duplicate-session races are also transient: the
                     # existing operation will wake a fresh policy search.
                     message = str(exc)
-                    if "maximum concurrent migrations reached" in message or "already has an active migration" in message:
+                    if (
+                        "maximum concurrent migrations reached" in message
+                        or "already has an active migration" in message
+                    ):
                         return False
                     raise
                 self.scheduler.set_migration_ready(
@@ -434,8 +458,15 @@ class MotivationRuntimeController:
             record = self.migration_manager.poll(session_id, now=now)
             if record.state != "ready":
                 return False
-            self.migration_manager.commit(session_id, now=now)
-            self.scheduler.commit_migration(session_id, target_gpu=candidate.gpu_id, now=now)
+            try:
+                self.migration_manager.commit(session_id, now=now)
+                self.scheduler.commit_migration(session_id, target_gpu=candidate.gpu_id, now=now)
+            except Exception:
+                # A failed backend operation is no longer active in the
+                # migration manager. Clear the scheduler hint as well, so the
+                # next search can keep using the source GPU or retry later.
+                self.scheduler.clear_migration(session_id, now=now)
+                return False
             return False
         return True
 

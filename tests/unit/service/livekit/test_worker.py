@@ -288,6 +288,51 @@ def test_livekit_worker_runs_pipeline_and_forwards_control() -> None:
     asyncio.run(_run())
 
 
+def test_livekit_worker_replays_latest_control_received_before_pipeline_creation() -> None:
+    async def _run() -> None:
+        adapter = FakePipelineAdapter()
+        room = FakeRoomClient()
+        room.participant_gate.clear()
+        worker = LiveKitWorker(
+            worker_id="worker-0",
+            config=LiveKitServeConfig(
+                livekit_url="wss://livekit.example",
+                livekit_api_key="key",
+                livekit_api_secret="secret",
+            ),
+            pipeline_file="pipeline.py",
+            token_service=FakeTokenService(),
+            pipeline_adapter=adapter,
+            room_client=room,
+        )
+        record = SessionRecord(
+            session_id="session-1",
+            room_name="room-1",
+            controller_identity="controller",
+            status="assigned",
+            worker_id="worker-0",
+            config={"session_id": "session-1"},
+            created_at=0,
+            updated_at=0,
+        )
+
+        task = asyncio.create_task(worker.run_session(record))
+        await room.connected.wait()
+        room.emit_control({"type": "control_state", "controls": ["ArrowUp"]})
+        room.emit_control({"type": "control_state", "controls": ["ArrowDown"]})
+        room.participant_gate.set()
+        await adapter.created.wait()
+        await _wait_for(lambda: len(adapter.pushed) == 1)
+        assert adapter.pushed == [
+            ("pipeline-session-1", {"type": "control_state", "controls": ["ArrowDown"]})
+        ]
+
+        await adapter.output_queue.put(None)
+        await task
+
+    asyncio.run(_run())
+
+
 def test_livekit_worker_waits_for_controller_before_creating_pipeline() -> None:
     async def _run() -> None:
         adapter = FakePipelineAdapter()

@@ -169,3 +169,39 @@ def test_livekit_room_client_uses_sdk_room_publish_and_video_source(monkeypatch)
         assert captured["disconnect"] is True
 
     asyncio.run(_run())
+
+def test_livekit_room_client_serializes_native_connect_handshakes(monkeypatch) -> None:
+    active = 0
+    maximum = 0
+
+    class FakeRoom:
+        def on(self, _event: str):
+            return lambda fn: fn
+
+        async def connect(self, _url: str, _token: str) -> None:
+            nonlocal active, maximum
+            active += 1
+            maximum = max(maximum, active)
+            await asyncio.sleep(0)
+            active -= 1
+
+        async def disconnect(self) -> None:
+            return None
+
+    class FakeRTC:
+        def Room(self):
+            return FakeRoom()
+
+    monkeypatch.setitem(sys.modules, "livekit", types.SimpleNamespace(rtc=FakeRTC()))
+
+    async def _run() -> None:
+        clients = [LiveKitRoomClient(), LiveKitRoomClient()]
+        await asyncio.gather(
+            *(
+                client.connect("wss://livekit.example", f"token-{index}", lambda *_: None)
+                for index, client in enumerate(clients)
+            )
+        )
+
+    asyncio.run(_run())
+    assert maximum == 1

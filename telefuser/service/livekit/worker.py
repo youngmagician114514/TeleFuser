@@ -119,6 +119,11 @@ class LiveKitWorker:
         self.gpu_num = gpu_num
         self._active_session_id: str | None = None
         self._pipeline_session_id: str | None = None
+        # LiveKit data can arrive after the controller joins but before the
+        # worker has finished creating its pipeline session. Keep only the
+        # latest control state; this matches the action-channel coalescing
+        # contract and prevents a newly admitted session from becoming stuck.
+        self._pending_control_chunk: dict[str, Any] | None = None
         self._delivery_ack_event = asyncio.Event()
         self._stop_event = asyncio.Event()
 
@@ -168,6 +173,7 @@ class LiveKitWorker:
                 self._publisher_progress_sequence = 0
                 self._publisher_frame_tracking_enabled = self._enable_publisher_frame_tracking()
                 self.event_sink.on_pipeline_session(record.session_id, self._pipeline_session_id)
+                self._flush_pending_control(record)
                 chunks = self.pipeline_adapter.pull_chunks(self._pipeline_session_id)
             elif self.pipeline_adapter.stream_mode == STREAM_MODE_SERVER_PUSH:
                 chunks = self.pipeline_adapter.stream_task(record.config)
@@ -295,8 +301,6 @@ class LiveKitWorker:
         topic: str,
         sender_identity: str,
     ) -> None:
-        if self._pipeline_session_id is None:
-            return
         try:
             chunk = normalize_control_message(
                 message,
@@ -309,6 +313,28 @@ class LiveKitWorker:
         except Exception as exc:
             logger.warning(f"LiveKit control message rejected: session={record.session_id} error={exc}")
             return
+        self._deliver_control_chunk(record, chunk)
+
+    def _flush_pending_control(self, record: SessionRecord) -> None:
+        """Replay the newest control received before pipeline creation completed."""
+        pending = self._pending_control_chunk
+        self._pending_control_chunk = None
+        if pending is not None:
+            self._deliver_control_chunk(record, pending)
+
+    def _deliver_control_chunk(self, record: SessionRecord, chunk: dict[str, Any]) -> None:
+        """Deliver a normalized control or retain it until the pipeline exists."""
+        pipeline_session_id = self._pipeline_session_id
+        if pipeline_session_id is None:
+            if chunk.get("type") == "stop":
+                self._pending_control_chunk = None
+                self._stop_event.set()
+            elif (
+                self.pipeline_adapter.stream_mode == STREAM_MODE_BIDIRECTIONAL
+                and chunk.get("type") in {"control_state", "control"}
+            ):
+                self._pending_control_chunk = dict(chunk)
+            return
         if chunk.get("type") == "delivery_ack":
             self._delivery_ack_event.set()
             return
@@ -319,7 +345,7 @@ class LiveKitWorker:
         intercept_callback = getattr(self.event_sink, "on_control_message", None)
         if callable(intercept_callback) and intercept_callback(self.worker_id, record.session_id, chunk):
             return
-        self.pipeline_adapter.push_chunk(self._pipeline_session_id, chunk)
+        self.pipeline_adapter.push_chunk(pipeline_session_id, chunk)
         if chunk.get("type") == "stop":
             self._stop_event.set()
 
@@ -469,6 +495,7 @@ class LiveKitWorker:
     async def _close_active_session(self) -> None:
         pipeline_session_id = self._pipeline_session_id
         self._pipeline_session_id = None
+        self._pending_control_chunk = None
         if pipeline_session_id is not None:
             with contextlib.suppress(Exception):
                 await asyncio.to_thread(self.pipeline_adapter.close_session, pipeline_session_id)

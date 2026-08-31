@@ -407,8 +407,15 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         if session_id in self._migrating_controls:
             self._migrating_controls[session_id].append(dict(chunk))
             return
+        worker_id = self._pipeline_routes.get(session_id)
+        if worker_id is None:
+            # A controller can publish a final stop/reset after the transport
+            # has already torn down the model route. The session is gone, so
+            # there is no child command to deliver; late control must not turn
+            # normal teardown into an uncaught KeyError in LiveKit's callback.
+            return
         self._send(
-            self._pipeline_routes[session_id],
+            worker_id,
             {"type": "model_push", "session_id": session_id, "chunk": dict(chunk)},
         )
 
@@ -421,7 +428,11 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                 continue
             worker_id = self._pipeline_routes.get(session_id)
             if worker_id is None:
-                raise KeyError(f"Unknown model session {session_id!r}")
+                # The session may have completed while a batch was being
+                # assembled. Drop that stale member and let remaining current
+                # routes proceed; the owning policy lease is invalidated by
+                # the session-finished callback.
+                continue
             grouped.setdefault(worker_id, []).append((session_id, dict(chunk)))
         for worker_id, grouped_items in grouped.items():
             self._send(worker_id, {"type": "model_push_batch", "items": grouped_items})

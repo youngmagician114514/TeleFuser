@@ -240,3 +240,56 @@ def test_async_migration_completion_wakes_policy_search() -> None:
 
     assert woken.wait(timeout=1.0)
     controller.close()
+
+
+def test_local_candidate_progresses_while_remote_migration_waits() -> None:
+    profiles = [MotivationProfile(1, "high", 0.4, 0.68, 20.0)]
+    scheduler = MotivationScheduler(StaticMotivationProfileTable(profiles))
+    scheduler.add_gpu(GpuSchedulingState("gpu-0", free_at=10.0, memory_free_gb=80.0))
+    scheduler.add_gpu(GpuSchedulingState("gpu-1", free_at=0.0, memory_free_gb=80.0))
+    scheduler.register_session("remote", owner_gpu="gpu-0", now=0.0, slack_seconds=-1.0)
+    scheduler.register_session("local", owner_gpu="gpu-1", now=0.0, slack_seconds=10.0)
+    scheduler.submit_action("remote", ["W"], now=0.0)
+    scheduler.submit_action("local", ["D"], now=0.0)
+    manager = AsyncMigrationManager(clock=lambda: 0.0)
+    backend = _ReadyBackend()
+    leases = []
+    controller = MotivationRuntimeController(
+        scheduler,
+        dispatch=leases.append,
+        migration_manager=manager,
+        migration_backend_factory=lambda request: backend,
+    )
+
+    lease = controller.schedule_once(now=0.0)
+
+    assert lease is not None
+    assert lease.jobs[0].session_id == "local"
+    assert manager.active()[0].request.session_id == "remote"
+    assert scheduler.session("remote").pending_action is not None
+    controller.close()
+
+
+def test_failed_migration_clears_scheduler_hint() -> None:
+    profiles = [MotivationProfile(1, "high", 0.4, 0.68, 20.0)]
+    scheduler = MotivationScheduler(StaticMotivationProfileTable(profiles))
+    scheduler.add_gpu(GpuSchedulingState("gpu-0", free_at=10.0, memory_free_gb=80.0))
+    scheduler.add_gpu(GpuSchedulingState("gpu-1", free_at=0.0, memory_free_gb=80.0))
+    scheduler.register_session("s", owner_gpu="gpu-0", now=0.0)
+    scheduler.submit_action("s", ["W"], now=0.0)
+    manager = AsyncMigrationManager(clock=lambda: 0.0)
+    backend = _CallbackBackend()
+    controller = MotivationRuntimeController(
+        scheduler,
+        dispatch=lambda lease: None,
+        migration_manager=manager,
+        migration_backend_factory=lambda request: backend,
+    )
+
+    assert controller.schedule_once(now=0.0) is None
+    backend.future.set_exception(RuntimeError("copy failed"))
+    assert controller.schedule_once(now=0.1) is None
+
+    assert manager.active() == ()
+    assert scheduler.session("s").migration_target_gpu is None
+    controller.close()
