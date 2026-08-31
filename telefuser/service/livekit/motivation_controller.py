@@ -393,6 +393,15 @@ class MotivationRuntimeController:
                 None,
             )
             if active is None:
+                # Migration is deliberately bounded so state transfer cannot
+                # consume all NCCL/PCIe resources during a user wave.  A
+                # candidate that arrives while the bound is full is simply
+                # deferred; the active backend's completion callback wakes
+                # the controller and causes a fresh search.  Do not let this
+                # expected back-pressure escape through LiveKit's data
+                # callback as an uncaught RuntimeError.
+                if len(self.migration_manager.active()) >= self.migration_manager.max_concurrent:
+                    return False
                 request = MigrationRequest(
                     session_id=session_id,
                     source_gpu=state.owner_gpu,
@@ -401,7 +410,17 @@ class MotivationRuntimeController:
                     estimated_ready_at=max(now, candidate.start_at),
                 )
                 backend = self.migration_backend_factory(request)
-                self.migration_manager.begin(request, backend)
+                try:
+                    self.migration_manager.begin(request, backend)
+                except RuntimeError as exc:
+                    # Keep the guard race-safe if another caller starts a
+                    # migration between the capacity check and ``begin``.
+                    # Duplicate-session races are also transient: the
+                    # existing operation will wake a fresh policy search.
+                    message = str(exc)
+                    if "maximum concurrent migrations reached" in message or "already has an active migration" in message:
+                        return False
+                    raise
                 self.scheduler.set_migration_ready(
                     session_id,
                     target_gpu=candidate.gpu_id,
