@@ -1038,6 +1038,7 @@ async def _run_nccl_model_worker(
     output_credits: dict[str, asyncio.BoundedSemaphore] = {}
     outgoing: dict[str, dict[tuple[Any, ...], torch.Tensor]] = {}
     incoming: dict[str, tuple[dict[str, Any], dict[tuple[Any, ...], torch.Tensor], str, int, int]] = {}
+    transfer_tasks: set[asyncio.Task[None]] = set()
 
     def transfer_on_worker_device(
         leaves: dict[tuple[Any, ...], torch.Tensor],
@@ -1102,6 +1103,57 @@ async def _run_nccl_model_worker(
                     "error": repr(error) if error else None,
                 }
             )
+
+    async def run_nccl_send(command: dict[str, Any]) -> None:
+        """Complete one send without monopolizing the child command loop."""
+        request_id = command.get("request_id")
+        try:
+            transfer_id = str(command["transfer_id"])
+            await asyncio.to_thread(
+                transfer_on_worker_device,
+                outgoing.pop(transfer_id),
+                peer_rank=int(command["target_rank"]),
+                send=True,
+            )
+            await result(request_id)
+        except Exception as exc:
+            await result(request_id, error=exc)
+
+    async def run_nccl_recv(command: dict[str, Any]) -> None:
+        """Receive and install one session while unrelated commands are served."""
+        request_id = command.get("request_id")
+        try:
+            transfer_id = str(command["transfer_id"])
+            metadata, leaves, owner, epoch, credit_window = incoming.pop(transfer_id)
+            await asyncio.to_thread(
+                transfer_on_worker_device,
+                leaves,
+                peer_rank=int(command["source_rank"]),
+                send=False,
+            )
+            session_id = await asyncio.to_thread(
+                import_session_on_worker_device,
+                metadata,
+                leaves,
+                owner_worker_id=owner,
+                ownership_epoch=epoch,
+            )
+            try:
+                publisher_tracking_enabled = bool(adapter.enable_publisher_frame_tracking(session_id))
+            except Exception:
+                publisher_tracking_enabled = False
+            events.put(
+                {
+                    "type": "model_publisher_frame_tracking",
+                    "worker_id": spec.worker_id,
+                    "session_id": session_id,
+                    "enabled": publisher_tracking_enabled,
+                }
+            )
+            start_pump(session_id, credit_window=credit_window)
+            await result(request_id)
+        except Exception as exc:
+            await result(request_id, error=exc)
 
     try:
         while True:
@@ -1195,42 +1247,18 @@ async def _run_nccl_model_worker(
                         int(command.get("model_output_credit_window", _MODEL_OUTPUT_PARENT_QUEUE_SIZE)),
                     )
                 elif kind == "nccl_send":
-                    # Keep the child command loop responsive so output pumps
-                    # for unrelated sessions continue during the transfer.
-                    await asyncio.to_thread(
-                        transfer_on_worker_device,
-                        outgoing.pop(command["transfer_id"]),
-                        peer_rank=command["target_rank"],
-                        send=True,
-                    )
+                    # The parent still waits for this request result before
+                    # committing ownership, but unrelated commands can run
+                    # while the point-to-point copy is in flight.
+                    task = asyncio.create_task(run_nccl_send(command), name=f"nccl-send-{command['transfer_id']}")
+                    transfer_tasks.add(task)
+                    task.add_done_callback(transfer_tasks.discard)
+                    continue
                 elif kind == "nccl_recv":
-                    metadata, leaves, owner, epoch, credit_window = incoming.pop(command["transfer_id"])
-                    await asyncio.to_thread(
-                        transfer_on_worker_device,
-                        leaves,
-                        peer_rank=command["source_rank"],
-                        send=False,
-                    )
-                    session_id = await asyncio.to_thread(
-                        import_session_on_worker_device,
-                        metadata,
-                        leaves,
-                        owner_worker_id=owner,
-                        ownership_epoch=epoch,
-                    )
-                    try:
-                        publisher_tracking_enabled = bool(adapter.enable_publisher_frame_tracking(session_id))
-                    except Exception:
-                        publisher_tracking_enabled = False
-                    events.put(
-                        {
-                            "type": "model_publisher_frame_tracking",
-                            "worker_id": spec.worker_id,
-                            "session_id": session_id,
-                            "enabled": publisher_tracking_enabled,
-                        }
-                    )
-                    start_pump(session_id, credit_window=credit_window)
+                    task = asyncio.create_task(run_nccl_recv(command), name=f"nccl-recv-{command['transfer_id']}")
+                    transfer_tasks.add(task)
+                    task.add_done_callback(transfer_tasks.discard)
+                    continue
                 elif kind == "nccl_commit_source":
                     await stop_pump(command["session_id"], drop_credit_state=True)
                     await asyncio.to_thread(service.commit_migration, command["session_id"])
@@ -1253,6 +1281,10 @@ async def _run_nccl_model_worker(
             except Exception as exc:
                 await result(request_id, error=exc)
     finally:
+        for task in tuple(transfer_tasks):
+            task.cancel()
+        if transfer_tasks:
+            await asyncio.gather(*transfer_tasks, return_exceptions=True)
         for session_id in tuple(outputs):
             await stop_pump(session_id, drop_credit_state=True)
         if dist.is_initialized():
