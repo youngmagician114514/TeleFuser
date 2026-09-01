@@ -581,7 +581,7 @@ class MotivationRuntimeController:
                         target_gpu=record.request.target_gpu,
                         now=now,
                     )
-                except (KeyError, RuntimeError, ValueError):
+                except Exception:
                     # A stale/failed transfer is cleared so the next search
                     # can safely remain on the source GPU or retry later.
                     try:
