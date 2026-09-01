@@ -27,6 +27,7 @@ MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-3}"
 MAX_DEADLINE_WAIT_MS="${MAX_DEADLINE_WAIT_MS:-1000}"
 FRAME_CREDIT_TARGET_FRAMES="${FRAME_CREDIT_TARGET_FRAMES:-36}"
 BATCH_SAFETY_FACTOR="${BATCH_SAFETY_FACTOR:-1.05}"
+MOTIVATION_PROFILE="${MOTIVATION_PROFILE:-}"
 RUN="${RUN:-results/experiments/abot_4gpu_lf3_12fps_publicdemo_b${MAX_BATCH_SIZE}_f${FRAME_CREDIT_TARGET_FRAMES}_30min_$(date -u +%Y%m%dT%H%M%SZ)}"
 
 IFS=',' read -r -a GPUS <<<"${GPU_IDS}"
@@ -69,8 +70,22 @@ printf '%s\n' \
   "MAX_DEADLINE_WAIT_MS=${MAX_DEADLINE_WAIT_MS}" \
   "FRAME_CREDIT_TARGET_FRAMES=${FRAME_CREDIT_TARGET_FRAMES}" \
   "BATCH_SAFETY_FACTOR=${BATCH_SAFETY_FACTOR}" \
+  "MOTIVATION_PROFILE=${MOTIVATION_PROFILE}" \
   "SCENARIO=${SCENARIO}" \
   >"${RUN}/run-config.env"
+
+MOTIVATION_ARGS=()
+if [[ -n "${MOTIVATION_PROFILE}" ]]; then
+  if [[ ! -f "${MOTIVATION_PROFILE}" ]]; then
+    echo "Motivation profile not found: ${MOTIVATION_PROFILE}" >&2
+    exit 2
+  fi
+  MOTIVATION_ARGS+=(
+    --motivation-profile "${MOTIVATION_PROFILE}"
+    --motivation-max-batch-size "${MAX_BATCH_SIZE}"
+  )
+  echo "Motivation scheduler diagnostics enabled; profile: ${MOTIVATION_PROFILE}"
+fi
 
 SERVER_PID=""
 SERVING_METRICS_PID=""
@@ -121,6 +136,7 @@ TELEFUSER_LIVEKIT_DISPATCH_TRACE_MAX_EVENTS=100000 \
   --worker-mode process-nccl \
   --max-sessions-per-worker 4 \
   --queue-size 0 \
+  "${MOTIVATION_ARGS[@]}" \
   --skip-validation \
   >"${RUN}/server.log" 2>&1 &
 SERVER_PID=$!
@@ -166,6 +182,12 @@ wait "${GPU_METRICS_PID}"
 GPU_METRICS_PID=""
 
 curl --noproxy '*' -fsS "http://127.0.0.1:${PORT}/v1/service/metadata" >"${RUN}/metadata-after.json"
+
+if [[ -n "${MOTIVATION_PROFILE}" ]]; then
+  PYTHONPATH="${REPO_ROOT}" "${PYTHON_BIN}" tools/validation/extract_motivation_diagnostics.py \
+    --metadata "${RUN}/metadata-after.json" \
+    --output "${RUN}/motivation-diagnostics.json"
+fi
 
 PYTHONPATH="${REPO_ROOT}" "${PYTHON_BIN}" tools/validation/render_abot_dispatch_timeline.py \
   --dispatch-trace "${RUN}/dispatch-trace.jsonl" \
