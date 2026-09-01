@@ -235,6 +235,20 @@ class MotivationRuntimeController:
             now=self._observed(now),
         )
 
+    def on_session_compatibility(
+        self,
+        session_id: str,
+        compatibility_key: Iterable[object],
+        *,
+        now: float | None = None,
+    ) -> None:
+        """Forward worker-reported KV/layout compatibility to the policy."""
+        self.scheduler.update_session_compatibility(
+            session_id,
+            compatibility_key,
+            now=self._observed(now),
+        )
+
     def search_async(
         self,
         *,
@@ -257,6 +271,7 @@ class MotivationRuntimeController:
                 self._owns_search_executor = True
             executor = self._search_executor
         def search() -> DispatchCandidate | None:
+            pending_migrations = self._pending_migration_sessions()
             # The task may start after an event callback has advanced policy
             # time.  Search from the scheduler's current timeline rather than
             # failing with a backwards-time error; dispatch_candidate still
@@ -267,6 +282,7 @@ class MotivationRuntimeController:
                     now=search_at,
                     wait_seconds=wait_seconds,
                     include_wait=True,
+                    exclude_session_ids=pending_migrations,
                 )
             except ValueError as exc:
                 # A concurrent event can advance the scheduler between the
@@ -279,6 +295,7 @@ class MotivationRuntimeController:
                     now=self.scheduler.current_time,
                     wait_seconds=wait_seconds,
                     include_wait=True,
+                    exclude_session_ids=self._pending_migration_sessions(),
                 )
 
         return executor.submit(search)
@@ -292,10 +309,12 @@ class MotivationRuntimeController:
         """Search synchronously and dispatch one current candidate if possible."""
         observed_at = self._observed(now)
         self._ensure_idle_jobs(now=observed_at)
+        pending_migrations = self._pending_migration_sessions()
         candidate = self.scheduler.find_best(
             now=observed_at,
             wait_seconds=wait_seconds,
             include_wait=True,
+            exclude_session_ids=pending_migrations,
         )
         if candidate is None:
             return None
@@ -311,11 +330,33 @@ class MotivationRuntimeController:
             wait_seconds=wait_seconds,
             include_wait=False,
             allow_migrations=False,
-            exclude_session_ids=candidate.session_ids,
+            exclude_session_ids=tuple({*candidate.session_ids, *pending_migrations}),
         )
         if fallback is None:
             return None
         return self.dispatch_candidate(fallback, now=self.scheduler.current_time)
+
+    def _pending_migration_sessions(self) -> tuple[str, ...]:
+        """Return sessions whose async migration is not ready to commit.
+
+        A pending transfer is already quiescing its source worker. Keeping its
+        job in every fresh global candidate causes repeated ``migration_pending``
+        decisions and starves local batches, so those sessions are isolated
+        until the completion callback makes the transfer ready.
+        """
+        manager = self.migration_manager
+        if manager is None:
+            return ()
+        for record in manager.active():
+            try:
+                manager.poll(record.request.session_id, now=self.scheduler.current_time)
+            except (KeyError, RuntimeError):
+                continue
+        return tuple(
+            record.request.session_id
+            for record in manager.active()
+            if record.state not in {"ready", "completed"}
+        )
 
     def _ensure_idle_jobs(self, *, now: float) -> None:
         """Materialize at most one consumption-gated idle sentinel per session."""
@@ -519,6 +560,34 @@ class MotivationRuntimeController:
         return True
 
     def _notify_migration_wakeup(self) -> None:
+        # The backend callback is the only event guaranteed to run after a
+        # true asynchronous copy completes. Commit ready transfers here
+        # before searching, otherwise a ready record can remain visible until
+        # an unrelated user action arrives and the target GPU is never used.
+        # Use the scheduler timeline rather than wall-clock time. Tests and
+        # replay harnesses intentionally use a virtual/normalized timeline;
+        # an async completion callback must not jump it forward unexpectedly.
+        now = self.scheduler.current_time
+        manager = self.migration_manager
+        if manager is not None:
+            for record in manager.active():
+                try:
+                    current = manager.poll(record.request.session_id, now=now)
+                    if current.state != "ready":
+                        continue
+                    manager.commit(record.request.session_id, now=now)
+                    self.scheduler.commit_migration(
+                        record.request.session_id,
+                        target_gpu=record.request.target_gpu,
+                        now=now,
+                    )
+                except (KeyError, RuntimeError, ValueError):
+                    # A stale/failed transfer is cleared so the next search
+                    # can safely remain on the source GPU or retry later.
+                    try:
+                        self.scheduler.clear_migration(record.request.session_id, now=now)
+                    except (KeyError, ValueError):
+                        pass
         with self._lock:
             callback = self._migration_wakeup
         if callback is None:

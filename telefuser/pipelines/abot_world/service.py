@@ -914,6 +914,12 @@ class ABotWorldLiveKitService:
             state = self._sessions[session_id]
             with state.lock:
                 now = time.monotonic()
+                # Keep the policy-side compatibility contract structural and
+                # fidelity-independent. The worker reports the same shape,
+                # first/continuation, KV-layout and lifecycle constraints that
+                # its native batch path enforces.
+                batch_key = self._batch_key(state)
+                structural_key = batch_key[:5] + batch_key[6:]
                 queued_video_frames = self._queued_video_frames(state)
                 frame_credit_frames = queued_video_frames + state.publisher_unsubmitted_frames
                 return {
@@ -944,6 +950,7 @@ class ABotWorldLiveKitService:
                     "publisher_progress_sequence": state.publisher_progress_sequence,
                     "publisher_frames_submitted": state.publisher_frames_submitted,
                     "publisher_frames_abandoned": state.publisher_frames_abandoned,
+                    "batch_compatibility_key": repr(structural_key),
                 }
 
     def set_dispatch_trace_callback(self, callback: Callable[[dict[str, Any]], None] | None) -> None:

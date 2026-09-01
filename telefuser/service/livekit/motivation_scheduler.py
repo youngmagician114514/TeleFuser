@@ -766,6 +766,30 @@ class MotivationScheduler:
             state.migration_ready_at = ready_at
             self._epoch += 1
 
+    def update_session_compatibility(
+        self,
+        session_id: str,
+        compatibility_key: Iterable[object],
+        *,
+        now: float | None = None,
+    ) -> None:
+        """Publish the worker's current batch-compatibility state.
+
+        The policy process cannot inspect a worker's KV cursor directly. A
+        worker therefore reports a structural key after each completed
+        invocation. Updating the key invalidates asynchronous searches based
+        on the previous KV/layout state.
+        """
+        observed_at = self._clock() if now is None else now
+        with self._lock:
+            self._advance_to(observed_at)
+            state = self._sessions[session_id]
+            updated = tuple(compatibility_key)
+            if state.compatibility_key == updated:
+                return
+            state.compatibility_key = updated
+            self._epoch += 1
+
     def _advance_to(self, now: float) -> None:
         if not math.isfinite(now) or now < self._now - EPSILON:
             raise ValueError("scheduler time must be monotonic")

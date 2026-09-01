@@ -300,7 +300,7 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         # Worker snapshots include scalar timings/counters plus the bounded
         # scheduler mode string (``batched`` or ``round_robin``).
         self._worker_runtime_metrics: dict[str, dict[str, float | int | str]] = {}
-        self._session_runtime_metrics: dict[str, dict[str, float | int]] = {}
+        self._session_runtime_metrics: dict[str, dict[str, float | int | str]] = {}
         self._migration_total_ms: list[float] = []
         self._nccl_ranks: dict[str, int] = {}
         self._migration_lock = asyncio.Lock()
@@ -948,7 +948,9 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
             session_metrics = event.get("session_runtime_metrics")
             if isinstance(session_metrics, dict):
                 self._session_runtime_metrics[event["session_id"]] = {
-                    key: value for key, value in session_metrics.items() if isinstance(value, int | float)
+                    key: value
+                    for key, value in session_metrics.items()
+                    if isinstance(value, int | float | str)
                 }
             output_callback = getattr(self._event_sink, "on_model_output", None)
             if callable(output_callback):

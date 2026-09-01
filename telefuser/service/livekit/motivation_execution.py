@@ -148,6 +148,7 @@ class MotivationExecutionBridge:
         worker_id: str,
         pipeline_session_id: str,
         payload: dict[str, Any],
+        session_runtime_metrics: dict[str, Any] | None = None,
     ) -> None:
         """Commit a lease after each selected session reaches model output."""
 
@@ -168,12 +169,22 @@ class MotivationExecutionBridge:
                 return
             progress = self._leases[lease_id]
             progress.pending_session_ids.discard(session_id)
-            if progress.pending_session_ids:
-                return
-            self._leases.pop(lease_id, None)
-            for job in progress.lease.jobs:
-                self._job_to_lease.pop(job.job_id, None)
             lease = progress.lease
+            completed = not progress.pending_session_ids
+            if completed:
+                self._leases.pop(lease_id, None)
+                for job in progress.lease.jobs:
+                    self._job_to_lease.pop(job.job_id, None)
+        if session_id is not None and isinstance(session_runtime_metrics, dict):
+            compatibility_key = session_runtime_metrics.get("batch_compatibility_key")
+            if isinstance(compatibility_key, str):
+                self.controller.on_session_compatibility(
+                    session_id,
+                    (compatibility_key,),
+                    now=self._clock(),
+                )
+        if not completed:
+            return
         self.controller.on_completion(lease, completed_at=self._clock())
         self._schedule()
 

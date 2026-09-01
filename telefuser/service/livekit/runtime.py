@@ -401,7 +401,12 @@ class LiveKitServeRuntime:
         )
         bridge = self._motivation_bridge
         if bridge is not None:
-            bridge.on_model_output(worker_id, session_id, payload)
+            bridge.on_model_output(
+                worker_id,
+                session_id,
+                payload,
+                session_runtime_metrics=session_runtime_metrics,
+            )
 
     def prometheus_metrics(self) -> str:
         """Render runtime, scheduler, session, and pipeline serving metrics."""
