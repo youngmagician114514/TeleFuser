@@ -82,7 +82,8 @@ ownership.
 
 ## Asynchronous migration
 
-`async_migration.AsyncMigrationManager` exposes a backend-neutral state machine:
+`session_state_transfer.SessionStateTransferManager` exposes a backend-neutral
+state-transfer state machine:
 
 ```text
 precopied -> ready -> committing -> completed
@@ -91,15 +92,21 @@ precopied/ready ────────> aborted
 ```
 
 A true backend can pre-copy KV state while the source computes and perform a
-short final delta copy at a chunk boundary.  `RouterMigrationBackend` is a
-compatibility adapter for the current blocking `TurboServePipelineRouter`:
-the router operation runs in a private thread, so the scheduler is not
-blocked, while the router still preserves its existing boundary-safe
-quiesce/import/ownership-commit protocol.
+short final delta copy at a chunk boundary.  The canonical compatibility
+adapter is `ThreadedRouterSessionStateTransferBackend`; it isolates the
+blocking `TurboServePipelineRouter` call behind the transfer interface.
 
-The next runtime integration layer should feed migration estimates into
-`MigrationEstimator`, reserve target memory, start the transfer during the
-current batch, and call `commit()` only after the target reports `ready`.
+The process-NCCL runtime now uses session-local quiescence: only the migrating
+session is removed from the source ready set, while other sessions continue on
+both workers. NCCL send/receive and target restoration run off the child
+command loop so output pumps remain responsive. The current backend still
+transfers a complete session tensor manifest; a paged or layer-streaming
+backend can be added behind the same interface without changing policy code.
+
+The remaining transport work is backend-specific: a paged or layer-streaming
+implementation should feed its readiness estimate into `MigrationEstimator`,
+reserve target memory, pre-copy during the current batch, and call `commit()`
+only after the target reports `ready`.
 ## Runtime bridge
 
 `MotivationRuntimeController` is an opt-in bridge around the policy core. A

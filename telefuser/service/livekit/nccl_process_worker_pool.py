@@ -703,10 +703,9 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
             started = time.monotonic()
             source_output_paused = False
             try:
-                await asyncio.gather(
-                    self._request(source_worker_id, "scheduler_pause", timeout=300.0),
-                    self._request(target_worker_id, "scheduler_pause", timeout=300.0),
-                )
+                # ABot marks only this session as migrating and waits for its
+                # own boundary. Other sessions on both workers keep running
+                # while the state transfer is prepared.
                 await self._drain_model_outputs_for_migration(
                     pipeline_session_id,
                     source_worker_id=source_worker_id,
@@ -802,15 +801,6 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                         source_worker_id, {"type": "model_push", "session_id": pipeline_session_id, "chunk": chunk}
                     )
                 raise
-            finally:
-                # A failed state copy must not leave either GPU permanently
-                # paused.  Resume is deliberately best-effort: the original
-                # migration exception is the meaningful caller-visible error.
-                await asyncio.gather(
-                    self._request(source_worker_id, "scheduler_resume"),
-                    self._request(target_worker_id, "scheduler_resume"),
-                    return_exceptions=True,
-                )
 
     def turboserve_snapshot(self) -> dict[str, object]:
         snapshot = super().turboserve_snapshot()
@@ -1049,6 +1039,32 @@ async def _run_nccl_model_worker(
     outgoing: dict[str, dict[tuple[Any, ...], torch.Tensor]] = {}
     incoming: dict[str, tuple[dict[str, Any], dict[tuple[Any, ...], torch.Tensor], str, int, int]] = {}
 
+    def transfer_on_worker_device(
+        leaves: dict[tuple[Any, ...], torch.Tensor],
+        *,
+        peer_rank: int,
+        send: bool,
+    ) -> int:
+        """Run NCCL transfer on a worker thread with the child CUDA device selected."""
+        torch.cuda.set_device(int(spec.gpu_ids[0]))
+        return transfer_tensor_leaves_nccl(leaves, peer_rank=peer_rank, send=send)
+
+    def import_session_on_worker_device(
+        metadata: dict[str, Any],
+        leaves: dict[tuple[Any, ...], torch.Tensor],
+        *,
+        owner_worker_id: str,
+        ownership_epoch: int,
+    ) -> str:
+        """Restore received session tensors on a thread bound to this worker GPU."""
+        torch.cuda.set_device(int(spec.gpu_ids[0]))
+        return service.import_migration_nccl(
+            metadata,
+            leaves,
+            owner_worker_id=owner_worker_id,
+            ownership_epoch=ownership_epoch,
+        )
+
     def start_pump(session_id: str, *, credit_window: int = _MODEL_OUTPUT_PARENT_QUEUE_SIZE) -> None:
         credits = output_credits.get(session_id)
         if credits is None:
@@ -1179,14 +1195,28 @@ async def _run_nccl_model_worker(
                         int(command.get("model_output_credit_window", _MODEL_OUTPUT_PARENT_QUEUE_SIZE)),
                     )
                 elif kind == "nccl_send":
-                    transfer_tensor_leaves_nccl(
-                        outgoing.pop(command["transfer_id"]), peer_rank=command["target_rank"], send=True
+                    # Keep the child command loop responsive so output pumps
+                    # for unrelated sessions continue during the transfer.
+                    await asyncio.to_thread(
+                        transfer_on_worker_device,
+                        outgoing.pop(command["transfer_id"]),
+                        peer_rank=command["target_rank"],
+                        send=True,
                     )
                 elif kind == "nccl_recv":
                     metadata, leaves, owner, epoch, credit_window = incoming.pop(command["transfer_id"])
-                    transfer_tensor_leaves_nccl(leaves, peer_rank=command["source_rank"], send=False)
-                    session_id = service.import_migration_nccl(
-                        metadata, leaves, owner_worker_id=owner, ownership_epoch=epoch
+                    await asyncio.to_thread(
+                        transfer_on_worker_device,
+                        leaves,
+                        peer_rank=command["source_rank"],
+                        send=False,
+                    )
+                    session_id = await asyncio.to_thread(
+                        import_session_on_worker_device,
+                        metadata,
+                        leaves,
+                        owner_worker_id=owner,
+                        ownership_epoch=epoch,
                     )
                     try:
                         publisher_tracking_enabled = bool(adapter.enable_publisher_frame_tracking(session_id))
@@ -1203,7 +1233,7 @@ async def _run_nccl_model_worker(
                     start_pump(session_id, credit_window=credit_window)
                 elif kind == "nccl_commit_source":
                     await stop_pump(command["session_id"], drop_credit_state=True)
-                    service.commit_migration(command["session_id"])
+                    await asyncio.to_thread(service.commit_migration, command["session_id"])
                 elif kind == "nccl_abort_source":
                     service.abort_migration(command["session_id"])
                     outgoing.pop(command.get("transfer_id", ""), None)

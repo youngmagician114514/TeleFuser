@@ -30,6 +30,12 @@ from .motivation_scheduler import (
     load_motivation_profiles_csv,
 )
 from .pipeline_router import TurboServePipelineRouter, TurboServeWorkerPipelineView
+from .session_state_transfer import (
+    SessionStateTransferBackend,
+    SessionStateTransferManager,
+    SessionStateTransferRecord,
+    SessionStateTransferRequest,
+)
 from .turboserve import (
     TurboServeAutoscalingController,
     TurboServeOwnershipTable,
@@ -41,6 +47,10 @@ __all__ = [
     "LiveKitServeConfig",
     "ActionJob",
     "AsyncMigrationManager",
+    "SessionStateTransferBackend",
+    "SessionStateTransferManager",
+    "SessionStateTransferRecord",
+    "SessionStateTransferRequest",
     "DispatchCandidate",
     "DispatchLease",
     "GpuSchedulingState",

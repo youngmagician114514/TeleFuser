@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from telefuser.service.security.security_validator import SecurityLevel
 from telefuser.utils.logging import logger
 
-from .async_migration import AsyncMigrationManager, MigrationRequest
 from .config import LiveKitServeConfig
 from .metrics import LiveKitServingMetrics
 from .motivation_controller import MotivationRuntimeController
@@ -32,6 +31,7 @@ from .schemas import (
     new_session_id,
 )
 from .session_registry import TERMINAL_SESSION_STATUSES, SessionRecord, SessionRegistry
+from .session_state_transfer import SessionStateTransferManager, SessionStateTransferRequest
 from .token_service import LiveKitTokenService
 from .turboserve import (
     TurboServeAutoscalingController,
@@ -50,7 +50,7 @@ from .turboserve import (
 from .worker_pool import InProcessLiveKitWorkerPool, WorkerPool
 
 
-class _RuntimeMigrationBackend:
+class _RuntimeSessionStateTransferBackend:
     """Adapt the runtime's async worker-pool migration to the policy backend."""
 
     def __init__(
@@ -63,7 +63,7 @@ class _RuntimeMigrationBackend:
         self._future: concurrent.futures.Future[object] | None = None
         self._callbacks: list[Callable[[object], None]] = []
 
-    def begin(self, request: MigrationRequest) -> concurrent.futures.Future[object]:
+    def begin(self, request: SessionStateTransferRequest) -> concurrent.futures.Future[object]:
         self._future = asyncio.run_coroutine_threadsafe(
             self._runtime.migrate_session(request.session_id, request.target_gpu),
             self._loop,
@@ -215,9 +215,9 @@ class LiveKitServeRuntime:
             self._motivation_loop = asyncio.get_running_loop()
             controller = self._motivation_bridge.controller
             if controller.migration_manager is None:
-                controller.migration_manager = AsyncMigrationManager()
+                controller.migration_manager = SessionStateTransferManager()
             if controller.migration_backend_factory is None:
-                controller.migration_backend_factory = lambda _request: _RuntimeMigrationBackend(
+                controller.migration_backend_factory = lambda _request: _RuntimeSessionStateTransferBackend(
                     self, self._motivation_loop
                 )
             controller.set_migration_wakeup_callback(self._motivation_bridge.schedule_wakeup)

@@ -16,12 +16,6 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
-from .async_migration import (
-    AsyncMigrationBackend,
-    AsyncMigrationManager,
-    MigrationRecord,
-    MigrationRequest,
-)
 from .motivation_diagnostics import MotivationDiagnosticsSink, MotivationDispatchSummary
 from .motivation_scheduler import (
     ActionJob,
@@ -31,6 +25,12 @@ from .motivation_scheduler import (
     MotivationSchedulerConfig,
     SessionSchedulingState,
     load_motivation_profiles_csv,
+)
+from .session_state_transfer import (
+    SessionStateTransferBackend,
+    SessionStateTransferManager,
+    SessionStateTransferRecord,
+    SessionStateTransferRequest,
 )
 
 
@@ -44,7 +44,7 @@ class DispatchLease:
 
 
 DispatchCallback = Callable[[DispatchLease], None]
-MigrationBackendFactory = Callable[[MigrationRequest], AsyncMigrationBackend]
+SessionStateTransferBackendFactory = Callable[[SessionStateTransferRequest], SessionStateTransferBackend]
 SearchExecutor = concurrent.futures.Executor
 
 
@@ -63,8 +63,8 @@ class MotivationRuntimeController:
         scheduler: MotivationScheduler,
         *,
         dispatch: DispatchCallback,
-        migration_manager: AsyncMigrationManager | None = None,
-        migration_backend_factory: MigrationBackendFactory | None = None,
+        migration_manager: SessionStateTransferManager | None = None,
+        migration_backend_factory: SessionStateTransferBackendFactory | None = None,
         search_executor: SearchExecutor | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -106,8 +106,8 @@ class MotivationRuntimeController:
         gpu_states: Iterable[GpuSchedulingState],
         dispatch: DispatchCallback,
         scheduler_config: MotivationSchedulerConfig | None = None,
-        migration_manager: AsyncMigrationManager | None = None,
-        migration_backend_factory: MigrationBackendFactory | None = None,
+        migration_manager: SessionStateTransferManager | None = None,
+        migration_backend_factory: SessionStateTransferBackendFactory | None = None,
         search_executor: SearchExecutor | None = None,
         diagnostics: MotivationDiagnosticsSink | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -474,11 +474,11 @@ class MotivationRuntimeController:
             quality=quality,
         )
 
-    def poll_migrations(self, *, now: float | None = None) -> tuple[MigrationRecord, ...]:
+    def poll_migrations(self, *, now: float | None = None) -> tuple[SessionStateTransferRecord, ...]:
         """Poll active transfers and return records that became ready/completed."""
         if self.migration_manager is None:
             return ()
-        records: list[MigrationRecord] = []
+        records: list[SessionStateTransferRecord] = []
         for record in self.migration_manager.active():
             records.append(self.migration_manager.poll(record.request.session_id, now=self._observed(now)))
         return tuple(records)
@@ -512,7 +512,7 @@ class MotivationRuntimeController:
                 # callback as an uncaught RuntimeError.
                 if len(self.migration_manager.active()) >= self.migration_manager.max_concurrent:
                     return False
-                request = MigrationRequest(
+                request = SessionStateTransferRequest(
                     session_id=session_id,
                     source_gpu=state.owner_gpu,
                     target_gpu=candidate.gpu_id,
@@ -530,7 +530,9 @@ class MotivationRuntimeController:
                     message = str(exc)
                     if (
                         "maximum concurrent migrations reached" in message
+                        or "maximum concurrent transfers reached" in message
                         or "already has an active migration" in message
+                        or "already has an active transfer" in message
                     ):
                         return False
                     raise
