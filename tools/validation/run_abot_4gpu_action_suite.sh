@@ -381,14 +381,15 @@ wait_for_port() {
   local port="$1"
   local pid="$2"
   local label="$3"
-  for _ in $(seq 1 60); do
+  local timeout_seconds="${4:-60}"
+  for _ in $(seq 1 "${timeout_seconds}"); do
     if ss -ltn "( sport = :${port} )" | tail -n +2 | grep -q .; then
       return 0
     fi
     kill -0 "${pid}" 2>/dev/null || die "${label} exited before listening on port ${port}"
     sleep 1
   done
-  die "${label} did not listen on port ${port} within 60 seconds"
+  die "${label} did not listen on port ${port} within ${timeout_seconds} seconds"
 }
 
 wait_for_ready() {
@@ -430,7 +431,7 @@ for workload in "${WORKLOADS[@]}"; do
   "${LIVEKIT_BIN}" --dev >"${RUN_DIR}/livekit.log" 2>&1 &
   LIVEKIT_PID=$!
   printf '%s\n' "${LIVEKIT_PID}" >"${RUN_DIR}/livekit.pid"
-  wait_for_port 7880 "${LIVEKIT_PID}" "LiveKit"
+  wait_for_port 7880 "${LIVEKIT_PID}" "LiveKit" 60
 
   CUDA_VISIBLE_DEVICES="${GPU_IDS}" \
   PYTHONPATH="${REPO_ROOT}" \
@@ -468,7 +469,11 @@ for workload in "${WORKLOADS[@]}"; do
   SERVER_PID=$!
   printf '%s\n' "${SERVER_PID}" >"${RUN_DIR}/server.pid"
 
-  wait_for_port 8088 "${SERVER_PID}" "TeleFuser"
+  # Model loading and process-NCCL initialization can take several minutes on
+  # a cold start. Keep this separate from the short LiveKit startup timeout;
+  # otherwise the runner kills a healthy server before /v1/service/ready can
+  # be reached.
+  wait_for_port 8088 "${SERVER_PID}" "TeleFuser" 300
   wait_for_ready "${RUN_DIR}"
   curl --noproxy '*' -fsS "http://127.0.0.1:8088/v1/service/metadata" \
     >"${RUN_DIR}/metadata-before.json"
