@@ -14,6 +14,7 @@ from telefuser.utils.logging import logger
 from .app import create_livekit_app
 from .config import LiveKitServeConfig
 from .motivation_controller import MotivationRuntimeController
+from .motivation_diagnostics import MotivationDiagnosticsCollector
 from .motivation_scheduler import GpuSchedulingState, MotivationSchedulerConfig
 from .runtime import LiveKitServeRuntime
 
@@ -83,11 +84,16 @@ def run_stream_server(
             GpuSchedulingState(f"worker-{index}", memory_free_gb=motivation_memory_free_gb)
             for index in range(config.num_workers)
         ]
+        diagnostics = MotivationDiagnosticsCollector(
+            recent_search_limit=64,
+            recent_dispatch_limit=64,
+        )
         motivation_controller = MotivationRuntimeController.from_offline_table(
             motivation_profile,
             gpu_states=gpu_states,
             dispatch=lambda _lease: None,
             scheduler_config=MotivationSchedulerConfig(max_batch_size=motivation_max_batch_size),
+            diagnostics=diagnostics,
         )
 
     runtime = LiveKitServeRuntime(

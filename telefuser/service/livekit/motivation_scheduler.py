@@ -23,6 +23,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
 
+from .motivation_diagnostics import (
+    MotivationDiagnosticsSink,
+    MotivationDispatchSummary,
+    MotivationSearchSummary,
+    NullMotivationDiagnostics,
+    empty_batch_counts,
+)
+
 EPSILON = 1e-9
 JobKind = Literal["action", "idle"]
 
@@ -519,11 +527,13 @@ class MotivationScheduler:
         *,
         config: MotivationSchedulerConfig | None = None,
         migration_estimator: MigrationEstimator | None = None,
+        diagnostics: MotivationDiagnosticsSink | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.profile_provider = profile_provider
         self.config = config or MotivationSchedulerConfig()
         self.migration_estimator = migration_estimator or LocalMigrationEstimator()
+        self._diagnostics = diagnostics or NullMotivationDiagnostics()
         self._clock = clock
         self._sessions: dict[str, SessionSchedulingState] = {}
         self._gpus: dict[str, GpuSchedulingState] = {}
@@ -846,28 +856,48 @@ class MotivationScheduler:
         excluded = set(exclude_session_ids)
         with self._lock:
             self._advance_to(observed_at)
-            ready = tuple(item for item in self._ready_jobs() if item[0].session_id not in excluded)
+            all_ready = self._ready_jobs()
+            ready = tuple(item for item in all_ready if item[0].session_id not in excluded)
             if gpu_states is not None:
                 gpus = tuple(gpu_states)
             else:
                 gpus = tuple(self._gpus.values())
             candidates: list[DispatchCandidate] = []
+            enumerated = empty_batch_counts()
+            compatible = empty_batch_counts()
+            profiles_evaluated = empty_batch_counts()
+            feasible = empty_batch_counts()
+            rejected: dict[str, int] = {}
+
+            def reject(reason: str) -> None:
+                rejected[reason] = rejected.get(reason, 0) + 1
+
             if ready:
                 for gpu in gpus:
                     if not gpu.available:
+                        reject("gpu_unavailable")
                         continue
                     for size in range(1, min(self.config.max_batch_size, len(ready)) + 1):
                         for members in itertools.combinations(ready, size):
+                            enumerated[size] += 1
                             states = tuple(item[0] for item in members)
                             jobs = tuple(item[1] for item in members)
                             keys = {state.compatibility_key for state in states}
                             if len(keys) != 1:
+                                reject("incompatible")
                                 continue
-                            for profile in self.profile_provider.profiles_for(
+                            compatible[size] += 1
+                            profiles = tuple(self.profile_provider.profiles_for(
                                 batch_size=size,
                                 gpu_id=gpu.gpu_id,
-                            ):
+                            ))
+                            if not profiles:
+                                reject("no_profile")
+                                continue
+                            profiles_evaluated[size] += len(profiles)
+                            for profile in profiles:
                                 if profile.memory_gb > gpu.memory_free_gb + EPSILON:
+                                    reject("memory")
                                     continue
                                 estimates = tuple(
                                     self.migration_estimator.estimate(
@@ -882,6 +912,7 @@ class MotivationScheduler:
                                     and (not self.config.migration_enabled or not allow_migrations)
                                     for estimate in estimates
                                 ):
+                                    reject("migration_disabled")
                                     continue
                                 migration_count = sum(estimate.required for estimate in estimates)
                                 migration_seconds = sum(
@@ -921,7 +952,9 @@ class MotivationScheduler:
                                     value < system_quality - self.config.fairness_delta - EPSILON
                                     for value in selected_quality
                                 ):
+                                    reject("fairness")
                                     continue
+                                feasible[size] += 1
                                 score = sum(
                                     self._utility(value, self.config.utility_cap_seconds)
                                     for value in projected_slack.values()
@@ -951,18 +984,73 @@ class MotivationScheduler:
                                 )
             if include_wait:
                 candidates.append(self._wait_candidate(now=observed_at, wait_seconds=wait_seconds))
-            if not candidates:
-                return None
-            return max(
-                candidates,
-                key=lambda candidate: (
-                    candidate.score,
-                    candidate.action_count,
-                    candidate.batch_size,
-                    -candidate.finish_at,
-                    -candidate.migration_count,
-                ),
+            selected = (
+                max(
+                    candidates,
+                    key=lambda candidate: (
+                        candidate.score,
+                        candidate.action_count,
+                        candidate.batch_size,
+                        -candidate.finish_at,
+                        -candidate.migration_count,
+                    ),
+                )
+                if candidates
+                else None
             )
+            not_selected = dict(feasible)
+            if selected is not None and not selected.wait:
+                not_selected[selected.batch_size] = max(
+                    0, not_selected[selected.batch_size] - 1
+                )
+            selected_batch_size = selected.batch_size if selected is not None else 0
+            summary = MotivationSearchSummary(
+                observed_at=observed_at,
+                snapshot_epoch=self._epoch,
+                ready_count=len(ready),
+                ready_action_count=sum(1 for _, job in ready if job.kind == "action"),
+                ready_idle_count=sum(1 for _, job in ready if job.kind == "idle"),
+                excluded_ready_count=len(all_ready) - len(ready),
+                gpu_count=len(gpus),
+                include_wait=include_wait,
+                allow_migrations=allow_migrations,
+                wait_seconds=max(0.0, wait_seconds),
+                enumerated_by_batch_size=enumerated,
+                compatible_by_batch_size=compatible,
+                profiles_evaluated_by_batch_size=profiles_evaluated,
+                feasible_by_batch_size=feasible,
+                rejected_by_reason=rejected,
+                not_selected_by_score=not_selected,
+                selected_batch_size=selected_batch_size,
+                selected_wait=bool(selected.wait) if selected is not None else False,
+                selected_gpu_id=selected.gpu_id if selected is not None else None,
+                selected_fidelity=selected.fidelity if selected is not None else None,
+                selected_score=selected.score if selected is not None else None,
+                selected_migration_count=(selected.migration_count if selected is not None else 0),
+                selected_session_ids=selected.session_ids if selected is not None else (),
+                selected_job_ids=selected.job_ids if selected is not None else (),
+            )
+            try:
+                self._diagnostics.record_search(summary)
+            except Exception:
+                # Diagnostics must never affect policy availability.
+                pass
+            return selected
+
+    def record_dispatch_diagnostics(self, summary: MotivationDispatchSummary) -> None:
+        """Publish a dispatch outcome without coupling policy to a logger."""
+        try:
+            self._diagnostics.record_dispatch(summary)
+        except Exception:
+            # A telemetry sink must never break reservation or worker dispatch.
+            return
+
+    def diagnostics_snapshot(self) -> dict[str, object]:
+        """Return the injected diagnostics sink's bounded snapshot."""
+        try:
+            return self._diagnostics.snapshot()
+        except Exception:
+            return {}
 
     def validate(self, candidate: DispatchCandidate, *, now: float | None = None) -> bool:
         """Check that an asynchronously searched candidate is still current."""

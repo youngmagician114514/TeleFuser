@@ -171,3 +171,33 @@ current completion boundary and later pass its result to
 reservation and dispatch remain synchronous and are rejected if the global
 epoch, selected job version, owner, or GPU version changed. Call `close()`
 when the owning runtime shuts down.
+
+## Modular diagnostics
+
+Candidate observability is injected through the `MotivationDiagnosticsSink`
+protocol and is independent of policy, CUDA, LiveKit, and model code. The
+provided `MotivationDiagnosticsCollector` keeps process-wide aggregate counts
+and optionally a bounded recent window:
+
+```python
+from telefuser.service.livekit import MotivationDiagnosticsCollector
+
+diagnostics = MotivationDiagnosticsCollector(
+    recent_search_limit=64,
+    recent_dispatch_limit=64,
+)
+controller = MotivationRuntimeController.from_offline_table(
+    profile_path, gpu_states=gpus, dispatch=execute_lease, diagnostics=diagnostics
+)
+```
+
+Each search records ready action/idle counts, candidate enumeration by
+`B=1..4`, compatibility/profile/memory/migration/fairness filtering, feasible
+candidates not selected by score, and the selected `(B,c,g)`. Each dispatch
+records whether the candidate was accepted, waited, rejected as stale, deferred
+for migration, or failed in the worker callback. The bounded snapshot is
+available from `MotivationRuntimeController.diagnostics_snapshot()` and is
+embedded under `MotivationExecutionBridge.snapshot()["diagnostics"]`. A custom
+sink can stream the same summaries to an experiment trace or replace the
+collector entirely for an ablation; the sink is best-effort and never changes
+policy availability.

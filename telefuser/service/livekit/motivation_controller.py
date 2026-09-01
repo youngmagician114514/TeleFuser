@@ -22,6 +22,7 @@ from .async_migration import (
     MigrationRecord,
     MigrationRequest,
 )
+from .motivation_diagnostics import MotivationDiagnosticsSink, MotivationDispatchSummary
 from .motivation_scheduler import (
     ActionJob,
     DispatchCandidate,
@@ -108,6 +109,7 @@ class MotivationRuntimeController:
         migration_manager: AsyncMigrationManager | None = None,
         migration_backend_factory: MigrationBackendFactory | None = None,
         search_executor: SearchExecutor | None = None,
+        diagnostics: MotivationDiagnosticsSink | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> "MotivationRuntimeController":
         """Build an opt-in controller from the measured offline profile CSV."""
@@ -119,6 +121,7 @@ class MotivationRuntimeController:
         scheduler = MotivationScheduler(
             profile_table,
             config=policy_config,
+            diagnostics=diagnostics,
             clock=clock,
         )
         registered = 0
@@ -338,23 +341,28 @@ class MotivationRuntimeController:
         observed_at = self._observed(now)
         with self._lock:
             if candidate.wait:
+                self._record_dispatch(candidate, observed_at, "wait", "wait_candidate")
                 return None
             # Validate before touching migration state. A remote candidate can
             # become stale while its asynchronous copy is running; committing
             # that stale ownership would race an in-flight action job.
             if not self.scheduler.validate(candidate, now=observed_at):
+                self._record_dispatch(candidate, observed_at, "rejected", "stale")
                 return None
             if candidate.migration_count:
                 if not self._prepare_migration(candidate, now=observed_at):
+                    self._record_dispatch(candidate, observed_at, "deferred", "migration_pending")
                     return None
                 # ``_prepare_migration`` commits at most one transfer. Search
                 # again after the ownership/version boundary.
+                self._record_dispatch(candidate, observed_at, "deferred", "migration_ready")
                 return None
             jobs = tuple(
                 self.scheduler.session(session_id).ready_job(include_idle=True)
                 for session_id in candidate.session_ids
             )
             if any(job is None for job in jobs):
+                self._record_dispatch(candidate, observed_at, "rejected", "job_missing")
                 return None
             lease = DispatchLease(
                 candidate=candidate,
@@ -362,8 +370,38 @@ class MotivationRuntimeController:
                 reserved_at=observed_at,
             )
             self.scheduler.reserve(candidate, now=observed_at)
-            self.dispatch(lease)
+            try:
+                self.dispatch(lease)
+            except Exception:
+                self._record_dispatch(candidate, observed_at, "error", "dispatch_exception")
+                raise
+            self._record_dispatch(candidate, observed_at, "dispatched", "accepted")
             return lease
+
+    def _record_dispatch(
+        self,
+        candidate: DispatchCandidate,
+        observed_at: float,
+        outcome: str,
+        reason: str,
+    ) -> None:
+        self.scheduler.record_dispatch_diagnostics(
+            MotivationDispatchSummary(
+                observed_at=observed_at,
+                outcome=outcome,
+                reason=reason,
+                batch_size=candidate.batch_size,
+                gpu_id=candidate.gpu_id,
+                fidelity=candidate.fidelity,
+                migration_count=candidate.migration_count,
+                session_ids=candidate.session_ids,
+                job_ids=candidate.job_ids,
+            )
+        )
+
+    def diagnostics_snapshot(self) -> dict[str, object]:
+        """Expose the injected, bounded diagnostics without owning its storage."""
+        return self.scheduler.diagnostics_snapshot()
 
     def close(self) -> None:
         """Release search resources and abort controller-owned migrations."""

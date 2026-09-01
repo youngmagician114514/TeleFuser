@@ -332,6 +332,7 @@ class MotivationExecutionBridge:
             "sessions": sessions,
             "controls": controls,
             "next_release_at": next_release_at,
+            "diagnostics": self.controller.diagnostics_snapshot(),
             "active_migrations": [
                 {
                     "session_id": record.request.session_id,
