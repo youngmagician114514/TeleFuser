@@ -265,6 +265,7 @@ def test_import_migration_nccl_restores_taew_state_without_cpu_copy() -> None:
     service._round_robin_order = deque()
     service._scheduler_condition = threading.Condition(threading.RLock())
     service.output_queue_size = 1
+    layer_readiness = object()
 
     session_id = service.import_migration_nccl(
         {
@@ -285,11 +286,16 @@ def test_import_migration_nccl_restores_taew_state_without_cpu_copy() -> None:
         target_leaves,
         owner_worker_id="gpu-1",
         ownership_epoch=3,
+        migration_layer_readiness=layer_readiness,
     )
 
     assert session_id == "migrating"
     snapshot = observed["snapshot"]
-    assert observed["kwargs"] == {"owner_worker_id": "gpu-1", "ownership_epoch": 3}
+    assert observed["kwargs"] == {
+        "owner_worker_id": "gpu-1",
+        "ownership_epoch": 3,
+        "migration_layer_readiness": layer_readiness,
+    }
     restored = source_stage.restore_decode_state(snapshot.taew_decode_state, direct_device_tensors=True)
     _assert_taew_state(restored)
     assert service._sessions[session_id].pipeline_session is restored_pipeline_session

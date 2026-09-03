@@ -52,11 +52,12 @@ class _MigratableService:
 class _Backend:
     stream_mode = STREAM_MODE_BIDIRECTIONAL
 
-    def __init__(self, *, fail_import: bool = False) -> None:
+    def __init__(self, *, fail_import: bool = False, metrics_id: str = "backend") -> None:
         self.service = _MigratableService(fail_import=fail_import)
         self.stream_service = SimpleNamespace(service=self.service)
         self.started: list[dict[str, object]] = []
         self.pushed: list[tuple[str, dict]] = []
+        self.metrics_id = metrics_id
 
     def start(self, pipeline_file: str, **kwargs: object) -> None:
         self.started.append({"pipeline_file": pipeline_file, **kwargs})
@@ -87,6 +88,9 @@ class _Backend:
 
     def close_session(self, session_id: str) -> None:
         self.service.close_session(session_id)
+
+    def runtime_metrics(self, session_id: str | None = None) -> dict[str, str]:
+        return {"backend": self.metrics_id, "session_id": session_id or "aggregate"}
 
 
 def test_router_switches_pull_and_push_without_recreating_transport() -> None:
@@ -134,3 +138,19 @@ def test_router_aborts_source_when_target_import_fails() -> None:
 
     assert router.snapshot()["routes"] == {session_id: "worker-0"}
     assert source.service.aborted == {session_id}
+
+
+def test_worker_view_session_metrics_follow_the_migrated_owner() -> None:
+    source = _Backend(metrics_id="source")
+    target = _Backend(metrics_id="target")
+    router = TurboServePipelineRouter({"worker-0": source, "worker-1": target})
+    view = router.worker_view("worker-0")
+    session_id = view.create_session({"session_id": "session-a"})
+
+    assert view.runtime_metrics() == {"backend": "source", "session_id": "aggregate"}
+    assert view.runtime_metrics(session_id) == {"backend": "source", "session_id": session_id}
+
+    router.migrate_session(session_id, "worker-1")
+
+    assert view.runtime_metrics(session_id) == {"backend": "target", "session_id": session_id}
+    assert router.runtime_metrics("missing-session") is None

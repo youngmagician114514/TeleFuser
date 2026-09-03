@@ -19,12 +19,21 @@ def _extract(metadata: dict[str, Any]) -> dict[str, Any]:
             "metadata does not contain motivation_scheduler.diagnostics; "
             "run the server with --motivation-profile on the diagnostics-enabled revision"
         )
-    return {
+    report = {
         "schema_version": "motivation_diagnostics_v1",
         "motivation_scheduler_epoch": scheduler.get("epoch"),
         "motivation_scheduler_time": scheduler.get("current_time"),
         "diagnostics": diagnostics,
     }
+    # Migration telemetry is exposed by the process-NCCL pool under the
+    # routing snapshot. Keep this field optional so reports generated from
+    # older servers (or CPU-only runs) remain valid and unchanged.
+    routing = metadata.get("turboserve_routing")
+    if isinstance(routing, dict):
+        migration_diagnostics = routing.get("migration_diagnostics")
+        if isinstance(migration_diagnostics, dict):
+            report["migration_diagnostics"] = migration_diagnostics
+    return report
 
 
 def _parse_args() -> argparse.Namespace:

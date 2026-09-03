@@ -125,6 +125,15 @@ def test_generate_next_blocks_surfaces_effective_taew_decode_metrics() -> None:
 
     first = make_session("first")
     second = make_session("second")
+    decoder_tail_waits: list[bool] = []
+    readiness = SimpleNamespace(complete=False)
+
+    def wait_complete() -> None:
+        decoder_tail_waits.append(True)
+        readiness.complete = True
+
+    readiness.wait_complete = wait_complete
+    first.migration_layer_readiness = readiness
     pipeline._interactive_sessions = {"first": first, "second": second}
 
     output = pipeline.generate_next_blocks([first, second], [{"W": True}, {"D": True}])
@@ -136,3 +145,4 @@ def test_generate_next_blocks_surfaces_effective_taew_decode_metrics() -> None:
     assert pipeline.last_stage_metrics()["taew_decode_batch_size"] == 1
     assert pipeline.last_stage_metrics()["taew_decode_invocations"] == 2
     assert pipeline.last_stage_metrics()["taew_decode_mode"] == 2
+    assert decoder_tail_waits == [True]

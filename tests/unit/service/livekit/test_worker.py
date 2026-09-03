@@ -34,6 +34,8 @@ class FakePipelineAdapter:
         self.publisher_tracking_enabled = False
         self.publisher_tracking_sessions: list[str] = []
         self.publisher_progress: list[dict[str, object]] = []
+        self.runtime_metrics_by_session: dict[str, dict[str, object]] = {}
+        self.runtime_metrics_calls: list[str | None] = []
 
     def start(self, pipeline_file: str, *, skip_validation: bool = False, gpu_num: int = 1) -> None:
         self.started.append({"pipeline_file": pipeline_file, "skip_validation": skip_validation, "gpu_num": gpu_num})
@@ -74,6 +76,12 @@ class FakePipelineAdapter:
     def report_publisher_frame_progress(self, session_id: str, **payload: object) -> bool:
         self.publisher_progress.append({"session_id": session_id, **payload})
         return self.publisher_tracking_enabled
+
+    def runtime_metrics(self, session_id: str | None = None) -> dict[str, object] | None:
+        self.runtime_metrics_calls.append(session_id)
+        if session_id is None:
+            return {"aggregate": 1}
+        return self.runtime_metrics_by_session.get(session_id)
 
 
 class FakeRoomClient:
@@ -135,6 +143,7 @@ class FakeSink:
         self.controls: list[tuple[str, str]] = []
         self.published: list[tuple[str, str, int, float | None]] = []
         self.model_outputs: list[tuple[str, str, dict]] = []
+        self.session_runtime_metrics: list[dict | None] = []
 
     def on_worker_status(self, worker_id: str, status: str) -> None:
         self.worker_statuses.append((worker_id, status))
@@ -164,7 +173,8 @@ class FakeSink:
         runtime_metrics: dict | None = None,
         session_runtime_metrics: dict | None = None,
     ) -> None:
-        del runtime_metrics, session_runtime_metrics
+        del runtime_metrics
+        self.session_runtime_metrics.append(session_runtime_metrics)
         self.model_outputs.append((worker_id, session_id, payload))
 
 
@@ -286,6 +296,69 @@ def test_livekit_worker_runs_pipeline_and_forwards_control() -> None:
         assert sink.finished == [("worker-0", "session-1", None)]
 
     asyncio.run(_run())
+
+
+def test_livekit_worker_forwards_session_runtime_metrics_to_output_sink(monkeypatch) -> None:
+    async def _run() -> None:
+        monkeypatch.setattr(worker_module, "_VIDEO_DRAIN_GRACE_SECONDS", 0)
+        adapter = FakePipelineAdapter()
+        adapter.runtime_metrics_by_session["pipeline-session-1"] = {
+            "batch_compatibility_key": "(shape,continuation)",
+        }
+        sink = FakeSink()
+        worker = LiveKitWorker(
+            worker_id="worker-0",
+            config=LiveKitServeConfig(
+                livekit_url="wss://livekit.example",
+                livekit_api_key="key",
+                livekit_api_secret="secret",
+            ),
+            pipeline_file="pipeline.py",
+            token_service=FakeTokenService(),
+            event_sink=sink,
+            pipeline_adapter=adapter,
+            room_client=FakeRoomClient(),
+        )
+        worker._pipeline_session_id = "pipeline-session-1"
+
+        async def chunks():
+            yield {"type": "chunk", "fps": 12, "frames": [Image.new("RGB", (8, 8))]}
+
+        await worker._publish_pipeline_chunks("public-session", chunks(), wait_for_delivery_ack=False)
+
+        assert adapter.runtime_metrics_calls == ["pipeline-session-1"]
+        assert sink.session_runtime_metrics == [{"batch_compatibility_key": "(shape,continuation)"}]
+
+    asyncio.run(_run())
+
+
+def test_livekit_worker_preserves_legacy_model_output_sink_signature() -> None:
+    class LegacySink:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, dict]] = []
+
+        def on_model_output(self, worker_id: str, session_id: str, payload: dict) -> None:
+            self.calls.append((worker_id, session_id, payload))
+
+    sink = LegacySink()
+    worker = LiveKitWorker(
+        worker_id="worker-0",
+        config=LiveKitServeConfig(
+            livekit_url="wss://livekit.example",
+            livekit_api_key="key",
+            livekit_api_secret="secret",
+        ),
+        pipeline_file="pipeline.py",
+        token_service=FakeTokenService(),
+        event_sink=sink,
+        pipeline_adapter=FakePipelineAdapter(),
+        room_client=FakeRoomClient(),
+    )
+    payload = {"type": "chunk"}
+
+    worker._notify_model_output(sink.on_model_output, "pipeline-session-1", payload, {"key": "value"})
+
+    assert sink.calls == [("worker-0", "pipeline-session-1", payload)]
 
 
 def test_livekit_worker_replays_latest_control_received_before_pipeline_creation() -> None:

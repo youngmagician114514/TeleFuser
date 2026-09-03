@@ -37,6 +37,11 @@ An action update with no release (for example, an intermediate state change in
 the one-second heartbeat window) changes the latest controls but creates no
 job.  Action jobs are considered before idle jobs globally.  An idle sentinel
 cannot be regenerated until its generated video has been consumed.
+Although a pending action is retained while that session has an in-flight invocation,
+`_ready_jobs()` excludes the session from candidate enumeration
+until completion frees the session slot.  The replacement is therefore not
+lost or dispatched concurrently; it becomes runnable on the next search after
+the in-flight output enters the output queue.
 
 A release that replaces an existing pending action only changes that session's
 job version; it does not invalidate an unrelated global search.  If there is no
@@ -76,9 +81,36 @@ quality.  The fairness check uses the predicted system mean quality and
 `fairness_delta`.
 
 The returned candidate captures the scheduler epoch, per-session state
-versions, and GPU version.  `reserve()` validates all of them, so a search run
-asynchronously while a GPU is computing cannot dispatch stale action state or
-ownership.
+versions, and GPU version.  Its `start_at` is a projected timeline used for
+scoring, not an enqueue permission: `MotivationRuntimeController` and
+`reserve()` re-check the live GPU `free_at` timestamp before handing a lease to
+a worker.  A candidate whose target GPU is still busy is deferred and, when
+possible, a fresh search is restricted to immediately free GPUs so unrelated
+sessions continue to make progress.  This keeps an asynchronous search run
+while a GPU is computing from dispatching stale state, ownership, or a future
+reservation.
+
+## Profile-family batch formation
+
+`MotivationBatchGate` exposes the measured aggregation geometry without owning
+a timer or queue.  For a common fidelity family with measured B1 and B2
+latencies, the throughput-neutral collection window is
+
+```text
+max(0, 2 * latency(B1) - latency(B2))
+```
+
+For example, if B1 takes 0.7 seconds and B2 takes 1.0 seconds, a caller may
+wait up to 0.4 seconds for a compatible second action while preserving the
+work budget of two serialized B1 invocations.  The gate pairs rows by fidelity
+(and therefore never mixes quality configurations), optionally applies a
+caller-supplied cap, and leaves deadline/slack checks plus timer ownership to
+the adapter.  A session still contributes at most one pending action job; the
+window only decides whether the adapter delays dispatch to form a larger batch.
+The adapter must re-check the ready-set version and compatibility key when the
+window expires. A replacement action can invalidate the original singleton
+while the timer is running, so the adapter should re-search rather than
+dispatching a stale batch.
 
 ## Asynchronous migration
 
@@ -107,6 +139,7 @@ The remaining transport work is backend-specific: a paged or layer-streaming
 implementation should feed its readiness estimate into `MigrationEstimator`,
 reserve target memory, pre-copy during the current batch, and call `commit()`
 only after the target reports `ready`.
+
 ## Runtime bridge
 
 `MotivationRuntimeController` is an opt-in bridge around the policy core. A
@@ -172,10 +205,23 @@ starts `LiveKitServeRuntime.migrate_session()` without blocking the serving
 loop; completion wakes the controller, which revalidates ownership and searches
 again before dispatch.
 
+The migration ETA is supplied through the `MigrationEstimator` interface.
+The standard local entrypoint uses
+`LocalMigrationEstimator(migration_cost_seconds=...)`, while a backend-specific
+estimator can return `MigrationEstimate` with `ready_at` and `cost_seconds`.
+The scheduler uses that readiness time in `start_at` and includes both the
+transfer count and predicted seconds in the migration penalty.
+
 For overlap with an active GPU invocation, call `search_async()` at the
 current completion boundary and later pass its result to
-`dispatch_candidate()`. The background task only computes a snapshot;
-reservation and dispatch remain synchronous and are rejected if the global
+`dispatch_candidate()`. The background task only computes a snapshot.
+Even a current candidate is not dispatched before its target GPU's live
+`free_at` time: it is deferred with a `gpu_busy` outcome, and an immediately
+free alternative is tried when available. Migration candidates are the
+exception; they may start asynchronous pre-copy, but dispatch still requires
+a fresh ownership and readiness validation after migration completes.
+
+Reservation and dispatch remain synchronous and are rejected if the global
 epoch, selected job version, owner, or GPU version changed. Call `close()`
 when the owning runtime shuts down.
 
@@ -202,9 +248,16 @@ Each search records ready action/idle counts, candidate enumeration by
 `B=1..4`, compatibility/profile/memory/migration/fairness filtering, feasible
 candidates not selected by score, and the selected `(B,c,g)`. Each dispatch
 records whether the candidate was accepted, waited, rejected as stale, deferred
-for migration, or failed in the worker callback. The bounded snapshot is
+for migration or `gpu_busy`, or failed in the worker callback. The bounded snapshot is
 available from `MotivationRuntimeController.diagnostics_snapshot()` and is
 embedded under `MotivationExecutionBridge.snapshot()["diagnostics"]`. A custom
 sink can stream the same summaries to an experiment trace or replace the
 collector entirely for an ablation; the sink is best-effort and never changes
 policy availability.
+
+Transport-level migration phases are collected independently by
+`MigrationDiagnostics` (export, transfer, route commit, worker exits, and
+bounded error classes). It has no NCCL dependency; the process-NCCL pool owns
+an instance internally, and another state-transfer backend can create one as
+needed. Migration observability can therefore be enabled or removed without
+changing the Motivation policy.

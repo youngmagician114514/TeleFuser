@@ -335,6 +335,24 @@ class SessionSchedulingState:
             self.pending_idle = None
         self.in_flight = job
 
+    def rollback_dispatched(self, job: ActionJob) -> None:
+        """Return a synchronously rejected dispatch to the ready queue.
+
+        Dispatch rollback is deliberately narrower than completion: it does
+        not advance slack, quality, or cache ownership.  A newer action may
+        already occupy ``pending_action`` in an unusual reentrant adapter; in
+        that case the latest action wins and the rejected older job is simply
+        cleared from the in-flight slot.
+        """
+        if self.in_flight is None or self.in_flight.job_id != job.job_id:
+            raise RuntimeError(f"job {job.job_id} is not in flight for session {self.session_id}")
+        self.in_flight = None
+        if job.kind == "action":
+            if self.pending_action is None:
+                self.pending_action = job
+        elif self.pending_action is None and self.pending_idle is None and not self.departed:
+            self.pending_idle = job
+
     def complete_job(self, *, completed_at: float, output_seconds: float, quality: float) -> ActionJob:
         """Complete the current job and update quality/idle consumption state."""
         self.advance_to(completed_at)
@@ -801,8 +819,15 @@ class MotivationScheduler:
         action_ready = [
             (state, state.pending_action)
             for state in self._sessions.values()
-            if not state.departed and state.pending_action is not None
+            if (
+                not state.departed
+                and state.in_flight is None
+                and state.pending_action is not None
+            )
         ]
+        # A session with an in-flight invocation is intentionally absent from
+        # both ready lists. Its pending action remains stored on the session and
+        # becomes runnable after completion releases the in-flight slot.
         # Action jobs have priority over idle sentinels globally.  This also
         # prevents an idle job from occupying a batch slot while action work is
         # waiting on another session.
@@ -813,7 +838,11 @@ class MotivationScheduler:
         idle_ready = [
             (state, state.pending_idle)
             for state in self._sessions.values()
-            if not state.departed and state.pending_idle is not None
+            if (
+                not state.departed
+                and state.in_flight is None
+                and state.pending_idle is not None
+            )
         ]
         return tuple((state, job) for state, job in idle_ready if job is not None)
 
@@ -869,15 +898,19 @@ class MotivationScheduler:
         include_wait: bool = True,
         allow_migrations: bool = True,
         exclude_session_ids: Iterable[str] = (),
+        blocked_migration_session_ids: Iterable[str] = (),
     ) -> DispatchCandidate | None:
         """Enumerate and score all feasible candidates in a global snapshot.
 
         Only one job is selected from each session.  All members of a batch
         share one fidelity and one target GPU.  A candidate includes all
         non-departed sessions in its slack utility, not just selected members.
+        blocked_migration_session_ids excludes candidates that would move one
+        of those sessions; work on its current owner remains eligible.
         """
         observed_at = self._clock() if now is None else now
         excluded = set(exclude_session_ids)
+        blocked_migrations = set(blocked_migration_session_ids)
         with self._lock:
             self._advance_to(observed_at)
             all_ready = self._ready_jobs()
@@ -938,6 +971,12 @@ class MotivationScheduler:
                                 ):
                                     reject("migration_disabled")
                                     continue
+                                if any(
+                                    estimate.required and state.session_id in blocked_migrations
+                                    for state, estimate in zip(states, estimates)
+                                ):
+                                    reject("migration_policy")
+                                    continue
                                 migration_count = sum(estimate.required for estimate in estimates)
                                 migration_seconds = sum(
                                     estimate.cost_seconds for estimate in estimates if estimate.required
@@ -984,7 +1023,8 @@ class MotivationScheduler:
                                     for value in projected_slack.values()
                                 )
                                 score += self.config.lambda_quality * sum(selected_quality)
-                                score -= self.config.lambda_migration * migration_count
+                                # Penalize both transfer count and predicted transfer time.
+                                score -= self.config.lambda_migration * (migration_count + migration_seconds)
                                 candidates.append(
                                     DispatchCandidate(
                                         session_ids=tuple(state.session_id for state in states),
@@ -1105,6 +1145,27 @@ class MotivationScheduler:
                     return False
             return True
 
+    def candidate_ready_now(self, candidate: DispatchCandidate, *, now: float | None = None) -> bool:
+        """Return whether a current candidate can start on its GPU immediately.
+
+        ``validate`` deliberately checks only snapshot freshness, because a
+        future candidate can still be useful for planning or asynchronous
+        migration.  This helper adds the live GPU timeline check needed by a
+        model dispatch path; callers should validate the candidate separately.
+        """
+        observed_at = self._clock() if now is None else now
+        with self._lock:
+            self._advance_to(observed_at)
+            if (
+                candidate.wait
+                or candidate.gpu_id is None
+                or not math.isfinite(candidate.start_at)
+                or candidate.start_at > observed_at + EPSILON
+            ):
+                return False
+            gpu = self._gpus.get(candidate.gpu_id)
+            return gpu is not None and gpu.available and gpu.free_at <= observed_at + EPSILON
+
     def reserve(self, candidate: DispatchCandidate, *, now: float | None = None) -> DispatchCandidate:
         """Atomically reserve a candidate and move its jobs in-flight."""
         observed_at = self._clock() if now is None else now
@@ -1114,6 +1175,15 @@ class MotivationScheduler:
                 return candidate
             if not self.validate(candidate, now=observed_at):
                 raise RuntimeError("stale motivation scheduling candidate")
+            # ``find_best`` includes the predicted GPU timeline in
+            # ``candidate.start_at`` so the policy can compare a future slot
+            # against an immediately executable one.  That prediction is not
+            # a reservation, however: only a worker-side completion event can
+            # make a busy GPU available.  Keep this final guard in the
+            # scheduler as a defence for callers that bypass the runtime
+            # controller (and for races between search and dispatch).
+            if not self.candidate_ready_now(candidate, now=observed_at):
+                raise RuntimeError("motivation scheduling candidate is not ready")
             assert candidate.gpu_id is not None
             for session_id, job_id in zip(candidate.session_ids, candidate.job_ids):
                 state = self._sessions[session_id]
@@ -1132,6 +1202,38 @@ class MotivationScheduler:
             )
             self._epoch += 1
             return candidate
+
+    def rollback_reservation(
+        self,
+        candidate: DispatchCandidate,
+        *,
+        now: float | None = None,
+    ) -> tuple[ActionJob, ...]:
+        """Release a reservation whose physical dispatch failed synchronously."""
+        if candidate.wait or candidate.profile is None or candidate.gpu_id is None:
+            return ()
+        observed_at = self._clock() if now is None else now
+        with self._lock:
+            self._advance_to(observed_at)
+            jobs: list[ActionJob] = []
+            for session_id, job_id in zip(candidate.session_ids, candidate.job_ids, strict=True):
+                state = self._sessions[session_id]
+                job = state.in_flight
+                if job is None or job.job_id != job_id:
+                    raise RuntimeError(f"motivation reservation for {job_id} is no longer active")
+                state.rollback_dispatched(job)
+                state.migration_target_gpu = None
+                jobs.append(job)
+            gpu = self._gpus[candidate.gpu_id]
+            self._gpus[candidate.gpu_id] = GpuSchedulingState(
+                gpu_id=gpu.gpu_id,
+                free_at=observed_at,
+                memory_free_gb=gpu.memory_free_gb + candidate.profile.memory_gb,
+                available=gpu.available,
+                version=gpu.version + 1,
+            )
+            self._epoch += 1
+            return tuple(jobs)
 
     def complete(
         self,
@@ -1184,4 +1286,3 @@ class MotivationScheduler:
         """Return the latest GPU snapshot."""
         with self._lock:
             return tuple(self._gpus.values())
-

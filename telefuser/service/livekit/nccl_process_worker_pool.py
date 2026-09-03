@@ -10,11 +10,13 @@ import asyncio
 import contextlib
 import json
 import socket
+import threading
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import torch
 import torch.distributed as dist
@@ -23,7 +25,14 @@ from telefuser.service.core.stream_pipeline_service import STREAM_MODE_BIDIRECTI
 from telefuser.service.security.security_validator import SecurityLevel
 from telefuser.utils.logging import logger
 
-from .nccl_transfer import allocate_tensor_tree_leaves, transfer_tensor_leaves_nccl
+from .migration_diagnostics import MigrationDiagnostics, classify_migration_error
+from .nccl_transfer import (
+    LayerTransferProgress,
+    TensorTransferGroup,
+    allocate_tensor_tree_leaves,
+    build_layer_transfer_groups,
+    transfer_tensor_leaves_nccl_streamed,
+)
 from .pipeline_adapter import LiveKitPipelineAdapter
 from .process_worker_pool import (
     ProcessLiveKitWorkerPool,
@@ -51,6 +60,9 @@ _TERMINAL_OUTPUT_TYPES = frozenset({"error", "done"})
 # child can return a useful failure instead of being torn down mid-initialization.
 _NCCL_INIT_GROUP_TIMEOUT_SECONDS = 180.0
 _NCCL_INIT_PARENT_TIMEOUT_SECONDS = 210.0
+_MIGRATION_COMMAND_TIMEOUT_SECONDS = 300.0
+
+_MigrationResult = TypeVar("_MigrationResult")
 
 
 @dataclass(frozen=True)
@@ -283,6 +295,8 @@ class _ParentTransportSink:
 class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
     """TurboServe-compatible parent transport / GPU model-process pool."""
 
+    progressive_migration_supported = True
+
     def __init__(self, specs: list[ProcessWorkerSpec], **kwargs: Any) -> None:
         super().__init__(specs, **kwargs)
         self._worker_target = _nccl_model_worker_main
@@ -297,17 +311,36 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         self._transport_workers: dict[str, LiveKitWorker] = {}
         self._transport_tasks: dict[str, asyncio.Task[None]] = {}
         self._migrating_controls: dict[str, list[dict]] = {}
+        self._provisional_migration_controls: dict[str, list[dict]] = {}
+        self._provisional_model_events: dict[str, list[dict[str, Any]]] = {}
+        self._migration_ready_waiters: dict[str, asyncio.Future[None]] = {}
         # Worker snapshots include scalar timings/counters plus the bounded
         # scheduler mode string (``batched`` or ``round_robin``).
         self._worker_runtime_metrics: dict[str, dict[str, float | int | str]] = {}
         self._session_runtime_metrics: dict[str, dict[str, float | int | str]] = {}
         self._migration_total_ms: list[float] = []
+        self._migration_cleanup_failures = 0
+        self._migration_diagnostics = MigrationDiagnostics()
         self._nccl_ranks: dict[str, int] = {}
+        self._nccl_warmup_ms = 0.0
         self._migration_lock = asyncio.Lock()
         self._initializing_workers = False
         # ``ProcessLiveKitWorkerPool`` owns the parent JSONL writer for both
         # isolated-worker modes. Recreating it here would reject the path it
         # has just created, preventing a traced process-NCCL run from starting.
+
+    def _handle_unexpected_exit(self, worker_id: str, exitcode: int | None) -> None:
+        """Attach migration context before the base pool tears down a dead worker."""
+
+        diagnostics = getattr(self, "_migration_diagnostics", None)
+        if isinstance(diagnostics, MigrationDiagnostics):
+            diagnostics.record_worker_exit(worker_id, exitcode)
+        logger.error(
+            f"NCCL worker exited unexpectedly: worker={worker_id} exit_code={exitcode} "
+            "active_migrations="
+            f"{diagnostics.snapshot().get('active', 0) if isinstance(diagnostics, MigrationDiagnostics) else 0}"
+        )
+        super()._handle_unexpected_exit(worker_id, exitcode)
 
     async def start(self, *, skip_validation: bool = False) -> None:
         # ``ProcessLiveKitWorkerPool.start`` calls this class's ``scale_to``
@@ -359,7 +392,7 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
 
     def dispatch_batch(self, lease: Any, payloads: list[tuple[str, dict]]) -> None:
         """Send a policy-selected batch through the parent transport routes."""
-        del lease
+        expected_worker_id = getattr(getattr(lease, "candidate", None), "gpu_id", None)
         grouped: dict[str, list[tuple[str, dict]]] = {}
         for session_id, chunk in payloads:
             runner = self._transport_workers.get(session_id)
@@ -368,9 +401,21 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
             worker_id = self._pipeline_routes.get(runner.pipeline_session_id)
             if worker_id is None:
                 raise RuntimeError(f"Session {session_id!r} has no model route")
+            if expected_worker_id is not None and worker_id != expected_worker_id:
+                raise RuntimeError(
+                    f"Motivation owner mismatch for {session_id!r}: "
+                    f"candidate={expected_worker_id!r} actual={worker_id!r}"
+                )
             grouped.setdefault(worker_id, []).append((runner.pipeline_session_id, dict(chunk)))
         for worker_id, items in grouped.items():
             self._send(worker_id, {"type": "model_push_batch", "items": items})
+
+    def dispatch_owner(self, session_id: str) -> str | None:
+        """Resolve a LiveKit transport session to its physical model route."""
+        runner = self._transport_workers.get(session_id)
+        if runner is None or runner.pipeline_session_id is None:
+            return None
+        return self._pipeline_routes.get(runner.pipeline_session_id)
 
     async def stop_session(self, session_id: str) -> None:
         runner = self._transport_workers.get(session_id)
@@ -404,6 +449,15 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         )
 
     def push_model_chunk(self, session_id: str, chunk: dict) -> None:
+        if session_id in self._provisional_migration_controls:
+            self._provisional_migration_controls[session_id].append(dict(chunk))
+            worker_id = self._pipeline_routes.get(session_id)
+            if worker_id is not None:
+                self._send(
+                    worker_id,
+                    {"type": "model_push", "session_id": session_id, "chunk": dict(chunk)},
+                )
+            return
         if session_id in self._migrating_controls:
             self._migrating_controls[session_id].append(dict(chunk))
             return
@@ -423,6 +477,12 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         """Forward a batch to one child command so its service sees one update turn."""
         grouped: dict[str, list[tuple[str, dict]]] = {}
         for session_id, chunk in items:
+            if session_id in self._provisional_migration_controls:
+                self._provisional_migration_controls[session_id].append(dict(chunk))
+                worker_id = self._pipeline_routes.get(session_id)
+                if worker_id is not None:
+                    grouped.setdefault(worker_id, []).append((session_id, dict(chunk)))
+                continue
             if session_id in self._migrating_controls:
                 self._migrating_controls[session_id].append(dict(chunk))
                 continue
@@ -490,6 +550,8 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         self._session_workers.pop(session_id, None)
         self._ownership.release(session_id)
         self._migrating_controls.pop(session_id, None)
+        self._provisional_migration_controls.pop(session_id, None)
+        self._provisional_model_events.pop(session_id, None)
         self._session_runtime_metrics.pop(session_id, None)
         self._publisher_progress_sequences.pop(session_id, None)
         self._publisher_frame_tracking.pop(session_id, None)
@@ -691,97 +753,97 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                 return
             await asyncio.sleep(0.001)
 
-    async def migrate_session(self, pipeline_session_id: str, target_worker_id: str) -> TurboServeOwnership:
+    async def _run_migration_phase(
+        self,
+        transfer_id: str,
+        phase: str,
+        operation: Callable[[], Awaitable[_MigrationResult]],
+    ) -> _MigrationResult:
+        """Run one migration phase while retaining bounded timing telemetry."""
+
+        diagnostics = getattr(self, "_migration_diagnostics", None)
+        started = time.monotonic()
+        if isinstance(diagnostics, MigrationDiagnostics):
+            diagnostics.phase_started(transfer_id, phase)
+        try:
+            value = await operation()
+        except BaseException as exc:
+            if isinstance(diagnostics, MigrationDiagnostics):
+                diagnostics.phase_finished(
+                    transfer_id,
+                    phase,
+                    success=False,
+                    duration_seconds=time.monotonic() - started,
+                    error=exc,
+                )
+            raise
+        else:
+            if isinstance(diagnostics, MigrationDiagnostics):
+                diagnostics.phase_finished(
+                    transfer_id,
+                    phase,
+                    success=True,
+                    duration_seconds=time.monotonic() - started,
+                )
+            return value
+
+    async def migrate_session(
+        self,
+        pipeline_session_id: str,
+        target_worker_id: str,
+        *,
+        on_compute_ready: Callable[[], None] | None = None,
+    ) -> TurboServeOwnership:
         async with self._migration_lock:
             source_worker_id = self._pipeline_routes[pipeline_session_id]
             if source_worker_id == target_worker_id:
                 return self._ownership.owner(pipeline_session_id)
+            diagnostics = getattr(self, "_migration_diagnostics", None)
             if source_worker_id not in self._nccl_ranks or target_worker_id not in self._nccl_ranks:
-                raise RuntimeError("NCCL migration requires initialized source and target workers")
-            token = self._ownership.prepare_migration(pipeline_session_id, source_worker_id, target_worker_id)
+                error = RuntimeError("NCCL migration requires initialized source and target workers")
+                if isinstance(diagnostics, MigrationDiagnostics):
+                    diagnostics.reject(
+                        source_worker_id=source_worker_id,
+                        target_worker_id=target_worker_id,
+                        reason=error,
+                    )
+                raise error
+            try:
+                token = self._ownership.prepare_migration(pipeline_session_id, source_worker_id, target_worker_id)
+            except Exception as exc:
+                if isinstance(diagnostics, MigrationDiagnostics):
+                    diagnostics.reject(
+                        source_worker_id=source_worker_id,
+                        target_worker_id=target_worker_id,
+                        reason=exc,
+                    )
+                raise
+            if isinstance(diagnostics, MigrationDiagnostics):
+                diagnostics.begin(
+                    token.token_id,
+                    source_worker_id=source_worker_id,
+                    target_worker_id=target_worker_id,
+                )
+            logger.info(
+                f"NCCL migration started: transfer={token.token_id} "
+                f"source={source_worker_id} target={target_worker_id}"
+            )
             self._migrating_controls[pipeline_session_id] = []
             started = time.monotonic()
             source_output_paused = False
-            try:
-                # ABot marks only this session as migrating and waits for its
-                # own boundary. Other sessions on both workers keep running
-                # while the state transfer is prepared.
-                await self._drain_model_outputs_for_migration(
-                    pipeline_session_id,
-                    source_worker_id=source_worker_id,
-                    timeout=300.0,
-                )
-                await self._request(
-                    source_worker_id,
-                    "model_output_pause",
-                    session_id=pipeline_session_id,
-                    timeout=300.0,
-                )
-                source_output_paused = True
-                paused_status_event = await self._request(
-                    source_worker_id,
-                    "model_output_drain_status",
-                    session_id=pipeline_session_id,
-                    timeout=300.0,
-                )
-                if not self._source_model_output_drain_complete(paused_status_event.get("result")):
-                    raise RuntimeError("Source output changed while preparing NCCL migration")
-                exported = await self._request(
-                    source_worker_id,
-                    "nccl_export",
-                    session_id=pipeline_session_id,
-                    transfer_id=token.token_id,
-                    timeout=300.0,
-                )
-                metadata = dict(exported["result"])
-                await self._request(
-                    target_worker_id,
-                    "nccl_prepare_recv",
-                    transfer_id=token.token_id,
-                    metadata=metadata,
-                    source_rank=self._nccl_ranks[source_worker_id],
-                    owner_worker_id=target_worker_id,
-                    ownership_epoch=token.source_epoch + 1,
-                    model_output_credit_window=_MODEL_OUTPUT_PARENT_QUEUE_SIZE,
-                    timeout=300.0,
-                )
-                await asyncio.gather(
-                    self._request(
-                        source_worker_id,
-                        "nccl_send",
-                        transfer_id=token.token_id,
-                        target_rank=self._nccl_ranks[target_worker_id],
-                        timeout=300.0,
-                    ),
-                    self._request(
-                        target_worker_id,
-                        "nccl_recv",
-                        transfer_id=token.token_id,
-                        source_rank=self._nccl_ranks[source_worker_id],
-                        timeout=300.0,
-                    ),
-                )
-                await self._request(
-                    source_worker_id, "nccl_commit_source", session_id=pipeline_session_id, timeout=300.0
-                )
-                ownership = self._ownership.commit_migration(token)
-                self._pipeline_routes[pipeline_session_id] = target_worker_id
-                self._session_workers[pipeline_session_id] = target_worker_id
-                for chunk in self._migrating_controls.pop(pipeline_session_id, []):
-                    self._send(
-                        target_worker_id, {"type": "model_push", "session_id": pipeline_session_id, "chunk": chunk}
-                    )
-                self._migration_total_ms.append((time.monotonic() - started) * 1000.0)
-                return ownership
-            except Exception:
-                with contextlib.suppress(Exception):
+            completed = False
+
+            async def rollback_migration() -> None:
+                """Best-effort cleanup for cancellation or transport failure."""
+
+                with contextlib.suppress(BaseException):
                     await self._request(
                         target_worker_id,
                         "nccl_discard",
                         transfer_id=token.token_id,
                         session_id=pipeline_session_id,
                     )
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(BaseException):
                     await self._request(
                         source_worker_id,
                         "nccl_abort_source",
@@ -789,18 +851,235 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                         transfer_id=token.token_id,
                     )
                 if source_output_paused:
-                    with contextlib.suppress(Exception):
+                    with contextlib.suppress(BaseException):
                         await self._request(
                             source_worker_id,
                             "model_output_resume",
                             session_id=pipeline_session_id,
                         )
-                self._ownership.abort_migration(token)
-                for chunk in self._migrating_controls.pop(pipeline_session_id, []):
-                    self._send(
-                        source_worker_id, {"type": "model_push", "session_id": pipeline_session_id, "chunk": chunk}
+                with contextlib.suppress(BaseException):
+                    self._ownership.abort_migration(token)
+                self._pipeline_routes[pipeline_session_id] = source_worker_id
+                self._session_workers[pipeline_session_id] = source_worker_id
+                pending_controls = self._migrating_controls.pop(pipeline_session_id, [])
+                pending_controls.extend(
+                    self._provisional_migration_controls.pop(pipeline_session_id, [])
+                )
+                staged_events = self._provisional_model_events.pop(pipeline_session_id, [])
+                for event in staged_events:
+                    if event.get("type") == "model_output":
+                        self._record_dropped_model_output(
+                            pipeline_session_id,
+                            _ModelOutput(
+                                worker_id=str(event.get("worker_id", target_worker_id)),
+                                payload=dict(event.get("payload", {})),
+                            ),
+                            acknowledge=False,
+                        )
+                for chunk in pending_controls:
+                    with contextlib.suppress(BaseException):
+                        self._send(
+                            source_worker_id,
+                            {"type": "model_push", "session_id": pipeline_session_id, "chunk": chunk},
+                        )
+
+            try:
+                # ABot marks only this session as migrating and waits for its
+                # own boundary. Other sessions on both workers keep running
+                # while the state transfer is prepared.
+                await self._run_migration_phase(
+                    token.token_id,
+                    "drain",
+                    lambda: self._drain_model_outputs_for_migration(
+                        pipeline_session_id,
+                        source_worker_id=source_worker_id,
+                        timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
+                    ),
+                )
+
+                async def pause_and_verify() -> None:
+                    nonlocal source_output_paused
+                    await self._request(
+                        source_worker_id,
+                        "model_output_pause",
+                        session_id=pipeline_session_id,
+                        timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
                     )
+                    # The pause command may have taken effect even when the
+                    # following status barrier fails. Mark it immediately so
+                    # the failure path always attempts to resume the source.
+                    source_output_paused = True
+                    paused_status_event = await self._request(
+                        source_worker_id,
+                        "model_output_drain_status",
+                        session_id=pipeline_session_id,
+                        timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
+                    )
+                    if not self._source_model_output_drain_complete(paused_status_event.get("result")):
+                        raise RuntimeError("Source output changed while preparing NCCL migration")
+
+                await self._run_migration_phase(token.token_id, "pause", pause_and_verify)
+
+                exported = await self._run_migration_phase(
+                    token.token_id,
+                    "export",
+                    lambda: self._request(
+                        source_worker_id,
+                        "nccl_export",
+                        session_id=pipeline_session_id,
+                        transfer_id=token.token_id,
+                        timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
+                    ),
+                )
+                metadata = dict(exported["result"])
+                state_bytes = metadata.get("state_bytes", 0)
+                if isinstance(diagnostics, MigrationDiagnostics):
+                    diagnostics.set_state_bytes(token.token_id, state_bytes)
+
+                await self._run_migration_phase(
+                    token.token_id,
+                    "prepare_recv",
+                    lambda: self._request(
+                        target_worker_id,
+                        "nccl_prepare_recv",
+                        transfer_id=token.token_id,
+                        metadata=metadata,
+                        source_rank=self._nccl_ranks[source_worker_id],
+                        owner_worker_id=target_worker_id,
+                        ownership_epoch=token.source_epoch + 1,
+                        model_output_credit_window=_MODEL_OUTPUT_PARENT_QUEUE_SIZE,
+                        timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
+                    ),
+                )
+                ready_waiter = asyncio.get_running_loop().create_future()
+                self._migration_ready_waiters[token.token_id] = ready_waiter
+
+                async def transfer_both() -> list[dict[str, Any]]:
+                    return await asyncio.gather(
+                        self._request(
+                            source_worker_id,
+                            "nccl_send",
+                            transfer_id=token.token_id,
+                            target_rank=self._nccl_ranks[target_worker_id],
+                            timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
+                        ),
+                        self._request(
+                            target_worker_id,
+                            "nccl_recv",
+                            transfer_id=token.token_id,
+                            source_rank=self._nccl_ranks[source_worker_id],
+                            timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
+                        ),
+                    )
+
+                transfer_task = asyncio.create_task(
+                    self._run_migration_phase(token.token_id, "transfer", transfer_both),
+                    name=f"sst-transfer-{token.token_id}",
+                )
+                first_done, _ = await asyncio.wait(
+                    (ready_waiter, transfer_task),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if transfer_task in first_done and not ready_waiter.done():
+                    # Compatibility path for a transport that only reports its
+                    # final result. A real process-NCCL child emits the early
+                    # readiness event immediately after target import.
+                    await transfer_task
+                    ready_waiter.set_result(None)
+                await ready_waiter
+
+                async def publish_compute_route() -> None:
+                    self._pipeline_routes[pipeline_session_id] = target_worker_id
+                    self._session_workers[pipeline_session_id] = target_worker_id
+                    pending_controls = self._migrating_controls.pop(pipeline_session_id, [])
+                    self._provisional_migration_controls[pipeline_session_id] = list(pending_controls)
+                    self._provisional_model_events[pipeline_session_id] = []
+                    for chunk in pending_controls:
+                        self._send(
+                            target_worker_id,
+                            {"type": "model_push", "session_id": pipeline_session_id, "chunk": chunk},
+                        )
+                    if on_compute_ready is not None:
+                        on_compute_ready()
+
+                await self._run_migration_phase(
+                    token.token_id,
+                    "compute_ready",
+                    publish_compute_route,
+                )
+                transfer_events = await transfer_task
+                if isinstance(diagnostics, MigrationDiagnostics) and isinstance(transfer_events, list):
+                    for event in reversed(transfer_events):
+                        report = event.get("result") if isinstance(event, dict) else None
+                        if isinstance(report, dict) and isinstance(report.get("groups"), list):
+                            diagnostics.set_transport_report(token.token_id, report)
+                            break
+                async def commit_route() -> TurboServeOwnership:
+                    ownership = self._ownership.commit_migration(token)
+                    self._pipeline_routes[pipeline_session_id] = target_worker_id
+                    self._session_workers[pipeline_session_id] = target_worker_id
+                    return ownership
+
+                ownership = await self._run_migration_phase(token.token_id, "route_commit", commit_route)
+                # Ownership is the transaction commit point. Source cleanup is
+                # deliberately ordered afterwards: if that worker disappears,
+                # the imported target remains authoritative instead of trying
+                # to roll back to state that may already have been deleted.
+                completed = True
+                self._provisional_migration_controls.pop(pipeline_session_id, None)
+                try:
+                    await self._run_migration_phase(
+                        token.token_id,
+                        "commit_source",
+                        lambda: self._request(
+                            source_worker_id,
+                            "nccl_commit_source",
+                            session_id=pipeline_session_id,
+                            timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
+                        ),
+                    )
+                except Exception as exc:
+                    self._migration_cleanup_failures += 1
+                    logger.warning(
+                        f"NCCL source cleanup failed after committed migration: "
+                        f"session={pipeline_session_id} source={source_worker_id} error={exc}"
+                    )
+                staged_events = self._provisional_model_events.pop(pipeline_session_id, [])
+                for event in staged_events:
+                    self._dispatch_event(event)
+                total_ms = (time.monotonic() - started) * 1000.0
+                self._migration_total_ms.append(total_ms)
+                if isinstance(diagnostics, MigrationDiagnostics):
+                    diagnostics.finish(token.token_id, outcome="success")
+                logger.info(
+                    f"NCCL migration completed: transfer={token.token_id} "
+                    f"source={source_worker_id} target={target_worker_id} duration_ms={total_ms:.3f}"
+                )
+                return ownership
+            except asyncio.CancelledError:
+                if not completed:
+                    await rollback_migration()
+                if isinstance(diagnostics, MigrationDiagnostics):
+                    diagnostics.finish(token.token_id, outcome="aborted", error="migration cancelled")
                 raise
+            except Exception as exc:
+                if not completed:
+                    await rollback_migration()
+                if isinstance(diagnostics, MigrationDiagnostics):
+                    diagnostics.finish(token.token_id, outcome="failure", error=exc)
+                logger.warning(
+                    f"NCCL migration failed: transfer={token.token_id} "
+                    f"source={source_worker_id} target={target_worker_id} "
+                    f"error_kind={classify_migration_error(exc)} error={exc}"
+                )
+                raise
+            finally:
+                self._migration_ready_waiters.pop(token.token_id, None)
+                # A normal success path has already finished telemetry.  This
+                # guard covers an unexpected cancellation/error during cleanup
+                # without allowing a stale active transfer in the snapshot.
+                if not completed and isinstance(diagnostics, MigrationDiagnostics):
+                    diagnostics.finish(token.token_id, outcome="aborted", error="migration interrupted")
 
     def turboserve_snapshot(self) -> dict[str, object]:
         snapshot = super().turboserve_snapshot()
@@ -809,6 +1088,8 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                 "migration_supported": bool(self._nccl_ranks),
                 "migration_backend": "process_nccl" if self._nccl_ranks else None,
                 "nccl_ranks": dict(self._nccl_ranks),
+                "nccl_pair_warmup_ms": getattr(self, "_nccl_warmup_ms", 0.0),
+                "migration_cleanup_failures": getattr(self, "_migration_cleanup_failures", 0),
                 "worker_runtime_metrics": {
                     worker_id: dict(self._worker_runtime_metrics.get(worker_id, {})) for worker_id in self._specs
                 },
@@ -818,6 +1099,11 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                     if self._migration_total_ms
                     else 0.0
                 },
+                "migration_diagnostics": (
+                    self._migration_diagnostics.snapshot()
+                    if isinstance(getattr(self, "_migration_diagnostics", None), MigrationDiagnostics)
+                    else {}
+                ),
                 "model_output_flow_control": self._model_output_flow_snapshot(),
                 "dispatch_trace": (
                     self._dispatch_trace.snapshot()
@@ -891,7 +1177,53 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         ]
         if failures:
             raise RuntimeError(f"NCCL process-group initialization failed: {'; '.join(failures)}")
-        self._nccl_ranks = {worker_id: rank for rank, worker_id in enumerate(workers)}
+        ranks = {worker_id: rank for rank, worker_id in enumerate(workers)}
+        warmup_started = time.monotonic()
+        collective_results = await asyncio.gather(
+            *(
+                self._request(
+                    worker_id,
+                    "nccl_warmup_collective",
+                    timeout=_NCCL_INIT_PARENT_TIMEOUT_SECONDS,
+                )
+                for worker_id in workers
+            ),
+            return_exceptions=True,
+        )
+        collective_failures = [
+            f"{worker_id}: {result}"
+            for worker_id, result in zip(workers, collective_results, strict=True)
+            if isinstance(result, BaseException)
+        ]
+        if collective_failures:
+            raise RuntimeError(f"NCCL collective warmup failed: {'; '.join(collective_failures)}")
+        for source_index, source_worker_id in enumerate(workers):
+            for target_worker_id in workers[source_index + 1 :]:
+                pair_results = await asyncio.gather(
+                    self._request(
+                        source_worker_id,
+                        "nccl_warmup_peer",
+                        peer_rank=ranks[target_worker_id],
+                        send_first=True,
+                        timeout=_NCCL_INIT_PARENT_TIMEOUT_SECONDS,
+                    ),
+                    self._request(
+                        target_worker_id,
+                        "nccl_warmup_peer",
+                        peer_rank=ranks[source_worker_id],
+                        send_first=False,
+                        timeout=_NCCL_INIT_PARENT_TIMEOUT_SECONDS,
+                    ),
+                    return_exceptions=True,
+                )
+                pair_failures = [str(result) for result in pair_results if isinstance(result, BaseException)]
+                if pair_failures:
+                    raise RuntimeError(
+                        f"NCCL peer warmup failed for {source_worker_id}/{target_worker_id}: "
+                        f"{'; '.join(pair_failures)}"
+                    )
+        self._nccl_warmup_ms = (time.monotonic() - warmup_started) * 1000.0
+        self._nccl_ranks = ranks
 
     def _transport_finished(self, session_id: str) -> None:
         self.close_model_session(session_id)
@@ -915,6 +1247,44 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         trace.append(record)
 
     def _dispatch_event(self, event: dict[str, Any]) -> None:
+        if event.get("type") == "nccl_first_layer_ready":
+            waiter = self._migration_ready_waiters.get(str(event.get("transfer_id", "")))
+            if waiter is not None and not waiter.done():
+                waiter.set_result(None)
+            return
+        if event.get("type") in {"model_output", "model_output_eos"}:
+            session_id = str(event.get("session_id", ""))
+            provisional_events = getattr(self, "_provisional_model_events", None)
+            staged = provisional_events.get(session_id) if isinstance(provisional_events, dict) else None
+            if staged is not None:
+                # The target may finish speculative/progressive compute before
+                # the residual copy transaction commits.  Retain the raw event
+                # (and therefore its child output credit) until source cleanup
+                # and ownership publication are both durable.
+                staged.append(dict(event))
+                return
+        if event.get("type") == "worker_start_failed":
+            # Startup failures arrive before the base monitor can invoke the
+            # unexpected-exit hook. Capture the child traceback/error here;
+            # once a worker is active, the monitor remains the single source
+            # of process-exit accounting to avoid double counting.
+            worker_id = str(event.get("worker_id", "unknown"))
+            diagnostics = getattr(self, "_migration_diagnostics", None)
+            startup_workers = getattr(self, "_startup", {})
+            active_workers = getattr(self, "_active_workers", set())
+            if (
+                isinstance(diagnostics, MigrationDiagnostics)
+                and isinstance(startup_workers, dict)
+                and worker_id in startup_workers
+                and worker_id not in active_workers
+            ):
+                diagnostics.record_worker_exit(
+                    worker_id,
+                    event.get("exitcode"),
+                    error=event.get("error"),
+                )
+            super()._dispatch_event(event)
+            return
         if event.get("type") == "model_publisher_frame_tracking":
             session_id = str(event.get("session_id", ""))
             if session_id in self._publisher_frame_tracking:
@@ -972,6 +1342,19 @@ def _nccl_model_worker_main(
         asyncio.run(
             _run_nccl_model_worker(spec, config_values, pipeline_file, skip_validation, security_name, commands, events)
         )
+    except BaseException as exc:
+        # Match the generic process worker's startup-failure signal. The
+        # parent consumes this only while the worker is still in startup;
+        # active-worker exits are accounted for by its process monitor.
+        with contextlib.suppress(Exception):
+            events.put(
+                {
+                    "type": "worker_start_failed",
+                    "worker_id": spec.worker_id,
+                    "error": repr(exc),
+                }
+            )
+        raise
     finally:
         _close_queue(commands, join=False)
         _close_queue(events)
@@ -1036,19 +1419,62 @@ async def _run_nccl_model_worker(
         set_dispatch_trace_callback(forward_dispatch_trace)
     outputs: dict[str, asyncio.Task[None]] = {}
     output_credits: dict[str, asyncio.BoundedSemaphore] = {}
-    outgoing: dict[str, dict[tuple[Any, ...], torch.Tensor]] = {}
+    outgoing: dict[
+        str,
+        tuple[dict[tuple[Any, ...], torch.Tensor], tuple[TensorTransferGroup, ...]],
+    ] = {}
     incoming: dict[str, tuple[dict[str, Any], dict[tuple[Any, ...], torch.Tensor], str, int, int]] = {}
     transfer_tasks: set[asyncio.Task[None]] = set()
+    transfer_stream = torch.cuda.Stream(device=torch.device("cuda", int(spec.gpu_ids[0])))
+
+    def warmup_nccl_collective() -> None:
+        """Initialize communicator-wide NCCL channels before pair-only P2P."""
+
+        torch.cuda.set_device(int(spec.gpu_ids[0]))
+        with torch.cuda.stream(transfer_stream):
+            tensor = torch.ones(1, dtype=torch.float32, device=transfer_stream.device)
+            dist.all_reduce(tensor)
+            transfer_stream.synchronize()
+
+    def warmup_nccl_peer(peer_rank: int, *, send_first: bool) -> None:
+        """Eagerly establish one pair's lazy NCCL P2P transport channels."""
+
+        torch.cuda.set_device(int(spec.gpu_ids[0]))
+        with torch.cuda.stream(transfer_stream):
+            send_tensor = torch.zeros(1, dtype=torch.uint8, device=transfer_stream.device)
+            recv_tensor = torch.empty_like(send_tensor)
+            send_op = dist.P2POp(dist.isend, send_tensor, peer_rank)
+            recv_op = dist.P2POp(dist.irecv, recv_tensor, peer_rank)
+            requests = dist.batch_isend_irecv(
+                [send_op, recv_op] if send_first else [recv_op, send_op]
+            )
+            for request in requests:
+                request.wait()
+            transfer_stream.synchronize()
 
     def transfer_on_worker_device(
         leaves: dict[tuple[Any, ...], torch.Tensor],
+        groups: tuple[TensorTransferGroup, ...],
         *,
         peer_rank: int,
         send: bool,
-    ) -> int:
+        progress: LayerTransferProgress | None = None,
+    ) -> dict[str, Any]:
         """Run NCCL transfer on a worker thread with the child CUDA device selected."""
         torch.cuda.set_device(int(spec.gpu_ids[0]))
-        return transfer_tensor_leaves_nccl(leaves, peer_rank=peer_rank, send=send)
+
+        def group_complete(group: TensorTransferGroup, event: torch.cuda.Event | None) -> None:
+            if progress is not None and group.layer_index is not None:
+                progress.mark_layer_ready(group.layer_index, event)
+
+        return transfer_tensor_leaves_nccl_streamed(
+            leaves,
+            peer_rank=peer_rank,
+            send=send,
+            groups=groups,
+            stream=transfer_stream,
+            on_group_complete=group_complete if progress is not None else None,
+        ).as_dict()
 
     def import_session_on_worker_device(
         metadata: dict[str, Any],
@@ -1056,6 +1482,7 @@ async def _run_nccl_model_worker(
         *,
         owner_worker_id: str,
         ownership_epoch: int,
+        migration_layer_readiness: LayerTransferProgress | None = None,
     ) -> str:
         """Restore received session tensors on a thread bound to this worker GPU."""
         torch.cuda.set_device(int(spec.gpu_ids[0]))
@@ -1064,6 +1491,7 @@ async def _run_nccl_model_worker(
             leaves,
             owner_worker_id=owner_worker_id,
             ownership_epoch=ownership_epoch,
+            migration_layer_readiness=migration_layer_readiness,
         )
 
     def start_pump(session_id: str, *, credit_window: int = _MODEL_OUTPUT_PARENT_QUEUE_SIZE) -> None:
@@ -1109,35 +1537,77 @@ async def _run_nccl_model_worker(
         request_id = command.get("request_id")
         try:
             transfer_id = str(command["transfer_id"])
-            await asyncio.to_thread(
+            leaves, groups = outgoing.pop(transfer_id)
+            report = await asyncio.to_thread(
                 transfer_on_worker_device,
-                outgoing.pop(transfer_id),
+                leaves,
+                groups,
                 peer_rank=int(command["target_rank"]),
                 send=True,
             )
-            await result(request_id)
+            await result(request_id, report)
         except Exception as exc:
             await result(request_id, error=exc)
 
     async def run_nccl_recv(command: dict[str, Any]) -> None:
         """Receive and install one session while unrelated commands are served."""
         request_id = command.get("request_id")
+        transfer_task: asyncio.Task[dict[str, Any]] | None = None
+        progress: LayerTransferProgress | None = None
         try:
             transfer_id = str(command["transfer_id"])
             metadata, leaves, owner, epoch, credit_window = incoming.pop(transfer_id)
-            await asyncio.to_thread(
-                transfer_on_worker_device,
-                leaves,
-                peer_rank=int(command["source_rank"]),
-                send=False,
+            groups = build_layer_transfer_groups(metadata["tensor_manifest"])
+            layer_count = max(
+                (group.layer_index for group in groups if group.layer_index is not None),
+                default=-1,
+            ) + 1
+            if layer_count < 1:
+                raise RuntimeError("NCCL migration manifest has no layer-grouped cache state")
+            progress = LayerTransferProgress(layer_count)
+
+            def receive_transfer() -> dict[str, Any]:
+                try:
+                    return transfer_on_worker_device(
+                        leaves,
+                        groups,
+                        peer_rank=int(command["source_rank"]),
+                        send=False,
+                        progress=progress,
+                    )
+                except BaseException as exc:
+                    progress.mark_failed(exc)
+                    raise
+
+            transfer_task = asyncio.create_task(
+                asyncio.to_thread(receive_transfer),
+                name=f"nccl-recv-copy-{transfer_id}",
             )
+            await asyncio.to_thread(progress.first_layer_ready.wait)
+            if transfer_task.done():
+                # Propagate a failure that woke the readiness event before a
+                # partially initialized target session can become visible.
+                await transfer_task
             session_id = await asyncio.to_thread(
                 import_session_on_worker_device,
                 metadata,
                 leaves,
                 owner_worker_id=owner,
                 ownership_epoch=epoch,
+                migration_layer_readiness=progress,
             )
+            events.put(
+                {
+                    "type": "nccl_first_layer_ready",
+                    "worker_id": spec.worker_id,
+                    "transfer_id": transfer_id,
+                    "session_id": session_id,
+                    "progress": progress.snapshot(),
+                }
+            )
+            report = await transfer_task
+            progress.mark_complete()
+            report["progress"] = progress.snapshot()
             try:
                 publisher_tracking_enabled = bool(adapter.enable_publisher_frame_tracking(session_id))
             except Exception:
@@ -1151,8 +1621,12 @@ async def _run_nccl_model_worker(
                 }
             )
             start_pump(session_id, credit_window=credit_window)
-            await result(request_id)
+            await result(request_id, report)
         except Exception as exc:
+            if progress is not None:
+                progress.mark_failed(exc)
+            if transfer_task is not None and not transfer_task.done():
+                await asyncio.gather(transfer_task, return_exceptions=True)
             await result(request_id, error=exc)
 
     try:
@@ -1225,13 +1699,25 @@ async def _run_nccl_model_worker(
                         timeout=timedelta(seconds=_NCCL_INIT_GROUP_TIMEOUT_SECONDS),
                         device_id=device_id,
                     )
+                elif kind == "nccl_warmup_peer":
+                    await asyncio.to_thread(
+                        warmup_nccl_peer,
+                        int(command["peer_rank"]),
+                        send_first=bool(command["send_first"]),
+                    )
+                elif kind == "nccl_warmup_collective":
+                    await asyncio.to_thread(warmup_nccl_collective)
                 elif kind == "scheduler_pause":
                     await asyncio.to_thread(service.pause_scheduler)
                 elif kind == "scheduler_resume":
                     service.resume_scheduler()
                 elif kind == "nccl_export":
                     metadata = await asyncio.to_thread(service.prepare_migration_nccl_metadata, command["session_id"])
-                    outgoing[command["transfer_id"]] = metadata.pop("_nccl_tensor_leaves")
+                    tensor_leaves = metadata.pop("_nccl_tensor_leaves")
+                    outgoing[command["transfer_id"]] = (
+                        tensor_leaves,
+                        build_layer_transfer_groups(metadata["tensor_manifest"]),
+                    )
                     await result(request_id, metadata)
                     continue
                 elif kind == "nccl_prepare_recv":

@@ -17,12 +17,14 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from .motivation_batch_gate import MotivationBatchGate
 from .motivation_controller import DispatchLease, MotivationRuntimeController
 
 ControlDispatch = Callable[[DispatchLease, Sequence[tuple[str, dict[str, Any]]]], None]
 ReleasePolicy = Callable[[dict[str, Any]], bool]
 
 logger = logging.getLogger(__name__)
+_EPSILON = 1e-9
 
 
 @dataclass
@@ -70,6 +72,8 @@ class MotivationExecutionBridge:
         release_policy: ReleasePolicy = release_on_control_state,
         heartbeat_interval_seconds: float = 1.0,
         clock: Callable[[], float] = time.monotonic,
+        batch_gate: MotivationBatchGate | None = None,
+        enable_batch_gate: bool = True,
     ) -> None:
         self.controller = controller
         self.dispatch = dispatch
@@ -78,6 +82,38 @@ class MotivationExecutionBridge:
         self.release_policy = release_policy
         self._heartbeat_interval_seconds = float(heartbeat_interval_seconds)
         self._clock = clock
+        if not isinstance(enable_batch_gate, bool):
+            raise TypeError("enable_batch_gate must be a bool")
+        self._batch_gate = (
+            (
+                batch_gate
+                if batch_gate is not None
+                else MotivationBatchGate(
+                    controller.scheduler.profile_provider,
+                    max_wait_seconds=self._heartbeat_interval_seconds,
+                )
+            )
+            if enable_batch_gate
+            else None
+        )
+        self._batch_gate_timer: threading.Timer | None = None
+        self._batch_gate_deadline: float | None = None
+        self._batch_gate_generation = 0
+        self._batch_gate_wait_count = 0
+        self._batch_gate_expiry_count = 0
+        self._batch_gate_cancel_count = 0
+        # Scheduling callbacks can be raised by dispatch/output events on
+        # different worker threads, and a dispatch adapter may synchronously
+        # emit another worker-free event. Serialize the bounded drain while
+        # coalescing such reentrant requests instead of recursively scheduling.
+        self._schedule_guard = threading.Lock()
+        self._schedule_running = False
+        self._schedule_requested = False
+        self._schedule_force_requested = False
+        self._drain_rounds_total = 0
+        self._drain_limit_hits = 0
+        self._drain_reentrant_events = 0
+        self._drain_last_rounds = 0
         self._lock = threading.RLock()
         self._controls: dict[str, set[str]] = {}
         self._next_release_at: dict[str, float] = {}
@@ -225,6 +261,7 @@ class MotivationExecutionBridge:
         """Stop future policy work while allowing an in-flight lease to drain."""
 
         self.controller.on_session_departed(session_id, now=self._observed(now))
+        self._cancel_batch_gate()
         with self._lock:
             timer = self._idle_wakeup_timers.pop(session_id, None)
             if timer is not None:
@@ -233,10 +270,14 @@ class MotivationExecutionBridge:
             # its reservation. The runtime owns final mapping cleanup.
             self._controls.pop(session_id, None)
             self._next_release_at.pop(session_id, None)
+        # A departing session may have been the only candidate holding the
+        # collection timer; immediately reconsider any other pending action.
+        self._schedule()
 
     def close(self) -> None:
         """Close the controller's optional async-search executor."""
 
+        self._cancel_batch_gate()
         with self._lock:
             timers = tuple(self._idle_wakeup_timers.values())
             self._idle_wakeup_timers.clear()
@@ -277,6 +318,11 @@ class MotivationExecutionBridge:
         try:
             self.dispatch(lease, payloads)
         except Exception:
+            with self._lock:
+                self._leases.pop(lease_id, None)
+                for job in lease.jobs:
+                    if self._job_to_lease.get(job.job_id) == lease_id:
+                        self._job_to_lease.pop(job.job_id, None)
             # A transport can disappear between candidate validation and the
             # parent queue write while a browser tears down. Keep the failure
             # visible at the policy boundary instead of silently losing it.
@@ -292,19 +338,274 @@ class MotivationExecutionBridge:
         """Retry the policy after an external event completes."""
         self._schedule()
 
-    def _schedule(self) -> None:
+    def _schedule(self, *, force_batch_gate: bool = False) -> None:
+        """Drain immediately runnable leases without allowing reentrant storms.
+
+        A controller call reserves at most one GPU slot.  On a worker/action
+        event, repeatedly invoke it while newly selected leases can start now;
+        the number of rounds is bounded by the configured GPU count.  A
+        singleton batch gate remains a hard stop for that round, so the drain
+        never turns profile-driven aggregation into a busy loop.  Callbacks
+        that arrive while dispatch is in progress are coalesced and observed
+        by the next round.
+        """
+        with self._schedule_guard:
+            if self._schedule_running:
+                self._schedule_requested = True
+                self._schedule_force_requested |= force_batch_gate
+                self._drain_reentrant_events += 1
+                return
+            self._schedule_running = True
+
+        rounds = 0
+        force = force_batch_gate
         try:
-            lease = self.controller.schedule_once(now=self._clock())
+            limit = self._immediate_drain_limit()
+            while rounds < limit:
+                rounds += 1
+                lease = self._schedule_round(force_batch_gate=force)
+                force = False
+                with self._schedule_guard:
+                    requested = self._schedule_requested
+                    force = self._schedule_force_requested
+                    self._schedule_requested = False
+                    self._schedule_force_requested = False
+                # A successful lease reserves one GPU timeline, so another
+                # round can only fill a different currently-free slot.  If no
+                # lease was produced, retry once only when a reentrant event
+                # was coalesced during the round; otherwise a gate/no-work
+                # result should return and let its timer/event wake us later.
+                if lease is None and not requested:
+                    break
+            if rounds >= limit and (lease is not None or requested):
+                with self._schedule_guard:
+                    self._drain_limit_hits += 1
+                logger.debug("Motivation immediate drain reached bound: rounds=%d", limit)
+        finally:
+            with self._schedule_guard:
+                self._drain_rounds_total += rounds
+                self._drain_last_rounds = rounds
+                # Do not recurse after the bound. A later worker event will
+                # retry; dropping the coalesced bit here guarantees that a
+                # pathological synchronous callback cannot spin indefinitely.
+                self._schedule_requested = False
+                self._schedule_force_requested = False
+                self._schedule_running = False
+
+    def _schedule_round(self, *, force_batch_gate: bool) -> DispatchLease | None:
+        """Run one policy search/dispatch round and return its lease, if any."""
+        observed_at = self._clock()
+        try:
+            if not force_batch_gate and self._defer_singleton_action(observed_at):
+                return None
+            lease = self.controller.schedule_once(now=observed_at)
         except Exception:
             logger.exception("Motivation scheduling callback failed")
-            return
+            return None
         if lease is not None:
+            self._cancel_batch_gate()
             logger.debug(
                 "Motivation lease dispatched: jobs=%s gpu=%s fidelity=%s",
                 len(lease.jobs),
                 lease.candidate.gpu_id,
                 lease.candidate.fidelity,
             )
+        return lease
+
+    def _immediate_drain_limit(self) -> int:
+        """Return a finite round bound based on the registered GPU count."""
+        try:
+            gpu_count = len(self.controller.scheduler.gpus())
+        except (AttributeError, TypeError):
+            gpu_count = 1
+        return max(1, gpu_count)
+
+    def _defer_singleton_action(self, observed_at: float) -> bool:
+        """Arm a profile-derived gate before dispatching a singleton action.
+
+        The gate is deliberately action-only. Idle sentinels, remote migration
+        candidates, busy GPUs, and candidates whose predicted slack would be
+        exhausted by the wait are dispatched through the normal controller
+        path. A single deadline is retained across input updates so repeated
+        heartbeats cannot postpone a pending action indefinitely.
+        """
+        gate = self._batch_gate
+        if gate is None:
+            return False
+        scheduler = self.controller.scheduler
+        has_action = any(
+            not state.departed and state.pending_action is not None
+            for state in scheduler.sessions()
+        )
+        if not has_action:
+            self._cancel_batch_gate()
+            return False
+        try:
+            pending_migrations = self.controller.pending_migration_sessions()
+            search_at = max(observed_at, scheduler.current_time)
+            blocked_migrations = self.controller.blocked_migration_sessions(now=search_at)
+            candidate = scheduler.find_best(
+                now=search_at,
+                include_wait=False,
+                allow_migrations=True,
+                exclude_session_ids=pending_migrations,
+                blocked_migration_session_ids=blocked_migrations,
+            )
+        except (AttributeError, KeyError, ValueError):
+            # A transient state/version race is handled by the controller's
+            # regular search path; never let the optional gate block service.
+            return False
+        if candidate is None:
+            return self._batch_gate_is_armed(search_at)
+        if not self._candidate_is_singleton_action(candidate, search_at):
+            self._cancel_batch_gate()
+            return False
+        # A gate is only useful when this is the sole pending action. If an
+        # independent action is already ready, dispatch immediately and let
+        # the bounded drain fill the other free GPU(s); delaying it would make
+        # a global singleton gate strand capacity for no aggregation benefit.
+        if self._has_other_pending_actions(candidate.session_ids):
+            self._cancel_batch_gate()
+            return False
+        assert candidate.gpu_id is not None
+        try:
+            wait_seconds = gate.wait_seconds(
+                gpu_id=candidate.gpu_id,
+                fidelity=candidate.fidelity,
+            )
+            # Keep a custom gate bounded by the bridge's one-heartbeat release
+            # period as well as the default gate's profile cap.
+            wait_seconds = min(wait_seconds, self._heartbeat_interval_seconds)
+        except (KeyError, ValueError, TypeError):
+            logger.debug("Motivation batch gate profile lookup failed", exc_info=True)
+            wait_seconds = 0.0
+        if wait_seconds <= _EPSILON or not self._batch_wait_preserves_slack(candidate, wait_seconds):
+            self._cancel_batch_gate()
+            return False
+        with self._lock:
+            deadline = self._batch_gate_deadline
+        if deadline is not None and search_at >= deadline - _EPSILON:
+            self._cancel_batch_gate()
+            return False
+        self._arm_batch_gate(search_at, wait_seconds)
+        return True
+
+    def _has_other_pending_actions(self, selected_session_ids: Sequence[str]) -> bool:
+        """Return whether another session can provide action work now.
+
+        The scheduler intentionally gives action jobs global priority over idle
+        sentinels. Mirror that narrow rule here rather than probing a second
+        candidate (which would duplicate policy scoring): an existing action
+        on another session is enough reason to dispatch and drain immediately.
+        """
+        selected = set(selected_session_ids)
+        return any(
+            not state.departed
+            and state.session_id not in selected
+            and state.pending_action is not None
+            and state.in_flight is None
+            for state in self.controller.scheduler.sessions()
+        )
+
+    def _candidate_is_singleton_action(self, candidate: Any, observed_at: float) -> bool:
+        """Check that a candidate is an immediately executable action B1."""
+        if candidate.wait or candidate.batch_size != 1 or candidate.migration_count:
+            return False
+        if candidate.gpu_id is None or candidate.fidelity is None:
+            return False
+        ready_now = getattr(self.controller.scheduler, "candidate_ready_now", None)
+        if callable(ready_now):
+            if not ready_now(candidate, now=observed_at):
+                return False
+        elif candidate.start_at > observed_at + _EPSILON:
+            return False
+        session_id = candidate.session_ids[0]
+        job_id = candidate.job_ids[0]
+        try:
+            state = self.controller.scheduler.session(session_id)
+        except KeyError:
+            return False
+        job = state.ready_job(include_idle=True)
+        return job is not None and job.job_id == job_id and job.kind == "action"
+
+    def _batch_wait_preserves_slack(self, candidate: Any, wait_seconds: float) -> bool:
+        """Reject a gate if waiting would make any active session unsafe.
+
+        The wait delays playback for every session, not only the singleton
+        candidate. Check the complete projected system state so a near-deadline
+        unselected session can force immediate dispatch.
+        """
+        for state in self.controller.scheduler.sessions():
+            if state.departed or not state.playback_active:
+                continue
+            projected = candidate.projected_slack.get(state.session_id)
+            if projected is None or projected - wait_seconds <= _EPSILON:
+                return False
+            if state.slack_seconds - wait_seconds <= _EPSILON:
+                return False
+        return True
+
+    def _arm_batch_gate(self, observed_at: float, wait_seconds: float) -> None:
+        """Arm or tighten the singleton gate timer without extending its deadline."""
+        desired_deadline = observed_at + wait_seconds
+        old_timer: threading.Timer | None = None
+        with self._lock:
+            current_deadline = self._batch_gate_deadline
+            if current_deadline is not None and current_deadline > observed_at + _EPSILON:
+                deadline = min(current_deadline, desired_deadline)
+            else:
+                deadline = desired_deadline
+            if (
+                self._batch_gate_timer is not None
+                and current_deadline is not None
+                and abs(current_deadline - deadline) <= _EPSILON
+            ):
+                return
+            old_timer = self._batch_gate_timer
+            self._batch_gate_generation += 1
+            generation = self._batch_gate_generation
+            self._batch_gate_deadline = deadline
+            self._batch_gate_wait_count += 1
+            timer = threading.Timer(
+                max(0.0, deadline - observed_at),
+                self._batch_gate_wakeup,
+                args=(generation,),
+            )
+            timer.daemon = True
+            self._batch_gate_timer = timer
+        if old_timer is not None:
+            old_timer.cancel()
+        timer.start()
+
+    def _batch_gate_wakeup(self, generation: int) -> None:
+        """Retry scheduling once the profile-derived collection window expires."""
+        with self._lock:
+            if generation != self._batch_gate_generation:
+                return
+            self._batch_gate_timer = None
+            self._batch_gate_deadline = None
+            self._batch_gate_expiry_count += 1
+        self._schedule(force_batch_gate=True)
+
+    def _batch_gate_is_armed(self, observed_at: float) -> bool:
+        with self._lock:
+            return (
+                self._batch_gate_timer is not None
+                and self._batch_gate_deadline is not None
+                and observed_at < self._batch_gate_deadline - _EPSILON
+            )
+
+    def _cancel_batch_gate(self) -> None:
+        """Cancel a pending collection timer and invalidate its callback."""
+        with self._lock:
+            self._batch_gate_generation += 1
+            timer = self._batch_gate_timer
+            self._batch_gate_timer = None
+            self._batch_gate_deadline = None
+            if timer is not None:
+                self._batch_gate_cancel_count += 1
+        if timer is not None:
+            timer.cancel()
 
     def snapshot(self) -> dict[str, Any]:
         """Return bounded policy state for diagnosing scheduling progress."""
@@ -321,6 +622,28 @@ class MotivationExecutionBridge:
             }
             controls = {session_id: sorted(values) for session_id, values in self._controls.items()}
             next_release_at = dict(self._next_release_at)
+            batch_gate_deadline = self._batch_gate_deadline
+            batch_gate_armed = self._batch_gate_timer is not None and batch_gate_deadline is not None
+            batch_gate_stats = {
+                "enabled": self._batch_gate is not None,
+                "armed": batch_gate_armed,
+                "deadline": batch_gate_deadline,
+                "wait_count": self._batch_gate_wait_count,
+                "expiry_count": self._batch_gate_expiry_count,
+                "cancel_count": self._batch_gate_cancel_count,
+            }
+        with self._schedule_guard:
+            immediate_drain_stats = {
+                "running": self._schedule_running,
+                "rounds_total": self._drain_rounds_total,
+                "last_rounds": self._drain_last_rounds,
+                "limit_hits": self._drain_limit_hits,
+                "reentrant_events": self._drain_reentrant_events,
+            }
+        if batch_gate_armed and batch_gate_deadline is not None:
+            batch_gate_stats["remaining_seconds"] = max(0.0, batch_gate_deadline - self._clock())
+        else:
+            batch_gate_stats["remaining_seconds"] = 0.0
         sessions = {}
         for state in self.controller.scheduler.sessions():
             sessions[state.session_id] = {
@@ -343,6 +666,8 @@ class MotivationExecutionBridge:
             "sessions": sessions,
             "controls": controls,
             "next_release_at": next_release_at,
+            "batch_gate": batch_gate_stats,
+            "immediate_drain": immediate_drain_stats,
             "diagnostics": self.controller.diagnostics_snapshot(),
             "active_migrations": [
                 {

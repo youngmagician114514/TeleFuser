@@ -10,7 +10,7 @@ sink prefix and rolling tail, so long sessions do not grow RoPE indices.
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 import torch.nn as nn
@@ -22,6 +22,18 @@ from telefuser.ops.attention import attention as attention_fn
 from telefuser.ops.normalization import LayerNorm, RMSNorm
 
 from .wan_video_dit import precompute_freqs_cis_3d, sinusoidal_embedding_1d
+
+
+class LayerReadiness(Protocol):
+    """Minimal state-plane dependency consumed by eager layer execution."""
+
+    def wait_layer(
+        self,
+        layer_index: int,
+        *,
+        stream: torch.cuda.Stream | None = None,
+        timeout: float | None = None,
+    ) -> float: ...
 
 
 def _rope_apply(
@@ -723,6 +735,7 @@ class ABotWorldDiT(BaseModel):
         crossattn_cache: list[dict[str, Any]],
         current_start: int,
         act_context_scale: float = 1.0,
+        layer_readiness: LayerReadiness | None = None,
     ) -> torch.Tensor:
         if x.ndim != 5 or timestep.ndim != 2:
             raise ValueError("ABot expects x=[B,C,F,H,W] and timestep=[B,F]")
@@ -747,6 +760,9 @@ class ABotWorldDiT(BaseModel):
         context = self.text_embedding(context)
         freqs = self._frequencies(tokens.device)
         for index, block in enumerate(self.blocks):
+            if layer_readiness is not None:
+                compute_stream = torch.cuda.current_stream(tokens.device) if tokens.device.type == "cuda" else None
+                layer_readiness.wait_layer(index, stream=compute_stream)
             tokens = block(
                 tokens,
                 time_modulation,

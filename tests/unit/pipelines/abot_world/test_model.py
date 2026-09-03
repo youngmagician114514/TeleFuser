@@ -139,6 +139,14 @@ def test_small_dit_forward_preserves_latent_and_cache_contract() -> None:
             }
         )
 
+    waited_layers = []
+
+    class _Readiness:
+        def wait_layer(self, layer_index: int, *, stream=None, timeout=None) -> float:
+            del stream, timeout
+            waited_layers.append(layer_index)
+            return 0.0
+
     output = model(
         x=torch.randn(batch, model.in_dim, frames, latent_height, latent_width),
         timestep=torch.tensor([[0.5]]),
@@ -148,12 +156,14 @@ def test_small_dit_forward_preserves_latent_and_cache_contract() -> None:
         kv_cache=self_cache,
         crossattn_cache=cross_cache,
         current_start=0,
+        layer_readiness=_Readiness(),
     )
 
     assert output.shape == (batch, model.out_dim, frames, latent_height, latent_width)
     assert torch.isfinite(output).all()
     assert all(int(cache["global_end_index"].item()) == frame_tokens for cache in self_cache)
     assert all(bool(cache["is_init"]) for cache in cross_cache)
+    assert waited_layers == [0, 1]
 
 
 def test_full_window_steady_state_matches_regular_relative_rope_continuation() -> None:

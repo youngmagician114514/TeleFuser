@@ -699,6 +699,7 @@ class ABotWorldLiveKitService:
         *,
         owner_worker_id: str | None = None,
         ownership_epoch: int | None = None,
+        migration_layer_readiness: Any | None = None,
     ) -> str:
         """Install target-GPU tensors received by NCCL without a CPU snapshot copy."""
         payload = rebuild_tensor_tree(metadata["tensor_skeleton"], dict(tensor_leaves))
@@ -736,6 +737,7 @@ class ABotWorldLiveKitService:
             bundle.snapshot,
             owner_worker_id=owner_worker_id,
             ownership_epoch=ownership_epoch,
+            migration_layer_readiness=migration_layer_readiness,
         )
         state = _ABotWorldLiveKitSession(
             session_id=snapshot.session_id,
@@ -1514,8 +1516,14 @@ class ABotWorldLiveKitService:
             with state.lock:
                 if state.deadline_batch_force_singleton:
                     return [state]
+        if ready[0].pipeline_session.migration_transfer_in_progress:
+            return [ready[0]]
         pivot_key = self._batch_key(ready[0])
-        batch = [state for state in ready if self._batch_key(state) == pivot_key][: self.max_batch_size]
+        batch = [
+            state
+            for state in ready
+            if not state.pipeline_session.migration_transfer_in_progress and self._batch_key(state) == pivot_key
+        ][: self.max_batch_size]
         if len(batch) <= 1:
             return batch
 

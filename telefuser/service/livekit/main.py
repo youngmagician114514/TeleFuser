@@ -13,9 +13,14 @@ from telefuser.utils.logging import logger
 
 from .app import create_livekit_app
 from .config import LiveKitServeConfig
+from .migration_hysteresis import MigrationCooldownPolicy
 from .motivation_controller import MotivationRuntimeController
 from .motivation_diagnostics import MotivationDiagnosticsCollector
-from .motivation_scheduler import GpuSchedulingState, MotivationSchedulerConfig
+from .motivation_scheduler import (
+    GpuSchedulingState,
+    LocalMigrationEstimator,
+    MotivationSchedulerConfig,
+)
 from .runtime import LiveKitServeRuntime
 
 
@@ -93,6 +98,15 @@ def run_stream_server(
             gpu_states=gpu_states,
             dispatch=lambda _lease: None,
             scheduler_config=MotivationSchedulerConfig(max_batch_size=motivation_max_batch_size),
+            # Reuse the already documented runtime migration estimate so the
+            # policy does not treat a remote GPU as free while an asynchronous
+            # state transfer is still in flight.
+            migration_estimator=LocalMigrationEstimator(
+                migration_cost_seconds=config.turboserve_migration_eta,
+            ),
+            migration_policy=MigrationCooldownPolicy(
+                cooldown_seconds=config.motivation_migration_cooldown_seconds,
+            ),
             diagnostics=diagnostics,
         )
 

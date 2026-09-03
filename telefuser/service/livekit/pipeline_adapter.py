@@ -87,8 +87,31 @@ class LiveKitPipelineAdapter:
         """Configure and return the loaded pipeline's optional capacity profile."""
         return self.stream_service.configure_session_capacity(max_sessions)
 
-    def runtime_metrics(self) -> dict[str, float | int | str] | None:
-        """Return optional model-service scheduling measurements for placement."""
+    def runtime_metrics(self, session_id: str | None = None) -> dict[str, float | int | str] | None:
+        """Return optional model-service scheduling measurements.
+
+        ``session_id`` selects per-pipeline-session facts when the wrapped
+        service supports them. Calling without an identifier preserves the
+        aggregate placement-metrics contract used by existing worker pools.
+        Older third-party services may expose only a no-argument
+        ``runtime_metrics`` method; in that case the per-session request
+        gracefully falls back to the aggregate snapshot.
+        """
         service = getattr(self.stream_service, "service", None)
         metrics = getattr(service, "runtime_metrics", None)
-        return dict(metrics()) if callable(metrics) else None
+        if not callable(metrics):
+            return None
+        try:
+            value = metrics(session_id) if session_id is not None else metrics()
+        except TypeError:
+            # Keep adapters for older pipeline services usable while allowing
+            # ABot-style services to expose ``runtime_metrics(session_id)``.
+            if session_id is None:
+                return None
+            try:
+                value = metrics()
+            except Exception:
+                return None
+        except Exception:
+            return None
+        return dict(value) if isinstance(value, dict) else None

@@ -31,6 +31,7 @@ class _FakePipelineSession:
             }
         ]
         self.lifecycle = ABotWorldSessionLifecycle.READY
+        self.migration_transfer_in_progress = False
         self.closed = False
 
     @property
@@ -182,6 +183,22 @@ def _wait_for(predicate, *, timeout: float = 2.0) -> None:
             return
         time.sleep(0.002)
     assert predicate()
+
+
+def test_select_batch_isolates_session_with_progressive_transfer() -> None:
+    service, _ = _service(max_batch_size=2)
+    service.configure_session_capacity(2)
+    try:
+        _create(service, "migrating")
+        _create(service, "resident")
+        migrating = service._sessions["migrating"]
+        resident = service._sessions["resident"]
+        migrating.pipeline_session.migration_transfer_in_progress = True
+
+        assert service._select_batch([migrating, resident], now=time.monotonic()) == [migrating]
+        assert service._select_batch([resident, migrating], now=time.monotonic()) == [resident]
+    finally:
+        service.stop()
 
 
 def test_service_matches_shared_multi_session_bidirectional_contract() -> None:

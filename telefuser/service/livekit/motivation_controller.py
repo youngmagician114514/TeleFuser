@@ -16,11 +16,14 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+from .migration_hysteresis import MigrationCooldownPolicy
 from .motivation_diagnostics import MotivationDiagnosticsSink, MotivationDispatchSummary
 from .motivation_scheduler import (
+    EPSILON,
     ActionJob,
     DispatchCandidate,
     GpuSchedulingState,
+    MigrationEstimator,
     MotivationScheduler,
     MotivationSchedulerConfig,
     SessionSchedulingState,
@@ -44,6 +47,7 @@ class DispatchLease:
 
 
 DispatchCallback = Callable[[DispatchLease], None]
+DispatchOwnerResolver = Callable[[str], str | None]
 SessionStateTransferBackendFactory = Callable[[SessionStateTransferRequest], SessionStateTransferBackend]
 SearchExecutor = concurrent.futures.Executor
 
@@ -65,6 +69,8 @@ class MotivationRuntimeController:
         dispatch: DispatchCallback,
         migration_manager: SessionStateTransferManager | None = None,
         migration_backend_factory: SessionStateTransferBackendFactory | None = None,
+        migration_policy: MigrationCooldownPolicy | None = None,
+        dispatch_owner_resolver: DispatchOwnerResolver | None = None,
         search_executor: SearchExecutor | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -72,6 +78,8 @@ class MotivationRuntimeController:
         self.dispatch = dispatch
         self.migration_manager = migration_manager
         self.migration_backend_factory = migration_backend_factory
+        self.migration_policy = migration_policy
+        self._dispatch_owner_resolver = dispatch_owner_resolver
         self._search_executor = search_executor
         self._owns_search_executor = False
         self._clock = clock
@@ -98,6 +106,13 @@ class MotivationRuntimeController:
         with self._lock:
             self._migration_wakeup = callback
 
+    def set_dispatch_owner_resolver(self, resolver: DispatchOwnerResolver | None) -> None:
+        """Install the physical worker-route lookup used before reservation."""
+        if resolver is not None and not callable(resolver):
+            raise TypeError("dispatch owner resolver must be callable or None")
+        with self._lock:
+            self._dispatch_owner_resolver = resolver
+
     @classmethod
     def from_offline_table(
         cls,
@@ -106,8 +121,11 @@ class MotivationRuntimeController:
         gpu_states: Iterable[GpuSchedulingState],
         dispatch: DispatchCallback,
         scheduler_config: MotivationSchedulerConfig | None = None,
+        migration_estimator: MigrationEstimator | None = None,
         migration_manager: SessionStateTransferManager | None = None,
         migration_backend_factory: SessionStateTransferBackendFactory | None = None,
+        migration_policy: MigrationCooldownPolicy | None = None,
+        dispatch_owner_resolver: DispatchOwnerResolver | None = None,
         search_executor: SearchExecutor | None = None,
         diagnostics: MotivationDiagnosticsSink | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -121,6 +139,7 @@ class MotivationRuntimeController:
         scheduler = MotivationScheduler(
             profile_table,
             config=policy_config,
+            migration_estimator=migration_estimator,
             diagnostics=diagnostics,
             clock=clock,
         )
@@ -135,6 +154,8 @@ class MotivationRuntimeController:
             dispatch=dispatch,
             migration_manager=migration_manager,
             migration_backend_factory=migration_backend_factory,
+            migration_policy=migration_policy,
+            dispatch_owner_resolver=dispatch_owner_resolver,
             search_executor=search_executor,
             clock=clock,
         )
@@ -183,7 +204,10 @@ class MotivationRuntimeController:
 
     def on_session_departed(self, session_id: str, *, now: float | None = None) -> None:
         """Remove future policy work while retaining any in-flight job."""
-        self.scheduler.mark_departed(session_id, now=self._observed(now))
+        observed_at = self._observed(now)
+        self.scheduler.mark_departed(session_id, now=observed_at)
+        if self.migration_policy is not None:
+            self.migration_policy.forget(session_id)
 
     def on_action(
         self,
@@ -271,18 +295,20 @@ class MotivationRuntimeController:
                 self._owns_search_executor = True
             executor = self._search_executor
         def search() -> DispatchCandidate | None:
-            pending_migrations = self._pending_migration_sessions()
+            pending_migrations = self.pending_migration_sessions()
             # The task may start after an event callback has advanced policy
             # time.  Search from the scheduler's current timeline rather than
             # failing with a backwards-time error; dispatch_candidate still
             # rejects the captured epoch if the state changed meanwhile.
             search_at = max(observed_at, self.scheduler.current_time)
+            blocked_migrations = self.blocked_migration_sessions(now=search_at)
             try:
                 return self.scheduler.find_best(
                     now=search_at,
                     wait_seconds=wait_seconds,
                     include_wait=True,
                     exclude_session_ids=pending_migrations,
+                    blocked_migration_session_ids=blocked_migrations,
                 )
             except ValueError as exc:
                 # A concurrent event can advance the scheduler between the
@@ -295,7 +321,10 @@ class MotivationRuntimeController:
                     now=self.scheduler.current_time,
                     wait_seconds=wait_seconds,
                     include_wait=True,
-                    exclude_session_ids=self._pending_migration_sessions(),
+                    exclude_session_ids=self.pending_migration_sessions(),
+                    blocked_migration_session_ids=self.blocked_migration_sessions(
+                        now=self.scheduler.current_time
+                    ),
                 )
 
         return executor.submit(search)
@@ -309,40 +338,68 @@ class MotivationRuntimeController:
         """Search synchronously and dispatch one current candidate if possible."""
         observed_at = self._observed(now)
         self._ensure_idle_jobs(now=observed_at)
-        pending_migrations = self._pending_migration_sessions()
+        pending_migrations = self.pending_migration_sessions()
+        blocked_migrations = self.blocked_migration_sessions(now=observed_at)
         candidate = self.scheduler.find_best(
             now=observed_at,
             wait_seconds=wait_seconds,
             include_wait=True,
             exclude_session_ids=pending_migrations,
+            blocked_migration_session_ids=blocked_migrations,
         )
         if candidate is None:
             return None
         lease = self.dispatch_candidate(candidate, now=observed_at)
-        if lease is not None or candidate.wait or not candidate.migration_count:
+        if lease is not None or candidate.wait:
             return lease
-        # A migration is deliberately asynchronous. While it is preparing (or
-        # waiting behind another transfer), keep dispatching feasible jobs that
-        # already have their state on the selected GPU. Otherwise one stalled
-        # pre-copy candidate can block every unrelated session globally.
+        # A migration is deliberately asynchronous. A local candidate can
+        # also be deferred when its target GPU is busy: ``start_at`` is a
+        # projection, never permission to enqueue work early. In either case,
+        # try unrelated work only on GPUs that are free at this scheduling
+        # instant; otherwise a second search could select the same future slot.
+        future_local = False
+        if not candidate.migration_count:
+            fallback_now = self.scheduler.current_time
+            future_local = not self.scheduler.candidate_ready_now(candidate, now=fallback_now)
+        if not candidate.migration_count and not future_local:
+            return lease
+        fallback_now = self.scheduler.current_time
         fallback = self.scheduler.find_best(
-            now=self.scheduler.current_time,
+            now=fallback_now,
+            gpu_states=self._immediate_gpu_states(now=fallback_now),
             wait_seconds=wait_seconds,
             include_wait=False,
             allow_migrations=False,
-            exclude_session_ids=tuple({*candidate.session_ids, *pending_migrations}),
+            # The first candidate may contain a session that is still useful
+            # on its owner GPU. Exclude only transfers already in flight;
+            # migration-disabled search rejects remote alternatives itself.
+            exclude_session_ids=self.pending_migration_sessions(),
+            blocked_migration_session_ids=self.blocked_migration_sessions(now=fallback_now),
         )
         if fallback is None:
             return None
-        return self.dispatch_candidate(fallback, now=self.scheduler.current_time)
+        return self.dispatch_candidate(fallback, now=fallback_now)
 
-    def _pending_migration_sessions(self) -> tuple[str, ...]:
-        """Return sessions whose async migration is not ready to commit.
+    def _immediate_gpu_states(self, *, now: float) -> tuple[GpuSchedulingState, ...]:
+        """Return scheduler GPU snapshots that can start work at ``now``."""
+        return tuple(
+            gpu
+            for gpu in self.scheduler.gpus()
+            if gpu.available and gpu.free_at <= now + EPSILON
+        )
+
+    def pending_migration_sessions(self) -> tuple[str, ...]:
+        """Return sessions whose asynchronous migration is not ready to commit.
 
         A pending transfer is already quiescing its source worker. Keeping its
         job in every fresh global candidate causes repeated ``migration_pending``
         decisions and starves local batches, so those sessions are isolated
         until the completion callback makes the transfer ready.
+
+        The method is a read-only policy view: it may opportunistically poll
+        the transfer backend to observe completion, but it does not reserve
+        jobs or mutate scheduler ownership. Callers can use it before a fresh
+        search without reaching into controller internals.
         """
         manager = self.migration_manager
         if manager is None:
@@ -355,8 +412,29 @@ class MotivationRuntimeController:
         return tuple(
             record.request.session_id
             for record in manager.active()
-            if record.state not in {"ready", "completed"}
+            if record.state not in {"ready", "streaming", "completed"}
         )
+
+    def blocked_migration_sessions(self, *, now: float | None = None) -> tuple[str, ...]:
+        """Return live sessions whose remote moves are in a residence cooldown.
+
+        A cooldown never removes a session's local work. It only tells the
+        candidate enumerator not to select that session on another GPU until
+        the residence window expires.
+        """
+
+        policy = self.migration_policy
+        if policy is None:
+            return ()
+        observed_at = self._observed(now)
+        session_ids = tuple(
+            state.session_id for state in self.scheduler.sessions() if not state.departed
+        )
+        return policy.blocked_session_ids(session_ids, now=observed_at)
+
+    def _pending_migration_sessions(self) -> tuple[str, ...]:
+        """Backward-compatible alias for :meth:`pending_migration_sessions`."""
+        return self.pending_migration_sessions()
 
     def _ensure_idle_jobs(self, *, now: float) -> None:
         """Materialize at most one consumption-gated idle sentinel per session."""
@@ -390,6 +468,17 @@ class MotivationRuntimeController:
             if not self.scheduler.validate(candidate, now=observed_at):
                 self._record_dispatch(candidate, observed_at, "rejected", "stale")
                 return None
+            # A candidate may be optimal in the projected timeline while its
+            # target GPU is still running another invocation.  ``start_at``
+            # is a planning fact, not permission to enqueue work early.  Only
+            # migration candidates may proceed here: their asynchronous
+            # transfer can overlap the current GPU invocation and is committed
+            # before a fresh execution candidate is searched.
+            if not candidate.migration_count and not self.scheduler.candidate_ready_now(
+                candidate, now=observed_at
+            ):
+                self._record_dispatch(candidate, observed_at, "deferred", "gpu_busy")
+                return None
             if candidate.migration_count:
                 if not self._prepare_migration(candidate, now=observed_at):
                     self._record_dispatch(candidate, observed_at, "deferred", "migration_pending")
@@ -398,6 +487,13 @@ class MotivationRuntimeController:
                 # again after the ownership/version boundary.
                 self._record_dispatch(candidate, observed_at, "deferred", "migration_ready")
                 return None
+            assert candidate.gpu_id is not None
+            resolver = self._dispatch_owner_resolver
+            if resolver is not None:
+                actual_owners = tuple(resolver(session_id) for session_id in candidate.session_ids)
+                if any(owner != candidate.gpu_id for owner in actual_owners):
+                    self._record_dispatch(candidate, observed_at, "rejected", "owner_mismatch")
+                    return None
             jobs = tuple(
                 self.scheduler.session(session_id).ready_job(include_idle=True)
                 for session_id in candidate.session_ids
@@ -414,6 +510,7 @@ class MotivationRuntimeController:
             try:
                 self.dispatch(lease)
             except Exception:
+                self.scheduler.rollback_reservation(candidate, now=observed_at)
                 self._record_dispatch(candidate, observed_at, "error", "dispatch_exception")
                 raise
             self._record_dispatch(candidate, observed_at, "dispatched", "accepted")
@@ -512,6 +609,16 @@ class MotivationRuntimeController:
                 # callback as an uncaught RuntimeError.
                 if len(self.migration_manager.active()) >= self.migration_manager.max_concurrent:
                     return False
+                policy = self.migration_policy
+                if policy is not None:
+                    admission = policy.admit(
+                        session_id,
+                        state.owner_gpu,
+                        candidate.gpu_id,
+                        now=now,
+                    )
+                    if not admission.allowed:
+                        return False
                 request = SessionStateTransferRequest(
                     session_id=session_id,
                     source_gpu=state.owner_gpu,
@@ -542,6 +649,9 @@ class MotivationRuntimeController:
                     ready_at=request.estimated_ready_at,
                     now=now,
                 )
+                add_ready_callback = getattr(backend, "add_ready_callback", None)
+                if callable(add_ready_callback):
+                    add_ready_callback(lambda _done: self._notify_migration_wakeup())
                 add_done_callback = getattr(backend, "add_done_callback", None)
                 if callable(add_done_callback):
                     add_done_callback(lambda _done: self._notify_migration_wakeup())
@@ -558,6 +668,13 @@ class MotivationRuntimeController:
                 # next search can keep using the source GPU or retry later.
                 self.scheduler.clear_migration(session_id, now=now)
                 return False
+            if self.migration_policy is not None:
+                self.migration_policy.record_commit(
+                    session_id,
+                    record.request.source_gpu,
+                    record.request.target_gpu,
+                    committed_at=now,
+                )
             return False
         return True
 
@@ -575,6 +692,9 @@ class MotivationRuntimeController:
             for record in manager.active():
                 try:
                     current = manager.poll(record.request.session_id, now=now)
+                    if current.state == "failed":
+                        self._rollback_failed_migration(current, now=now)
+                        continue
                     if current.state != "ready":
                         continue
                     manager.commit(record.request.session_id, now=now)
@@ -583,6 +703,13 @@ class MotivationRuntimeController:
                         target_gpu=record.request.target_gpu,
                         now=now,
                     )
+                    if self.migration_policy is not None:
+                        self.migration_policy.record_commit(
+                            record.request.session_id,
+                            record.request.source_gpu,
+                            record.request.target_gpu,
+                            committed_at=now,
+                        )
                 except Exception:
                     # A stale/failed transfer is cleared so the next search
                     # can safely remain on the source GPU or retry later.
@@ -601,9 +728,31 @@ class MotivationRuntimeController:
             # next control/GPU event will retry the policy search as well.
             return
 
+    def _rollback_failed_migration(self, record: SessionStateTransferRecord, *, now: float) -> None:
+        """Reconcile policy ownership after a progressive residual-copy failure."""
+
+        session_id = record.request.session_id
+        try:
+            state = self.scheduler.session(session_id)
+        except KeyError:
+            return
+        if state.owner_gpu == record.request.target_gpu:
+            self.scheduler.commit_migration(
+                session_id,
+                target_gpu=record.request.source_gpu,
+                now=now,
+            )
+            if self.migration_policy is not None:
+                self.migration_policy.record_commit(
+                    session_id,
+                    record.request.target_gpu,
+                    record.request.source_gpu,
+                    committed_at=now,
+                )
+        self.scheduler.clear_migration(session_id, now=now)
+
     def _observed(self, now: float | None) -> float:
         observed = self._clock() if now is None else now
         if not math.isfinite(observed) or observed < 0:
             raise ValueError("observed time must be finite and non-negative")
         return observed
-

@@ -78,6 +78,33 @@ class TurboServePipelineRouter:
                 for pipeline_session_id, chunk in backend_items:
                     self._backends[worker_id].push_chunk(pipeline_session_id, chunk)
 
+    def owner_worker_id(self, pipeline_session_id: str) -> str | None:
+        """Return the physical route used for the next model dispatch."""
+        with self._lock:
+            return self._routes.get(pipeline_session_id)
+
+    def runtime_metrics(self, pipeline_session_id: str) -> dict[str, float | int | str] | None:
+        """Return metrics from the backend that currently owns a session."""
+        with self._lock:
+            worker_id = self._routes.get(pipeline_session_id)
+        if worker_id is None:
+            return None
+        metrics = getattr(self._backends[worker_id], "runtime_metrics", None)
+        if not callable(metrics):
+            return None
+        try:
+            value = metrics(pipeline_session_id)
+        except TypeError:
+            # Preserve compatibility with adapters that only expose aggregate
+            # metrics without a session argument.
+            try:
+                value = metrics()
+            except Exception:
+                return None
+        except Exception:
+            return None
+        return dict(value) if isinstance(value, dict) else None
+
     async def pull_chunks(self, pipeline_session_id: str) -> AsyncGenerator[dict, None]:
         """Continue on a new backend after the source generator closes during commit."""
         while True:
@@ -309,6 +336,12 @@ class TurboServeWorkerPipelineView:
 
     def close_session(self, pipeline_session_id: str) -> None:
         self._router.close_session(pipeline_session_id)
+
+    def runtime_metrics(self, pipeline_session_id: str | None = None) -> dict[str, float | int | str] | None:
+        """Expose aggregate or session-scoped metrics through the worker view."""
+        if pipeline_session_id is None:
+            return self._backend.runtime_metrics()
+        return self._router.runtime_metrics(pipeline_session_id)
 
     async def stream_task(self, config: dict[str, Any]) -> AsyncGenerator[dict, None]:
         async for chunk in self._backend.stream_task(config):

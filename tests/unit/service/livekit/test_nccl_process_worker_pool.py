@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import pytest
+
 from telefuser.service.livekit.config import LiveKitServeConfig
 from telefuser.service.livekit.nccl_process_worker_pool import (
     _MODEL_OUTPUT_PARENT_QUEUE_SIZE,
@@ -262,11 +264,29 @@ def test_init_nccl_uses_dedicated_parent_timeout() -> None:
         assert [(worker_id, command_type) for worker_id, command_type, _ in requests] == [
             ("worker-0", "nccl_init"),
             ("worker-1", "nccl_init"),
+            ("worker-0", "nccl_warmup_collective"),
+            ("worker-1", "nccl_warmup_collective"),
+            ("worker-0", "nccl_warmup_peer"),
+            ("worker-1", "nccl_warmup_peer"),
         ]
-        assert [kwargs["rank"] for _, _, kwargs in requests] == [0, 1]
-        assert all(kwargs["world_size"] == 2 for _, _, kwargs in requests)
+        init_requests = [kwargs for _, command_type, kwargs in requests if command_type == "nccl_init"]
+        assert [kwargs["rank"] for kwargs in init_requests] == [0, 1]
+        assert all(kwargs["world_size"] == 2 for kwargs in init_requests)
         assert all(kwargs["timeout"] == _NCCL_INIT_PARENT_TIMEOUT_SECONDS for _, _, kwargs in requests)
-        assert len({kwargs["init_method"] for _, _, kwargs in requests}) == 1
+        assert len({kwargs["init_method"] for kwargs in init_requests}) == 1
+        warmups = [kwargs for _, command_type, kwargs in requests if command_type == "nccl_warmup_peer"]
+        assert warmups == [
+            {
+                "peer_rank": 1,
+                "send_first": True,
+                "timeout": _NCCL_INIT_PARENT_TIMEOUT_SECONDS,
+            },
+            {
+                "peer_rank": 0,
+                "send_first": False,
+                "timeout": _NCCL_INIT_PARENT_TIMEOUT_SECONDS,
+            },
+        ]
         assert pool._nccl_ranks == {"worker-0": 0, "worker-1": 1}
 
     asyncio.run(run())
@@ -403,3 +423,450 @@ def test_migration_drain_waits_for_child_queue_and_publisher_frames(monkeypatch)
             {"in_flight": False, "output_queue_empty": True, "publisher_unsubmitted_frames": 0},
             {"in_flight": False, "output_queue_empty": True, "publisher_unsubmitted_frames": 0},
         ]
+
+
+
+def test_migration_records_transport_phase_diagnostics(monkeypatch) -> None:
+    async def run() -> None:
+        pool = _pool()
+        pool._active_workers = {"worker-0", "worker-1"}
+        pool._nccl_ranks = {"worker-0": 0, "worker-1": 1}
+        pool._pipeline_routes["pipeline-1"] = "worker-0"
+        pool._session_workers["pipeline-1"] = "worker-0"
+        pool._ownership.register("pipeline-1", "worker-0")
+        pool._send = lambda worker_id, command: None
+
+        async def fake_parent_drain(session_id: str, *, timeout: float) -> None:
+            assert session_id == "pipeline-1"
+            assert timeout > 0
+
+        async def fake_request(worker_id: str, request_type: str, **kwargs: object) -> dict[str, object]:
+            del worker_id, kwargs
+            if request_type == "model_output_drain_status":
+                return {
+                    "result": {
+                        "in_flight": False,
+                        "output_queue_empty": True,
+                        "publisher_unsubmitted_frames": 0,
+                    }
+                }
+            if request_type == "nccl_export":
+                return {"result": {"tensor_manifest": [], "state_bytes": 128}}
+            return {"result": True}
+
+        monkeypatch.setattr(pool, "_wait_for_model_output_drain", fake_parent_drain)
+        monkeypatch.setattr(pool, "_request", fake_request)
+
+        ownership = await pool.migrate_session("pipeline-1", "worker-1")
+
+        assert ownership.worker_id == "worker-1"
+        diagnostics = pool.turboserve_snapshot()["migration_diagnostics"]
+        assert diagnostics["attempts_total"] == 1
+        assert diagnostics["success_total"] == 1
+        assert diagnostics["failure_total"] == 0
+        assert diagnostics["active"] == 0
+        assert diagnostics["last"]["outcome"] == "success"
+        assert diagnostics["last"]["state_bytes"] == 128
+        assert all(diagnostics["phase_timings"][phase]["success"] == 1 for phase in (
+            "drain", "pause", "export", "prepare_recv", "transfer", "commit_source", "route_commit"
+        ))
+
+    asyncio.run(run())
+
+
+def test_migration_failure_records_failed_phase_and_error_kind(monkeypatch) -> None:
+    async def run() -> None:
+        pool = _pool()
+        pool._active_workers = {"worker-0", "worker-1"}
+        pool._nccl_ranks = {"worker-0": 0, "worker-1": 1}
+        pool._pipeline_routes["pipeline-1"] = "worker-0"
+        pool._session_workers["pipeline-1"] = "worker-0"
+        pool._ownership.register("pipeline-1", "worker-0")
+        pool._send = lambda worker_id, command: None
+
+        async def fake_parent_drain(session_id: str, *, timeout: float) -> None:
+            del session_id, timeout
+
+        async def fake_request(worker_id: str, request_type: str, **kwargs: object) -> dict[str, object]:
+            del worker_id, kwargs
+            if request_type == "model_output_drain_status":
+                return {
+                    "result": {
+                        "in_flight": False,
+                        "output_queue_empty": True,
+                        "publisher_unsubmitted_frames": 0,
+                    }
+                }
+            if request_type == "nccl_export":
+                return {"result": {"tensor_manifest": []}}
+            if request_type == "nccl_send":
+                raise RuntimeError("Worker process worker-0 is not alive")
+            return {"result": True}
+
+        monkeypatch.setattr(pool, "_wait_for_model_output_drain", fake_parent_drain)
+        monkeypatch.setattr(pool, "_request", fake_request)
+
+        with pytest.raises(RuntimeError, match="Worker process"):
+            await pool.migrate_session("pipeline-1", "worker-1")
+
+        diagnostics = pool.turboserve_snapshot()["migration_diagnostics"]
+        assert diagnostics["attempts_total"] == 1
+        assert diagnostics["success_total"] == 0
+        assert diagnostics["failure_total"] == 1
+        assert diagnostics["active"] == 0
+        assert diagnostics["last_failure"]["failed_phase"] == "transfer"
+        assert diagnostics["last_failure"]["error_kind"] == "worker_unavailable"
+        assert diagnostics["error_counts"] == {"worker_unavailable": 1}
+        assert diagnostics["phase_timings"]["transfer"]["failures"] == 1
+
+    asyncio.run(run())
+
+
+def test_source_cleanup_failure_preserves_committed_target_owner(monkeypatch) -> None:
+    async def run() -> None:
+        pool = _pool()
+        pool._active_workers = {"worker-0", "worker-1"}
+        pool._nccl_ranks = {"worker-0": 0, "worker-1": 1}
+        pool._pipeline_routes["pipeline-1"] = "worker-0"
+        pool._session_workers["pipeline-1"] = "worker-0"
+        pool._ownership.register("pipeline-1", "worker-0")
+        pool._send = lambda worker_id, command: None
+        requests: list[str] = []
+
+        async def fake_parent_drain(session_id: str, *, timeout: float) -> None:
+            del session_id, timeout
+
+        async def fake_request(worker_id: str, request_type: str, **kwargs: object) -> dict[str, object]:
+            del worker_id, kwargs
+            requests.append(request_type)
+            if request_type == "model_output_drain_status":
+                return {
+                    "result": {
+                        "in_flight": False,
+                        "output_queue_empty": True,
+                        "publisher_unsubmitted_frames": 0,
+                    }
+                }
+            if request_type == "nccl_export":
+                return {"result": {"tensor_manifest": [], "state_bytes": 128}}
+            if request_type == "nccl_commit_source":
+                raise RuntimeError("source cleanup unavailable")
+            return {"result": {"groups": []}}
+
+        monkeypatch.setattr(pool, "_wait_for_model_output_drain", fake_parent_drain)
+        monkeypatch.setattr(pool, "_request", fake_request)
+
+        ownership = await pool.migrate_session("pipeline-1", "worker-1")
+
+        assert ownership.worker_id == "worker-1"
+        assert pool._ownership.owner("pipeline-1").worker_id == "worker-1"
+        assert pool._pipeline_routes["pipeline-1"] == "worker-1"
+        assert "nccl_discard" not in requests
+        assert "nccl_abort_source" not in requests
+        snapshot = pool.turboserve_snapshot()
+        assert snapshot["migration_cleanup_failures"] == 1
+        assert snapshot["migration_diagnostics"]["success_total"] == 1
+        assert snapshot["migration_diagnostics"]["phase_timings"]["route_commit"]["success"] == 1
+        assert snapshot["migration_diagnostics"]["phase_timings"]["commit_source"]["failures"] == 1
+
+    asyncio.run(run())
+
+
+def test_migration_pause_failure_resumes_source(monkeypatch) -> None:
+    async def run() -> None:
+        pool = _pool()
+        pool._active_workers = {"worker-0", "worker-1"}
+        pool._nccl_ranks = {"worker-0": 0, "worker-1": 1}
+        pool._pipeline_routes["pipeline-1"] = "worker-0"
+        pool._session_workers["pipeline-1"] = "worker-0"
+        pool._ownership.register("pipeline-1", "worker-0")
+        sent: list[tuple[str, dict[str, object]]] = []
+        requests: list[tuple[str, str]] = []
+        pool._send = lambda worker_id, command: sent.append((worker_id, command))
+        paused = False
+
+        async def fake_parent_drain(session_id: str, *, timeout: float) -> None:
+            del session_id, timeout
+
+        async def fake_request(worker_id: str, request_type: str, **kwargs: object) -> dict[str, object]:
+            nonlocal paused
+            requests.append((worker_id, request_type))
+            del worker_id, kwargs
+            if request_type == "model_output_drain_status":
+                if paused:
+                    raise RuntimeError("status barrier unavailable")
+                return {
+                    "result": {
+                        "in_flight": False,
+                        "output_queue_empty": True,
+                        "publisher_unsubmitted_frames": 0,
+                    }
+                }
+            if request_type == "model_output_pause":
+                paused = True
+            return {"result": True}
+
+        monkeypatch.setattr(pool, "_wait_for_model_output_drain", fake_parent_drain)
+        monkeypatch.setattr(pool, "_request", fake_request)
+
+        with pytest.raises(RuntimeError, match="status barrier unavailable"):
+            await pool.migrate_session("pipeline-1", "worker-1")
+
+        assert ("worker-0", "model_output_resume") in requests
+        diagnostics = pool.turboserve_snapshot()["migration_diagnostics"]
+        assert diagnostics["failure_total"] == 1
+        assert diagnostics["last_failure"]["failed_phase"] == "pause"
+
+    asyncio.run(run())
+
+
+def test_nccl_start_failure_event_records_worker_exit() -> None:
+    async def run() -> None:
+        pool = _pool()
+        startup = asyncio.get_running_loop().create_future()
+        pool._startup["worker-1"] = startup
+
+        NCCLProcessLiveKitWorkerPool._dispatch_event(
+            pool,
+            {
+                "type": "worker_start_failed",
+                "worker_id": "worker-1",
+                "error": "RuntimeError: CUDA out of memory",
+            },
+        )
+
+        snapshot = pool.turboserve_snapshot()["migration_diagnostics"]
+        assert snapshot["worker_exits_total"] == 1
+        assert snapshot["worker_exits_by_code"] == {"unknown": 1}
+        assert snapshot["worker_exit_error_counts"] == {"oom": 1}
+        assert snapshot["last_worker_exit"]["worker_id"] == "worker-1"
+        assert snapshot["last_worker_exit"]["error_kind"] == "oom"
+        assert startup.done()
+        startup_error = startup.exception()
+        assert isinstance(startup_error, RuntimeError)
+        assert "CUDA out of memory" in str(startup_error)
+
+    asyncio.run(run())
+
+def test_migration_cancellation_rolls_back_state(monkeypatch) -> None:
+    async def run() -> None:
+        pool = _pool()
+        pool._active_workers = {"worker-0", "worker-1"}
+        pool._nccl_ranks = {"worker-0": 0, "worker-1": 1}
+        pool._pipeline_routes["pipeline-1"] = "worker-0"
+        pool._session_workers["pipeline-1"] = "worker-0"
+        pool._ownership.register("pipeline-1", "worker-0")
+        requests: list[str] = []
+        pool._send = lambda worker_id, command: None
+
+        async def fake_parent_drain(session_id: str, *, timeout: float) -> None:
+            del session_id, timeout
+
+        async def fake_request(worker_id: str, request_type: str, **kwargs: object) -> dict[str, object]:
+            del worker_id, kwargs
+            requests.append(request_type)
+            if request_type == "model_output_drain_status":
+                return {
+                    "result": {
+                        "in_flight": False,
+                        "output_queue_empty": True,
+                        "publisher_unsubmitted_frames": 0,
+                    }
+                }
+            if request_type == "nccl_export":
+                return {"result": {"tensor_manifest": [], "state_bytes": 64}}
+            if request_type == "nccl_send":
+                raise asyncio.CancelledError()
+            return {"result": True}
+
+        monkeypatch.setattr(pool, "_wait_for_model_output_drain", fake_parent_drain)
+        monkeypatch.setattr(pool, "_request", fake_request)
+
+        with pytest.raises(asyncio.CancelledError):
+            await pool.migrate_session("pipeline-1", "worker-1")
+
+        assert "nccl_discard" in requests
+        assert "nccl_abort_source" in requests
+        assert "model_output_resume" in requests
+        assert "pipeline-1" not in pool._migrating_controls
+        assert pool._ownership.owner("pipeline-1").worker_id == "worker-0"
+        diagnostics = pool.turboserve_snapshot()["migration_diagnostics"]
+        assert diagnostics["attempts_total"] == 1
+        assert diagnostics["success_total"] == 0
+        assert diagnostics["failure_total"] == 0
+        assert diagnostics["aborted_total"] == 1
+        assert diagnostics["active"] == 0
+        assert diagnostics["last"]["outcome"] == "aborted"
+
+    asyncio.run(run())
+
+
+def test_progressive_migration_routes_compute_before_residual_copy_finishes(monkeypatch) -> None:
+    async def run() -> None:
+        pool = _pool()
+        pool._active_workers = {"worker-0", "worker-1"}
+        pool._nccl_ranks = {"worker-0": 0, "worker-1": 1}
+        pool._pipeline_routes["pipeline-1"] = "worker-0"
+        pool._session_workers["pipeline-1"] = "worker-0"
+        pool._ownership.register("pipeline-1", "worker-0")
+        pool._model_outputs["pipeline-1"] = asyncio.Queue(maxsize=1)
+        sent: list[tuple[str, dict[str, object]]] = []
+        pool._send = lambda worker_id, command: sent.append((worker_id, command))
+        transfer_started = asyncio.Event()
+        transfer_release = asyncio.Event()
+        active_transfer_requests: set[str] = set()
+
+        async def fake_parent_drain(session_id: str, *, timeout: float) -> None:
+            del session_id, timeout
+
+        async def fake_request(worker_id: str, request_type: str, **kwargs: object) -> dict[str, object]:
+            del worker_id, kwargs
+            if request_type == "model_output_drain_status":
+                return {
+                    "result": {
+                        "in_flight": False,
+                        "output_queue_empty": True,
+                        "publisher_unsubmitted_frames": 0,
+                    }
+                }
+            if request_type == "nccl_export":
+                return {"result": {"tensor_manifest": [], "state_bytes": 128}}
+            if request_type in {"nccl_send", "nccl_recv"}:
+                active_transfer_requests.add(request_type)
+                if len(active_transfer_requests) == 2:
+                    transfer_started.set()
+                await transfer_release.wait()
+                return {"result": {"groups": []}}
+            return {"result": True}
+
+        monkeypatch.setattr(pool, "_wait_for_model_output_drain", fake_parent_drain)
+        monkeypatch.setattr(pool, "_request", fake_request)
+        compute_ready = asyncio.Event()
+        migration = asyncio.create_task(
+            pool.migrate_session("pipeline-1", "worker-1", on_compute_ready=compute_ready.set)
+        )
+        await asyncio.wait_for(transfer_started.wait(), timeout=1.0)
+        transfer_id = next(iter(pool._migration_ready_waiters))
+        pool._dispatch_event(
+            {
+                "type": "nccl_first_layer_ready",
+                "worker_id": "worker-1",
+                "transfer_id": transfer_id,
+                "session_id": "pipeline-1",
+            }
+        )
+        await asyncio.wait_for(compute_ready.wait(), timeout=1.0)
+
+        assert not migration.done()
+        assert pool._pipeline_routes["pipeline-1"] == "worker-1"
+        assert pool._ownership.owner("pipeline-1").worker_id == "worker-0"
+        pool.push_model_chunk("pipeline-1", {"type": "action", "action": ["W"]})
+        assert sent[-1][0] == "worker-1"
+        pool._dispatch_event(
+            {
+                "type": "model_output",
+                "worker_id": "worker-1",
+                "session_id": "pipeline-1",
+                "payload": {"type": "chunk", "frames": [1]},
+            }
+        )
+        assert pool._model_outputs["pipeline-1"].empty()
+
+        transfer_release.set()
+        ownership = await migration
+
+        assert ownership.worker_id == "worker-1"
+        assert pool._ownership.owner("pipeline-1").worker_id == "worker-1"
+        queued = pool._model_outputs["pipeline-1"].get_nowait()
+        assert queued.payload["frames"] == [1]
+        assert "pipeline-1" not in pool._provisional_migration_controls
+        assert "pipeline-1" not in pool._provisional_model_events
+
+    asyncio.run(run())
+
+
+def test_progressive_migration_failure_replays_controls_and_discards_output(monkeypatch) -> None:
+    async def run() -> None:
+        pool = _pool()
+        pool._active_workers = {"worker-0", "worker-1"}
+        pool._nccl_ranks = {"worker-0": 0, "worker-1": 1}
+        pool._pipeline_routes["pipeline-1"] = "worker-0"
+        pool._session_workers["pipeline-1"] = "worker-0"
+        pool._ownership.register("pipeline-1", "worker-0")
+        pool._model_outputs["pipeline-1"] = asyncio.Queue(maxsize=1)
+        sent: list[tuple[str, dict[str, object]]] = []
+        pool._send = lambda worker_id, command: sent.append((worker_id, command))
+        transfer_started = asyncio.Event()
+        transfer_release = asyncio.Event()
+        active_transfer_requests: set[str] = set()
+
+        async def fake_parent_drain(session_id: str, *, timeout: float) -> None:
+            del session_id, timeout
+
+        async def fake_request(worker_id: str, request_type: str, **kwargs: object) -> dict[str, object]:
+            del worker_id, kwargs
+            if request_type == "model_output_drain_status":
+                return {
+                    "result": {
+                        "in_flight": False,
+                        "output_queue_empty": True,
+                        "publisher_unsubmitted_frames": 0,
+                    }
+                }
+            if request_type == "nccl_export":
+                return {"result": {"tensor_manifest": [], "state_bytes": 128}}
+            if request_type in {"nccl_send", "nccl_recv"}:
+                active_transfer_requests.add(request_type)
+                if len(active_transfer_requests) == 2:
+                    transfer_started.set()
+                await transfer_release.wait()
+                if request_type == "nccl_send":
+                    raise RuntimeError("late NCCL failure")
+                return {"result": {"groups": []}}
+            return {"result": True}
+
+        monkeypatch.setattr(pool, "_wait_for_model_output_drain", fake_parent_drain)
+        monkeypatch.setattr(pool, "_request", fake_request)
+        compute_ready = asyncio.Event()
+        migration = asyncio.create_task(
+            pool.migrate_session("pipeline-1", "worker-1", on_compute_ready=compute_ready.set)
+        )
+        await asyncio.wait_for(transfer_started.wait(), timeout=1.0)
+        transfer_id = next(iter(pool._migration_ready_waiters))
+        pool._dispatch_event(
+            {
+                "type": "nccl_first_layer_ready",
+                "worker_id": "worker-1",
+                "transfer_id": transfer_id,
+                "session_id": "pipeline-1",
+            }
+        )
+        await asyncio.wait_for(compute_ready.wait(), timeout=1.0)
+        control = {"type": "action", "action": ["D"]}
+        pool.push_model_chunk("pipeline-1", control)
+        pool._dispatch_event(
+            {
+                "type": "model_output",
+                "worker_id": "worker-1",
+                "session_id": "pipeline-1",
+                "payload": {"type": "chunk", "frames": [2]},
+            }
+        )
+
+        transfer_release.set()
+        with pytest.raises(RuntimeError, match="late NCCL failure"):
+            await migration
+
+        assert pool._pipeline_routes["pipeline-1"] == "worker-0"
+        assert pool._ownership.owner("pipeline-1").worker_id == "worker-0"
+        assert pool._model_outputs["pipeline-1"].empty()
+        replayed = [
+            command
+            for worker_id, command in sent
+            if worker_id == "worker-0" and command.get("type") == "model_push"
+        ]
+        assert replayed[-1]["chunk"] == control
+        assert "pipeline-1" not in pool._provisional_migration_controls
+        assert "pipeline-1" not in pool._provisional_model_events
+
+    asyncio.run(run())

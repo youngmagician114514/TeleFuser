@@ -68,6 +68,49 @@ def test_action_arriving_while_running_waits_for_next_slot() -> None:
     assert scheduler.session("s").pending_action == next_job
 
 
+def test_pending_action_waits_out_in_flight_then_becomes_runnable() -> None:
+    scheduler = _scheduler()
+    scheduler.register_session("s", owner_gpu="gpu-0", now=0.0)
+    first, _ = scheduler.submit_action("s", ["W"], now=0.0)
+    assert first is not None
+    running = scheduler.find_best(now=0.0, include_wait=False)
+    assert running is not None
+    scheduler.reserve(running, now=0.0)
+
+    replacement, _ = scheduler.submit_action("s", ["J"], now=0.1, release=True)
+    assert replacement is not None
+
+    assert scheduler.find_best(now=0.1, include_wait=False) is None
+    assert scheduler.session("s").pending_action == replacement
+
+    completed = scheduler.complete(running, completed_at=0.4)
+    assert completed == (first,)
+    resumed = scheduler.find_best(now=0.4, include_wait=False)
+    assert resumed is not None
+    assert resumed.session_ids == ("s",)
+    assert resumed.job_ids == (replacement.job_id,)
+
+
+def test_in_flight_session_does_not_block_another_ready_session() -> None:
+    scheduler = _scheduler()
+    scheduler.register_session("running", owner_gpu="gpu-0", now=0.0)
+    scheduler.register_session("ready", owner_gpu="gpu-1", now=0.0)
+    first, _ = scheduler.submit_action("running", ["W"], now=0.0)
+    assert first is not None
+    running = scheduler.find_best(now=0.0, include_wait=False)
+    assert running is not None
+    scheduler.reserve(running, now=0.0)
+
+    replacement, _ = scheduler.submit_action("running", ["J"], now=0.1, release=True)
+    other, _ = scheduler.submit_action("ready", ["D"], now=0.1, release=True)
+    assert replacement is not None and other is not None
+
+    candidate = scheduler.find_best(now=0.1, include_wait=False)
+    assert candidate is not None
+    assert candidate.session_ids == ("ready",)
+    assert candidate.job_ids == (other.job_id,)
+
+
 def test_idle_video_is_consumption_gated_and_does_not_get_overwritten() -> None:
     scheduler = _scheduler()
     scheduler.register_session("s", owner_gpu="gpu-0", now=0.0)
@@ -140,6 +183,49 @@ def test_candidate_is_rejected_after_pending_job_version_changes() -> None:
     assert scheduler.validate(candidate, now=0.1) is False
     with pytest.raises(RuntimeError, match="stale"):
         scheduler.reserve(candidate, now=0.1)
+
+
+def test_busy_gpu_candidate_cannot_be_reserved_before_predicted_start() -> None:
+    scheduler = _scheduler()
+    scheduler.register_session("s", owner_gpu="gpu-0", now=0.0)
+    scheduler.submit_action("s", ["W"], now=0.0)
+    scheduler.update_gpu("gpu-0", free_at=2.0, now=0.0)
+    busy_gpu = scheduler.gpus()[0]
+
+    candidate = scheduler.find_best(now=0.0, gpu_states=(busy_gpu,), include_wait=False)
+
+    assert candidate is not None
+    assert candidate.start_at == pytest.approx(2.0)
+    assert scheduler.validate(candidate, now=0.0) is True
+    with pytest.raises(RuntimeError, match="not ready"):
+        scheduler.reserve(candidate, now=0.0)
+    assert scheduler.session("s").pending_action is not None
+    assert scheduler.session("s").in_flight is None
+
+    scheduler.reserve(candidate, now=2.0)
+    assert scheduler.session("s").in_flight is not None
+
+
+def test_internal_gpu_timeline_blocks_stale_external_snapshot() -> None:
+    scheduler = _scheduler()
+    scheduler.register_session("s", owner_gpu="gpu-0", now=0.0)
+    scheduler.submit_action("s", ["W"], now=0.0)
+    scheduler.update_gpu("gpu-0", free_at=2.0, now=0.0)
+    internal_gpu = scheduler.gpus()[0]
+    stale_snapshot = GpuSchedulingState(
+        "gpu-0", free_at=0.0, memory_free_gb=80.0, version=internal_gpu.version
+    )
+
+    candidate = scheduler.find_best(now=0.0, gpu_states=(stale_snapshot,), include_wait=False)
+
+    assert candidate is not None
+    assert candidate.start_at == pytest.approx(0.0)
+    assert scheduler.validate(candidate, now=0.0) is True
+    assert scheduler.candidate_ready_now(candidate, now=0.0) is False
+    with pytest.raises(RuntimeError, match="not ready"):
+        scheduler.reserve(candidate, now=0.0)
+    assert scheduler.session("s").pending_action is not None
+    assert scheduler.session("s").in_flight is None
 
 
 def test_departure_keeps_reserved_job_until_completion() -> None:

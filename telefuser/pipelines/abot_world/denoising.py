@@ -893,6 +893,7 @@ class ABotWorldDenoisingStage(BaseStage):
         generator: torch.Generator,
         scheduler: FlowMatchScheduler,
         timestep_positions: Sequence[int] | None = None,
+        layer_readiness: Any | None = None,
     ) -> torch.Tensor:
         """Use a graph replay for an eligible retained-session continuation.
 
@@ -901,6 +902,21 @@ class ABotWorldDenoisingStage(BaseStage):
         therefore an unsupported PyTorch or attention backend safely falls
         back to the existing eager implementation.
         """
+        if layer_readiness is not None:
+            self._set_cuda_graph_last_metrics(eligible=False)
+            return self._denoise_block(
+                latent,
+                prompt_emb,
+                action_context,
+                None,
+                self_cache,
+                cross_cache,
+                current_start,
+                generator,
+                scheduler,
+                timestep_positions=timestep_positions,
+                layer_readiness=layer_readiness,
+            )
         if timestep_positions is not None:
             self._set_cuda_graph_last_metrics(eligible=False)
             return self._denoise_block(
@@ -1038,6 +1054,7 @@ class ABotWorldDenoisingStage(BaseStage):
         scheduler: FlowMatchScheduler,
         *,
         timestep_positions: Sequence[int] | None = None,
+        layer_readiness: Any | None = None,
     ) -> torch.Tensor:
         current = latent
         batch, _, frames, height, width = current.shape
@@ -1070,6 +1087,7 @@ class ABotWorldDenoisingStage(BaseStage):
                     kv_cache=self_cache,
                     crossattn_cache=cross_cache,
                     current_start=current_start * frame_tokens,
+                    layer_readiness=layer_readiness,
                 )
             x0 = self._x0_prediction(flow_prediction, current, timestep, scheduler)
             if index < len(timesteps) - 1:
@@ -1104,6 +1122,7 @@ class ABotWorldDenoisingStage(BaseStage):
             kv_cache=self_cache,
             crossattn_cache=cross_cache,
             current_start=current_start * frame_tokens,
+            layer_readiness=layer_readiness,
         )
         return current
 

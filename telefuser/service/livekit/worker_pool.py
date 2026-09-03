@@ -85,13 +85,30 @@ class InProcessLiveKitWorkerPool:
 
     def dispatch_batch(self, lease: Any, payloads: Sequence[tuple[str, dict]]) -> None:
         """Dispatch one policy-selected batch through its owning workers."""
-        del lease
+        expected_worker_id = getattr(getattr(lease, "candidate", None), "gpu_id", None)
+        routed_items: list[tuple[str, dict]] = []
         grouped: dict[str, list[tuple[str, dict]]] = {}
         for session_id, chunk in payloads:
-            worker_id = self._task_workers.get(session_id)
-            if worker_id is None:
+            transport_worker_id = self._task_workers.get(session_id)
+            if transport_worker_id is None:
                 raise RuntimeError(f"Session {session_id!r} is not assigned to an active worker")
-            grouped.setdefault(worker_id, []).append((session_id, dict(chunk)))
+            worker = self._workers[transport_worker_id]
+            pipeline_session_id = worker.pipeline_session_id
+            actual_worker_id = self.dispatch_owner(session_id)
+            if pipeline_session_id is None or actual_worker_id is None:
+                raise RuntimeError(f"Session {session_id!r} has no active model route")
+            if expected_worker_id is not None and actual_worker_id != expected_worker_id:
+                raise RuntimeError(
+                    f"Motivation owner mismatch for {session_id!r}: "
+                    f"candidate={expected_worker_id!r} actual={actual_worker_id!r}"
+                )
+            if self.router is not None:
+                routed_items.append((pipeline_session_id, dict(chunk)))
+            else:
+                grouped.setdefault(transport_worker_id, []).append((session_id, dict(chunk)))
+        if self.router is not None:
+            self.router.push_batch(routed_items)
+            return
         for worker_id, items in grouped.items():
             worker = self._workers[worker_id]
             dispatch_batch = getattr(worker, "dispatch_batch", None)
@@ -103,6 +120,19 @@ class InProcessLiveKitWorkerPool:
                 raise RuntimeError(f"Worker {worker_id!r} does not support policy dispatch")
             for session_id, chunk in items:
                 dispatch_controls(session_id, chunk)
+
+    def dispatch_owner(self, session_id: str) -> str | None:
+        """Resolve a LiveKit session to its current model-state owner."""
+        transport_worker_id = self._task_workers.get(session_id)
+        if transport_worker_id is None:
+            return None
+        worker = self._workers[transport_worker_id]
+        pipeline_session_id = worker.pipeline_session_id
+        if pipeline_session_id is None:
+            return None
+        if self.router is None:
+            return transport_worker_id
+        return self.router.owner_worker_id(pipeline_session_id)
 
     async def stop_session(self, session_id: str) -> None:
         """Request an active session to stop and wait for cleanup."""

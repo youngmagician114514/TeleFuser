@@ -2,10 +2,19 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from telefuser.service.livekit.config import LiveKitServeConfig
+from telefuser.service.livekit.motivation_controller import MotivationRuntimeController
+from telefuser.service.livekit.motivation_scheduler import (
+    GpuSchedulingState,
+    MotivationProfile,
+    MotivationScheduler,
+    StaticMotivationProfileTable,
+)
 from telefuser.service.livekit.runtime import LiveKitServeRuntime
 from telefuser.service.livekit.schemas import SessionCreateRequest
-from telefuser.service.livekit.turboserve import TurboServeOwnership
+from telefuser.service.livekit.turboserve import TurboServeOwnership, TurboServeSchedulingDecision
 
 
 class FakeTokenService:
@@ -65,6 +74,31 @@ class MigratingWorkerPool(FakeWorkerPool):
                 "worker-1": {"active_sessions": 0, "mean_chunk_seconds": 0.5, "p95_chunk_seconds": 1.0},
             },
         }
+
+
+class ProgressiveMigratingWorkerPool(MigratingWorkerPool):
+    progressive_migration_supported = True
+
+    def __init__(self, *, fail_residual: bool = False) -> None:
+        super().__init__()
+        self.fail_residual = fail_residual
+        self.compute_ready = asyncio.Event()
+        self.release_residual = asyncio.Event()
+
+    async def migrate_session(
+        self,
+        pipeline_session_id: str,
+        target_worker_id: str,
+        *,
+        on_compute_ready,
+    ) -> TurboServeOwnership:
+        self.migrations.append((pipeline_session_id, target_worker_id))
+        on_compute_ready()
+        self.compute_ready.set()
+        await self.release_residual.wait()
+        if self.fail_residual:
+            raise RuntimeError("late residual failure")
+        return TurboServeOwnership(pipeline_session_id, target_worker_id, len(self.migrations) + 1)
 
 
 def test_runtime_autoscaling_scales_out_and_drains_capacity() -> None:
@@ -202,6 +236,43 @@ def test_runtime_migration_updates_registry_and_admission_owner() -> None:
     asyncio.run(_run())
 
 
+def test_runtime_publishes_progressive_compute_owner_and_rolls_back_late_failure() -> None:
+    async def _run() -> None:
+        config = LiveKitServeConfig(
+            livekit_url="wss://livekit.example",
+            livekit_api_key="key",
+            livekit_api_secret="secret",
+            num_workers=2,
+            worker_gpu_map="0;1",
+            max_sessions_per_worker=2,
+        )
+        pool = ProgressiveMigratingWorkerPool(fail_residual=True)
+        runtime = LiveKitServeRuntime(
+            config=config,
+            pipeline_file="pipeline.py",
+            token_service=FakeTokenService(),
+            worker_pool=pool,
+        )
+        created = runtime.create_session(SessionCreateRequest(identity="controller-1"))
+        runtime.on_pipeline_session(created.record.session_id, "pipeline-1")
+
+        migration = asyncio.create_task(runtime.migrate_session(created.record.session_id, "worker-1"))
+        await asyncio.wait_for(pool.compute_ready.wait(), timeout=1.0)
+
+        assert not migration.done()
+        assert runtime.registry.require(created.record.session_id).worker_id == "worker-1"
+        pool.release_residual.set()
+        with pytest.raises(RuntimeError, match="late residual failure"):
+            await migration
+
+        assert runtime.registry.require(created.record.session_id).worker_id == "worker-0"
+        workers = {worker.worker_id: worker for worker in runtime.scheduler.workers()}
+        assert workers["worker-0"].session_ids == [created.record.session_id]
+        assert workers["worker-1"].session_ids == []
+
+    asyncio.run(_run())
+
+
 def test_runtime_rebalances_one_profitable_migration_from_measured_load() -> None:
     async def _run() -> None:
         config = LiveKitServeConfig(
@@ -234,6 +305,98 @@ def test_runtime_rebalances_one_profitable_migration_from_measured_load() -> Non
 
     asyncio.run(_run())
 
+
+def _make_runtime_motivation_controller() -> MotivationRuntimeController:
+    scheduler = MotivationScheduler(
+        StaticMotivationProfileTable([MotivationProfile(1, "high", 0.4, 0.68, 20.0)])
+    )
+    scheduler.add_gpu(GpuSchedulingState("worker-0", memory_free_gb=80.0))
+    scheduler.add_gpu(GpuSchedulingState("worker-1", memory_free_gb=80.0))
+    return MotivationRuntimeController(scheduler, dispatch=lambda _lease: None)
+
+
+def test_runtime_gives_motivation_exclusive_placement_control() -> None:
+    async def _run() -> None:
+        config = LiveKitServeConfig(
+            livekit_url="wss://livekit.example",
+            livekit_api_key="key",
+            livekit_api_secret="secret",
+            num_workers=2,
+            worker_gpu_map="0;1",
+            max_sessions_per_worker=3,
+            turboserve_rebalance_enabled=True,
+        )
+        pool = MigratingWorkerPool()
+        runtime = LiveKitServeRuntime(
+            config=config,
+            pipeline_file="pipeline.py",
+            token_service=FakeTokenService(),
+            worker_pool=pool,
+            motivation_controller=_make_runtime_motivation_controller(),
+        )
+
+        assert runtime._motivation_owns_placement is True
+        assert runtime._background_rebalance_enabled is False
+        assert runtime._cluster_scheduler.config.enable_migration is False
+
+        first = runtime.create_session(SessionCreateRequest(identity="controller-1"))
+        runtime.on_pipeline_session(first.record.session_id, "pipeline-1")
+        second = runtime.create_session(SessionCreateRequest(identity="controller-2"))
+        runtime.on_pipeline_session(second.record.session_id, "pipeline-2")
+        runtime.scheduler.reassign_session(second.record.session_id, "worker-0")
+        runtime.registry.assign_worker(second.record.session_id, "worker-0")
+
+        await runtime._rebalance_once()
+
+        assert pool.migrations == []
+        rebalance = runtime.metadata()["turboserve_rebalance"]
+        assert rebalance["enabled"] is False
+        assert rebalance["configured_enabled"] is True
+        assert rebalance["owner"] == "motivation"
+
+        await runtime.start()
+        assert runtime._autoscale_task is None
+        await runtime.aclose()
+
+    asyncio.run(_run())
+
+def test_runtime_does_not_apply_cluster_placement_in_motivation_mode() -> None:
+    async def _run() -> None:
+        config = LiveKitServeConfig(
+            livekit_url="wss://livekit.example",
+            livekit_api_key="key",
+            livekit_api_secret="secret",
+            num_workers=2,
+            worker_gpu_map="0;1",
+            max_sessions_per_worker=2,
+            queue_size=1,
+            autoscaling_enabled=True,
+            autoscaling_min_workers=1,
+        )
+        pool = MigratingWorkerPool()
+        pool.active_workers = 2
+        runtime = LiveKitServeRuntime(
+            config=config,
+            pipeline_file="pipeline.py",
+            token_service=FakeTokenService(),
+            worker_pool=pool,
+            motivation_controller=_make_runtime_motivation_controller(),
+        )
+        result = runtime.create_session(SessionCreateRequest(identity="controller-1"))
+        runtime.on_pipeline_session(result.record.session_id, "pipeline-1")
+        forced = TurboServeSchedulingDecision(
+            worker_budget=2,
+            placement={result.record.session_id: "worker-1"},
+            metadata={"autoscale_action": "hold"},
+        )
+        runtime._cluster_scheduler.decide = lambda _snapshot: forced
+
+        await runtime._turboserve_control_once()
+
+        assert pool.migrations == []
+        await runtime.aclose()
+
+    asyncio.run(_run())
 
 def test_runtime_reports_livekit_connected_only_after_room_connection() -> None:
     config = LiveKitServeConfig(livekit_url="wss://livekit.example", livekit_api_key="key", livekit_api_secret="secret")

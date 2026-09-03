@@ -7,7 +7,7 @@ import pytest
 
 from telefuser.service.core.stream_pipeline_service import STREAM_MODE_BIDIRECTIONAL, STREAM_MODE_SERVER_PUSH
 from telefuser.service.livekit.config import LiveKitServeConfig
-from telefuser.service.livekit.multi_session_worker import MultiSessionLiveKitWorker
+from telefuser.service.livekit.multi_session_worker import MultiSessionLiveKitWorker, _SessionWorkerEventSink
 from telefuser.service.livekit.session_registry import SessionRecord
 
 
@@ -107,6 +107,7 @@ class _RoomClient:
 class _EventSink:
     def __init__(self) -> None:
         self.worker_statuses: list[str] = []
+        self.model_outputs: list[tuple[str, str, dict, dict | None]] = []
 
     def on_worker_status(self, worker_id: str, status: str) -> None:
         del worker_id
@@ -119,6 +120,18 @@ class _EventSink:
         return None
 
     def on_session_finished(self, worker_id: str, session_id: str, error: str | None = None) -> None:
+        return None
+
+    def on_model_output(
+        self,
+        worker_id: str,
+        session_id: str,
+        payload: dict,
+        runtime_metrics: dict | None = None,
+        session_runtime_metrics: dict | None = None,
+    ) -> None:
+        del runtime_metrics
+        self.model_outputs.append((worker_id, session_id, payload, session_runtime_metrics))
         return None
 
 
@@ -240,6 +253,29 @@ def test_multi_session_worker_rejects_server_push_capacity_above_one() -> None:
         assert adapter.closed_service is True
 
     asyncio.run(_run())
+
+
+def test_multi_session_worker_forwards_session_runtime_metrics() -> None:
+    event_sink = _EventSink()
+    worker = MultiSessionLiveKitWorker(
+        worker_id="worker-0",
+        config=LiveKitServeConfig(
+            livekit_url="wss://livekit.example",
+            livekit_api_key="key",
+            livekit_api_secret="secret",
+        ),
+        pipeline_file="pipeline.py",
+        token_service=_TokenService(),
+        pipeline_adapter=_PipelineAdapter(),
+        event_sink=event_sink,
+    )
+    runner_sink = _SessionWorkerEventSink(worker, "session-a")
+    payload = {"type": "chunk"}
+    metrics = {"batch_compatibility_key": "(shape,continuation)"}
+
+    runner_sink.on_model_output("worker-0", "pipeline-a", payload, session_runtime_metrics=metrics)
+
+    assert event_sink.model_outputs == [("worker-0", "pipeline-a", payload, metrics)]
 
 
 def test_multi_session_worker_aggregates_runner_statuses() -> None:

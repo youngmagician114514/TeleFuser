@@ -18,7 +18,15 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
-SessionStateTransferState = Literal["precopied", "ready", "committing", "completed", "aborted", "failed"]
+SessionStateTransferState = Literal[
+    "precopied",
+    "ready",
+    "committing",
+    "streaming",
+    "completed",
+    "aborted",
+    "failed",
+]
 
 
 @dataclass(frozen=True)
@@ -61,6 +69,11 @@ class SessionStateTransferBackend(Protocol):
 
     def abort(self, operation: Any) -> None:
         """Cancel the transfer and release target-side reservations."""
+
+    # A progressive backend may additionally expose ``done(operation)`` and
+    # ``finalize(operation)``.  In that case ``commit`` publishes a target
+    # whose first layer is ready, while the manager retains the operation in
+    # ``streaming`` until the residual copy has either completed or failed.
 
 
 @dataclass(frozen=True)
@@ -128,7 +141,7 @@ class SessionStateTransferManager:
             return record
 
     def poll(self, session_id: str, *, now: float | None = None) -> SessionStateTransferRecord:
-        """Advance a transfer to ``ready`` once its backend reports readiness."""
+        """Advance readiness and finalize a progressive residual transfer."""
         with self._lock:
             item = self._active.get(session_id)
             if item is None:
@@ -145,6 +158,38 @@ class SessionStateTransferManager:
                     started_at=record.started_at,
                     ready_at=self._clock() if now is None else now,
                 )
+            elif record.state == "streaming":
+                done = getattr(item.backend, "done", None)
+                if callable(done) and done(item.operation):
+                    completed_at = self._clock() if now is None else now
+                    finalize = getattr(item.backend, "finalize", None)
+                    try:
+                        if callable(finalize):
+                            finalize(item.operation)
+                    except Exception as exc:
+                        failed = SessionStateTransferRecord(
+                            transfer_id=record.transfer_id,
+                            request=record.request,
+                            state="failed",
+                            started_at=record.started_at,
+                            ready_at=record.ready_at,
+                            completed_at=completed_at,
+                            error=repr(exc),
+                        )
+                        self._active.pop(session_id, None)
+                        self._finished[record.transfer_id] = failed
+                        return failed
+                    completed = SessionStateTransferRecord(
+                        transfer_id=record.transfer_id,
+                        request=record.request,
+                        state="completed",
+                        started_at=record.started_at,
+                        ready_at=record.ready_at,
+                        completed_at=completed_at,
+                    )
+                    self._active.pop(session_id, None)
+                    self._finished[record.transfer_id] = completed
+                    return completed
             return item.record
 
     def commit(self, session_id: str, *, now: float | None = None) -> SessionStateTransferRecord:
@@ -178,6 +223,34 @@ class SessionStateTransferManager:
                 self._active.pop(session_id, None)
                 self._finished[record.transfer_id] = failed
                 raise
+            done = getattr(item.backend, "done", None)
+            if callable(done) and not done(item.operation):
+                streaming = SessionStateTransferRecord(
+                    transfer_id=record.transfer_id,
+                    request=record.request,
+                    state="streaming",
+                    started_at=record.started_at,
+                    ready_at=record.ready_at,
+                )
+                item.record = streaming
+                return streaming
+            finalize = getattr(item.backend, "finalize", None)
+            if callable(finalize):
+                try:
+                    finalize(item.operation)
+                except Exception as exc:
+                    failed = SessionStateTransferRecord(
+                        transfer_id=record.transfer_id,
+                        request=record.request,
+                        state="failed",
+                        started_at=record.started_at,
+                        ready_at=record.ready_at,
+                        completed_at=self._clock() if now is None else now,
+                        error=repr(exc),
+                    )
+                    self._active.pop(session_id, None)
+                    self._finished[record.transfer_id] = failed
+                    raise
             completed = SessionStateTransferRecord(
                 transfer_id=record.transfer_id,
                 request=record.request,

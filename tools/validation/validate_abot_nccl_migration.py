@@ -1,10 +1,10 @@
 """Validate one ABot session migration across two GPU processes with NCCL.
 
 This is intentionally model-service level: each rank owns an independent ABot
-replica, rank 0 generates one causal chunk, the retained tensors are moved with
-the same manifest/P2P helpers used by ``--worker-mode process-nccl``, and rank
-1 continues that exact session.  No CPU tensor snapshot is used for model
-state.
+replica, rank 0 generates one causal chunk, and rank 1 imports the session as
+soon as layer 0 arrives while the residual cache continues over a dedicated
+CUDA/NCCL stream.  The target then runs the next causal chunk with per-layer
+readiness waits.  No CPU tensor snapshot is used for model state.
 """
 
 from __future__ import annotations
@@ -23,7 +23,12 @@ import torch.multiprocessing as mp
 
 from telefuser.pipelines.abot_world.interactive import ABotWorldInteractivePipeline
 from telefuser.pipelines.abot_world.service import ABotWorldLiveKitService
-from telefuser.service.livekit.nccl_transfer import allocate_tensor_tree_leaves, transfer_tensor_leaves_nccl
+from telefuser.service.livekit.nccl_transfer import (
+    LayerTransferProgress,
+    allocate_tensor_tree_leaves,
+    build_layer_transfer_groups,
+    transfer_tensor_leaves_nccl_streamed,
+)
 
 
 def _loader_module() -> Any:
@@ -72,6 +77,20 @@ def _rank_main(rank: int, args: argparse.Namespace, port: int) -> None:
             world_size=2,
         )
         print(f"rank={rank} phase=nccl_ready", flush=True)
+        warmup_started = time.monotonic()
+        warmup_send = torch.zeros(1, dtype=torch.uint8, device=torch.device(f"cuda:{rank}"))
+        warmup_recv = torch.empty_like(warmup_send)
+        send_op = dist.P2POp(dist.isend, warmup_send, 1 - rank)
+        recv_op = dist.P2POp(dist.irecv, warmup_recv, 1 - rank)
+        warmup_requests = dist.batch_isend_irecv(
+            [send_op, recv_op] if rank == 0 else [recv_op, send_op]
+        )
+        for request in warmup_requests:
+            request.wait()
+        torch.cuda.synchronize(rank)
+        dist.barrier()
+        if rank == 0:
+            print(f"nccl_peer_warmup_seconds={time.monotonic() - warmup_started:.6f}", flush=True)
 
         # Process workers are started serially in the real serving pool.  Do
         # the same here: concurrently materializing two 25-GB checkpoints on
@@ -140,22 +159,85 @@ def _rank_main(rank: int, args: argparse.Namespace, port: int) -> None:
         if rank == 1:
             leaves = allocate_tensor_tree_leaves(metadata["tensor_manifest"], torch.device(f"cuda:{rank}"))
         assert leaves is not None
-
-        started = time.monotonic()
-        transferred = transfer_tensor_leaves_nccl(leaves, peer_rank=1 - rank, send=rank == 0)
-        torch.cuda.synchronize(rank)
-        elapsed = time.monotonic() - started
+        groups = build_layer_transfer_groups(metadata["tensor_manifest"])
+        transfer_stream = torch.cuda.Stream(device=torch.device(f"cuda:{rank}"))
         if rank == 0:
-            print(f"nccl_copy_bytes={transferred} nccl_copy_seconds={elapsed:.6f}", flush=True)
-        if rank == 1:
-            installed = service.import_migration_nccl(metadata, leaves, owner_worker_id="worker-1", ownership_epoch=1)
-            assert installed == session_id
-        dist.barrier()
-        if rank == 0:
+            report = transfer_tensor_leaves_nccl_streamed(
+                leaves,
+                peer_rank=1,
+                send=True,
+                groups=groups,
+                stream=transfer_stream,
+            )
+            print(
+                f"nccl_copy_bytes={report.total_bytes} "
+                f"nccl_copy_seconds={report.total_duration_ms / 1000.0:.6f} "
+                f"transfer_groups={len(report.groups)}",
+                flush=True,
+            )
             service.commit_migration(session_id)
         else:
+            layer_count = max(
+                (group.layer_index for group in groups if group.layer_index is not None),
+                default=-1,
+            ) + 1
+            progress = LayerTransferProgress(layer_count)
+            transfer_result: dict[str, Any] = {}
+            transfer_errors: list[BaseException] = []
+
+            def receive_progressively() -> None:
+                torch.cuda.set_device(rank)
+
+                def group_complete(group, event) -> None:
+                    if group.layer_index is not None:
+                        progress.mark_layer_ready(group.layer_index, event)
+
+                try:
+                    transfer_result["report"] = transfer_tensor_leaves_nccl_streamed(
+                        leaves,
+                        peer_rank=0,
+                        send=False,
+                        groups=groups,
+                        stream=transfer_stream,
+                        on_group_complete=group_complete,
+                    )
+                except BaseException as exc:
+                    transfer_errors.append(exc)
+                    progress.mark_failed(exc)
+                else:
+                    progress.mark_complete()
+
+            transfer_thread = threading.Thread(
+                target=receive_progressively,
+                name="sst-progressive-recv",
+                daemon=True,
+            )
+            transfer_started = time.monotonic()
+            transfer_thread.start()
+            if not progress.first_layer_ready.wait(timeout=120.0):
+                raise TimeoutError("Timed out waiting for SST layer 0")
+            if transfer_errors:
+                raise RuntimeError("SST receive failed before layer 0") from transfer_errors[0]
+            installed = service.import_migration_nccl(
+                metadata,
+                leaves,
+                owner_worker_id="worker-1",
+                ownership_epoch=1,
+                migration_layer_readiness=progress,
+            )
+            assert installed == session_id
+            residual_active_at_dispatch = transfer_thread.is_alive()
+            compute_started = time.monotonic()
             service.push_chunk(session_id, {"type": "control_state", "controls": ["W"]})
             target_chunk = _take_output(service, session_id)
+            compute_seconds = time.monotonic() - compute_started
+            output_before_transfer_complete = transfer_thread.is_alive()
+            transfer_thread.join(timeout=120.0)
+            if transfer_thread.is_alive():
+                raise TimeoutError("Timed out waiting for residual SST layers")
+            if transfer_errors:
+                raise RuntimeError("SST residual receive failed") from transfer_errors[0]
+            report = transfer_result["report"]
             if target_chunk.get("type") not in {"chunk", "video"}:
                 raise RuntimeError(f"Expected target generated output, got {target_chunk.get('type')!r}")
             session = service._session(session_id)
@@ -163,7 +245,15 @@ def _rank_main(rank: int, args: argparse.Namespace, port: int) -> None:
             print(
                 f"target_chunk={target_chunk.get('index')} "
                 f"next_latent_frame={session.pipeline_session.next_latent_frame} "
-                f"emitted_frames={session.pipeline_session.emitted_frames}",
+                f"emitted_frames={session.pipeline_session.emitted_frames} "
+                f"first_layer_ready_ms={progress.snapshot()['first_layer_ready_ms']} "
+                f"transfer_complete_ms={progress.snapshot()['transfer_complete_ms']} "
+                f"compute_seconds={compute_seconds:.6f} "
+                f"residual_active_at_dispatch={residual_active_at_dispatch} "
+                f"output_before_transfer_complete={output_before_transfer_complete} "
+                f"host_wait_ms={progress.snapshot()['host_wait_ms']} "
+                f"nccl_copy_seconds={report.total_duration_ms / 1000.0:.6f} "
+                f"wall_transfer_seconds={time.monotonic() - transfer_started:.6f}",
                 flush=True,
             )
         dist.barrier()

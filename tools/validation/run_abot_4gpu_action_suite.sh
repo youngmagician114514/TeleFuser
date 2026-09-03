@@ -22,6 +22,7 @@ RUN_ROOT=""
 TRACE_ROOT=""
 MAX_SESSIONS_PER_WORKER=""
 DRY_RUN=0
+STARTUP_TIMEOUT_SECONDS=900
 REQUESTED_WORKLOADS=()
 
 readonly -a ALL_WORKLOADS=(
@@ -50,6 +51,7 @@ Options:
   --livekit-bin PATH              LiveKit server binary.
   --profile PATH                  Evaluated motivation profile CSV.
   --scenario PATH                 Base LiveKit replay scenario.
+  --startup-timeout-seconds N     Wait up to N seconds for TeleFuser startup (default: 900).
   --dry-run                       Validate all selected traces without starting services.
   -h, --help                      Show this help.
 
@@ -123,6 +125,11 @@ while [[ $# -gt 0 ]]; do
       SCENARIO_PATH="$2"
       shift 2
       ;;
+    --startup-timeout-seconds)
+      need_value "$1" "${2:-}"
+      STARTUP_TIMEOUT_SECONDS="$2"
+      shift 2
+      ;;
     --dry-run)
       DRY_RUN=1
       shift
@@ -171,6 +178,8 @@ RUN_ROOT="$(repo_absolute_path "${RUN_ROOT}")"
 
 [[ "${MAX_SESSIONS_PER_WORKER}" =~ ^[1-9][0-9]*$ ]] \
   || die "--max-sessions-per-worker must be a positive integer"
+[[ "${STARTUP_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ ]] \
+  || die "--startup-timeout-seconds must be a positive integer"
 [[ -x "${PYTHON_BIN}" ]] || die "Python interpreter is not executable: ${PYTHON_BIN}"
 [[ -f "${PROFILE_PATH}" ]] || die "Motivation profile not found: ${PROFILE_PATH}"
 [[ -f "${SCENARIO_PATH}" ]] || die "Replay scenario not found: ${SCENARIO_PATH}"
@@ -259,6 +268,7 @@ printf '%s\n' \
   "TRACE_ROOT=${TRACE_ROOT}" \
   "GPU_IDS=${GPU_IDS}" \
   "MAX_SESSIONS_PER_WORKER=${MAX_SESSIONS_PER_WORKER}" \
+  "STARTUP_TIMEOUT_SECONDS=${STARTUP_TIMEOUT_SECONDS}" \
   "PROFILE_PATH=${PROFILE_PATH}" \
   "SCENARIO_PATH=${SCENARIO_PATH}" \
   "WORKLOADS=${WORKLOADS[*]}" \
@@ -266,6 +276,7 @@ printf '%s\n' \
 
 LIVEKIT_PID=""
 SERVER_PID=""
+SERVER_PGID=""
 SERVING_METRICS_PID=""
 GPU_METRICS_PID=""
 
@@ -290,13 +301,36 @@ stop_pid() {
   wait "${pid}" 2>/dev/null || true
 }
 
+stop_process_group() {
+  local pid="$1"
+  local label="$2"
+  [[ -n "${pid}" ]] || return 0
+
+  # The runner starts TeleFuser in its own session. Terminating the process
+  # group also reaps process-NCCL workers if the parent exits during startup.
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill -TERM -- "-${pid}" 2>/dev/null || kill -TERM "${pid}" 2>/dev/null || true
+    for _ in $(seq 1 30); do
+      if ! kill -0 "${pid}" 2>/dev/null; then
+        wait "${pid}" 2>/dev/null || true
+        return 0
+      fi
+      sleep 1
+    done
+    echo "${label} PID ${pid} did not stop after 30 seconds; sending SIGKILL" >&2
+    kill -KILL -- "-${pid}" 2>/dev/null || kill -KILL "${pid}" 2>/dev/null || true
+  fi
+  wait "${pid}" 2>/dev/null || true
+}
+
 cleanup_current() {
   stop_pid "${SERVING_METRICS_PID}" "serving metrics"
   SERVING_METRICS_PID=""
   stop_pid "${GPU_METRICS_PID}" "GPU metrics"
   GPU_METRICS_PID=""
-  stop_pid "${SERVER_PID}" "TeleFuser server"
+  stop_process_group "${SERVER_PGID:-${SERVER_PID}}" "TeleFuser server"
   SERVER_PID=""
+  SERVER_PGID=""
   stop_pid "${LIVEKIT_PID}" "LiveKit server"
   LIVEKIT_PID=""
 }
@@ -433,7 +467,9 @@ for workload in "${WORKLOADS[@]}"; do
   printf '%s\n' "${LIVEKIT_PID}" >"${RUN_DIR}/livekit.pid"
   wait_for_port 7880 "${LIVEKIT_PID}" "LiveKit" 60
 
-  CUDA_VISIBLE_DEVICES="${GPU_IDS}" \
+  # Start the server in a dedicated session so timeout/failure cleanup also
+  # terminates all process-NCCL worker children.
+  setsid env CUDA_VISIBLE_DEVICES="${GPU_IDS}" \
   PYTHONPATH="${REPO_ROOT}" \
   TF_MODEL_ZOO_PATH="${MODEL_ZOO_PATH}" \
   TELEFUSER_ABOT_CUDA_GRAPH_ENABLED=0 \
@@ -467,13 +503,14 @@ for workload in "${WORKLOADS[@]}"; do
     --skip-validation \
     >"${RUN_DIR}/server.log" 2>&1 &
   SERVER_PID=$!
+  SERVER_PGID="${SERVER_PID}"
   printf '%s\n' "${SERVER_PID}" >"${RUN_DIR}/server.pid"
 
   # Model loading and process-NCCL initialization can take several minutes on
   # a cold start. Keep this separate from the short LiveKit startup timeout;
   # otherwise the runner kills a healthy server before /v1/service/ready can
   # be reached.
-  wait_for_port 8088 "${SERVER_PID}" "TeleFuser" 300
+  wait_for_port 8088 "${SERVER_PID}" "TeleFuser" "${STARTUP_TIMEOUT_SECONDS}"
   wait_for_ready "${RUN_DIR}"
   curl --noproxy '*' -fsS "http://127.0.0.1:8088/v1/service/metadata" \
     >"${RUN_DIR}/metadata-before.json"

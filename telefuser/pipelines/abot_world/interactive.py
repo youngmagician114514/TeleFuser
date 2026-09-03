@@ -53,6 +53,7 @@ class ABotWorldInteractiveSession:
     last_activity_at: float = field(default_factory=time.monotonic)
     owner_worker_id: str | None = None
     ownership_epoch: int = 0
+    migration_layer_readiness: Any | None = field(default=None, repr=False)
     closed: bool = False
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
@@ -60,6 +61,11 @@ class ABotWorldInteractiveSession:
     def is_resident(self) -> bool:
         """Return whether tensors are currently resident on the execution device."""
         return self.lifecycle != ABotWorldSessionLifecycle.SUSPENDED
+
+    @property
+    def migration_transfer_in_progress(self) -> bool:
+        readiness = self.migration_layer_readiness
+        return readiness is not None and not bool(getattr(readiness, "complete", False))
 
 
 @dataclass(frozen=True)
@@ -297,6 +303,11 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
                     current_start=start,
                     generator=sessions[0].generator,
                     scheduler=sessions[0].scheduler,
+                    layer_readiness=(
+                        sessions[0].migration_layer_readiness
+                        if sessions[0].migration_transfer_in_progress
+                        else None
+                    ),
                     **denoise_kwargs,
                 )
             elif start > 0:
@@ -390,6 +401,15 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
                         )
                 self._scatter_caches(sessions, "cross_cache", cross_cache)
             cache_scatter_seconds = time.monotonic() - cache_scatter_started_at
+            for session in sessions:
+                readiness = session.migration_layer_readiness
+                wait_complete = getattr(readiness, "wait_complete", None)
+                if callable(wait_complete) and not bool(getattr(readiness, "complete", False)):
+                    # Decoder-only VAE/TAEW state is deliberately the final SST
+                    # group. DiT kernels have already been enqueued, so this
+                    # host wait overlaps their execution and only fences the
+                    # first decode that can consume the deferred tensors.
+                    wait_complete()
             if use_cuda_events:
                 vae_started.record()
             else:
@@ -641,6 +661,7 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
         *,
         owner_worker_id: str | None = None,
         ownership_epoch: int | None = None,
+        migration_layer_readiness: Any | None = None,
     ) -> ABotWorldInteractiveSession:
         """Adopt a snapshot already received on this pipeline's CUDA device.
 
@@ -652,6 +673,7 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
             owner_worker_id=owner_worker_id,
             ownership_epoch=ownership_epoch,
             direct_device_tensors=True,
+            migration_layer_readiness=migration_layer_readiness,
         )
 
     def _restore_snapshot(
@@ -661,6 +683,7 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
         owner_worker_id: str | None,
         ownership_epoch: int | None,
         direct_device_tensors: bool,
+        migration_layer_readiness: Any | None = None,
     ) -> ABotWorldInteractiveSession:
         with self._execution_lock:
             self._release_cuda_graph(snapshot.session_id)
@@ -713,6 +736,7 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
                 emitted_frames=snapshot.emitted_frames,
                 owner_worker_id=owner_worker_id,
                 ownership_epoch=snapshot.ownership_epoch + 1 if ownership_epoch is None else ownership_epoch,
+                migration_layer_readiness=migration_layer_readiness,
             )
         with self._lifecycle_lock:
             if session.session_id in self._interactive_sessions:

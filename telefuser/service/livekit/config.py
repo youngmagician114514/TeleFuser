@@ -74,6 +74,11 @@ class LiveKitServeConfig(BaseSettings):
     turboserve_migration_eta: float = Field(default=0.35, ge=0)
     turboserve_min_migration_gain_ms: float = Field(default=40.0, ge=0)
     turboserve_rebalance_iteration_limit: int = Field(default=3, ge=1, le=64)
+    motivation_migration_cooldown_seconds: float = Field(
+        default=60.0,
+        ge=0,
+        description="Minimum residence time after a Motivation-owned session migration",
+    )
     control_idle_timeout: float = Field(
         default=10.0,
         gt=0,

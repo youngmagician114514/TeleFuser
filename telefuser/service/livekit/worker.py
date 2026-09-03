@@ -294,6 +294,56 @@ class LiveKitWorker:
             frames_delta=-(total_frames - published_frames),
         )
 
+    def _session_runtime_metrics(self, pipeline_session_id: str) -> dict[str, Any] | None:
+        """Read per-session model facts without making output delivery fragile.
+
+        The in-process worker shares the pipeline adapter with all retained
+        sessions. ABot's compatibility key is exposed through the service's
+        session-scoped runtime snapshot and must be attached to the output
+        event before the motivation bridge commits the lease. Custom adapters
+        predating this optional argument are still supported by a no-argument
+        fallback.
+        """
+        callback = getattr(self.pipeline_adapter, "runtime_metrics", None)
+        if not callable(callback):
+            return None
+        try:
+            value = callback(pipeline_session_id)
+        except TypeError:
+            try:
+                value = callback()
+            except Exception as exc:  # pragma: no cover - optional telemetry
+                logger.debug("Could not read runtime metrics: worker=%s error=%s", self.worker_id, exc)
+                return None
+        except Exception as exc:  # pragma: no cover - optional telemetry
+            logger.debug("Could not read runtime metrics: worker=%s error=%s", self.worker_id, exc)
+            return None
+        return dict(value) if isinstance(value, dict) else None
+
+    def _notify_model_output(
+        self,
+        callback: Any,
+        pipeline_session_id: str,
+        payload: dict[str, Any],
+        session_runtime_metrics: dict[str, Any] | None,
+    ) -> None:
+        """Notify an output sink, tolerating legacy three-argument sinks."""
+        if session_runtime_metrics is None:
+            callback(self.worker_id, pipeline_session_id, payload)
+            return
+        try:
+            callback(
+                self.worker_id,
+                pipeline_session_id,
+                payload,
+                session_runtime_metrics=session_runtime_metrics,
+            )
+        except TypeError:
+            # WorkerEventSink gained this optional keyword after the original
+            # three-argument callback shipped. Do not drop model output just
+            # because an embedding application still has the old sink.
+            callback(self.worker_id, pipeline_session_id, payload)
+
     def _on_data_message(
         self,
         record: SessionRecord,
@@ -373,19 +423,21 @@ class LiveKitWorker:
                 break
             model_output_callback = getattr(self.event_sink, "on_model_output", None)
             if callable(model_output_callback) and self._pipeline_session_id is not None:
+                pipeline_session_id = self._pipeline_session_id
                 chunk_data_for_metrics = chunk.get("data") if isinstance(chunk.get("data"), dict) else chunk
                 scheduler = (
                     chunk_data_for_metrics.get("scheduler") if isinstance(chunk_data_for_metrics, dict) else None
                 )
-                model_output_callback(
-                    self.worker_id,
-                    self._pipeline_session_id,
+                self._notify_model_output(
+                    model_output_callback,
+                    pipeline_session_id,
                     {
                         "type": chunk.get("type"),
                         "fps": chunk_data_for_metrics.get("fps", chunk.get("fps", self.config.default_fps)),
                         "scheduler": dict(scheduler) if isinstance(scheduler, dict) else {},
                         "frame_count": len(frames),
                     },
+                    self._session_runtime_metrics(pipeline_session_id),
                 )
             decoded_ready_at = chunk.get("timestamp")
             publish_started_at = time.time()

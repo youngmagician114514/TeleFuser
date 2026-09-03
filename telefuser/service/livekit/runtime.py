@@ -50,6 +50,12 @@ from .turboserve import (
 from .worker_pool import InProcessLiveKitWorkerPool, WorkerPool
 
 
+@dataclass(frozen=True)
+class _RuntimeTransferOperation:
+    migration: concurrent.futures.Future[object]
+    compute_ready: concurrent.futures.Future[None]
+
+
 class _RuntimeSessionStateTransferBackend:
     """Adapt the runtime's async worker-pool migration to the policy backend."""
 
@@ -60,40 +66,85 @@ class _RuntimeSessionStateTransferBackend:
     ) -> None:
         self._runtime = runtime
         self._loop = loop
-        self._future: concurrent.futures.Future[object] | None = None
-        self._callbacks: list[Callable[[object], None]] = []
+        self._operation: _RuntimeTransferOperation | None = None
+        self._ready_callbacks: list[Callable[[object], None]] = []
+        self._done_callbacks: list[Callable[[object], None]] = []
 
-    def begin(self, request: SessionStateTransferRequest) -> concurrent.futures.Future[object]:
-        self._future = asyncio.run_coroutine_threadsafe(
-            self._runtime.migrate_session(request.session_id, request.target_gpu),
+    def begin(self, request: SessionStateTransferRequest) -> _RuntimeTransferOperation:
+        compute_ready: concurrent.futures.Future[None] = concurrent.futures.Future()
+
+        def publish_compute_ready() -> None:
+            if not compute_ready.done():
+                compute_ready.set_result(None)
+
+        migration = asyncio.run_coroutine_threadsafe(
+            self._runtime.migrate_session(
+                request.session_id,
+                request.target_gpu,
+                compute_ready_callback=publish_compute_ready,
+            ),
             self._loop,
         )
-        for callback in self._callbacks:
-            self._future.add_done_callback(callback)
-        self._callbacks.clear()
-        return self._future
+
+        def propagate_early_failure(done: concurrent.futures.Future[object]) -> None:
+            if compute_ready.done():
+                return
+            try:
+                done.result()
+            except BaseException as exc:
+                compute_ready.set_exception(exc)
+            else:
+                compute_ready.set_result(None)
+
+        migration.add_done_callback(propagate_early_failure)
+        operation = _RuntimeTransferOperation(migration=migration, compute_ready=compute_ready)
+        self._operation = operation
+        for callback in self._ready_callbacks:
+            compute_ready.add_done_callback(callback)
+        for callback in self._done_callbacks:
+            migration.add_done_callback(callback)
+        self._ready_callbacks.clear()
+        self._done_callbacks.clear()
+        return operation
 
     @staticmethod
     def ready(operation: object) -> bool:
-        return isinstance(operation, concurrent.futures.Future) and operation.done()
+        return isinstance(operation, _RuntimeTransferOperation) and operation.compute_ready.done()
 
     @staticmethod
     def commit(operation: object) -> None:
-        if not isinstance(operation, concurrent.futures.Future):
-            raise TypeError("runtime migration operation is not a Future")
-        operation.result()
+        if not isinstance(operation, _RuntimeTransferOperation):
+            raise TypeError("runtime migration operation has an unexpected type")
+        operation.compute_ready.result()
+
+    @staticmethod
+    def done(operation: object) -> bool:
+        return isinstance(operation, _RuntimeTransferOperation) and operation.migration.done()
+
+    @staticmethod
+    def finalize(operation: object) -> None:
+        if not isinstance(operation, _RuntimeTransferOperation):
+            raise TypeError("runtime migration operation has an unexpected type")
+        operation.migration.result()
 
     @staticmethod
     def abort(operation: object) -> None:
-        if isinstance(operation, concurrent.futures.Future):
-            operation.cancel()
+        if isinstance(operation, _RuntimeTransferOperation):
+            operation.migration.cancel()
 
     def add_done_callback(self, callback: Callable[[object], None]) -> None:
-        """Expose future completion without leaking it into policy state."""
-        if self._future is None:
-            self._callbacks.append(callback)
+        """Wake policy when the residual transfer completes or fails."""
+        if self._operation is None:
+            self._done_callbacks.append(callback)
         else:
-            self._future.add_done_callback(callback)
+            self._operation.migration.add_done_callback(callback)
+
+    def add_ready_callback(self, callback: Callable[[object], None]) -> None:
+        """Wake policy as soon as the target's first cache layer is usable."""
+        if self._operation is None:
+            self._ready_callbacks.append(callback)
+        else:
+            self._operation.compute_ready.add_done_callback(callback)
 
 
 @dataclass(frozen=True)
@@ -168,11 +219,22 @@ class LiveKitServeRuntime:
             migration_bandwidth_bytes_per_second=config.turboserve_migration_bandwidth_gbps * 1_000_000_000,
             migration_penalty=config.turboserve_migration_penalty,
         )
+        # A Motivation controller owns the global ``(B, c, g)`` placement
+        # decision, including asynchronous state migration. Keep the legacy
+        # TurboServe placement loop out of that mode: two independent
+        # controllers can select different owners for the same session while
+        # an NCCL transfer is in flight. Autoscaling remains independently
+        # controllable (when explicitly enabled), but it never performs a
+        # second placement decision for Motivation sessions.
+        self._motivation_owns_placement = motivation_controller is not None
+        self._background_rebalance_enabled = (
+            config.turboserve_rebalance_enabled and not self._motivation_owns_placement
+        )
         self._autoscale_task: asyncio.Task | None = None
         self._cluster_scheduler = TurboServeClusterScheduler(
             TurboServeSchedulerConfig(
                 enable_autoscaling=config.autoscaling_enabled,
-                enable_migration=config.turboserve_rebalance_enabled,
+                enable_migration=self._background_rebalance_enabled,
                 min_workers=config.autoscaling_min_workers,
                 max_workers=config.num_workers,
                 capacity_per_worker=config.session_capacity_limit() or 1,
@@ -221,10 +283,11 @@ class LiveKitServeRuntime:
                     self, self._motivation_loop
                 )
             controller.set_migration_wakeup_callback(self._motivation_bridge.schedule_wakeup)
+            controller.set_dispatch_owner_resolver(self._motivation_dispatch_owner)
         await self.worker_pool.start(skip_validation=self.skip_validation)
         with self._lock:
             self._started = True
-        if self.config.autoscaling_enabled or self.config.turboserve_rebalance_enabled:
+        if self.config.autoscaling_enabled or self._background_rebalance_enabled:
             self._autoscale_task = asyncio.create_task(self._autoscale_loop(), name="livekit-turboserve-control")
 
     def create_session(self, request: SessionCreateRequest) -> CreateSessionResult:
@@ -475,9 +538,18 @@ class LiveKitServeRuntime:
                 "target_utilization": self._last_scale_decision.target_utilization,
                 "reason": self._last_scale_decision.reason,
             }
-        if self._last_migration_plan is not None or self._last_migration_error is not None:
+        if (
+            self._last_migration_plan is not None
+            or self._last_migration_error is not None
+            or self._motivation_owns_placement
+        ):
             metadata["turboserve_rebalance"] = {
-                "enabled": self.config.turboserve_rebalance_enabled,
+                # ``enabled`` describes the effective background controller,
+                # not merely the legacy configuration bit. The latter is
+                # retained for diagnosing why a controller was suppressed.
+                "enabled": self._background_rebalance_enabled,
+                "configured_enabled": self.config.turboserve_rebalance_enabled,
+                "owner": "motivation" if self._motivation_owns_placement else "turboserve",
                 "last_plan": (
                     {
                         "session_id": self._last_migration_plan.session_id,
@@ -493,7 +565,13 @@ class LiveKitServeRuntime:
             }
         return metadata
 
-    async def migrate_session(self, session_id: str, target_worker_id: str) -> TurboServeOwnership:
+    async def migrate_session(
+        self,
+        session_id: str,
+        target_worker_id: str,
+        *,
+        compute_ready_callback: Callable[[], None] | None = None,
+    ) -> TurboServeOwnership:
         """Migrate ABot model state without reconnecting the LiveKit room."""
         record = self.registry.require(session_id)
         if record.pipeline_session_id is None:
@@ -506,18 +584,43 @@ class LiveKitServeRuntime:
         migrate = getattr(self.worker_pool, "migrate_session", None)
         if not callable(migrate):
             raise RuntimeError("Configured worker pool does not support TurboServe migration")
+        source_worker_id = record.worker_id
+        if source_worker_id is None:
+            raise RuntimeError(f"Session {session_id} has no assigned source worker")
+        compute_owner_published = False
+
+        def publish_compute_owner() -> None:
+            nonlocal compute_owner_published
+            if compute_owner_published:
+                return
+            self.scheduler.reassign_session(session_id, target_worker_id)
+            self.registry.assign_worker(session_id, target_worker_id)
+            compute_owner_published = True
+            if compute_ready_callback is not None:
+                compute_ready_callback()
+
         migration_started_at = asyncio.get_running_loop().time()
         try:
-            ownership = await migrate(record.pipeline_session_id, target_worker_id)
+            if bool(getattr(self.worker_pool, "progressive_migration_supported", False)):
+                ownership = await migrate(
+                    record.pipeline_session_id,
+                    target_worker_id,
+                    on_compute_ready=publish_compute_owner,
+                )
+            else:
+                ownership = await migrate(record.pipeline_session_id, target_worker_id)
+                publish_compute_owner()
         except Exception as exc:
+            if compute_owner_published:
+                self.scheduler.reassign_session(session_id, source_worker_id)
+                self.registry.assign_worker(session_id, source_worker_id)
             self._serving_metrics.record_migration(success=False, error=str(exc))
             raise
         self._serving_metrics.record_migration(
             success=True,
             duration_seconds=asyncio.get_running_loop().time() - migration_started_at,
         )
-        self.scheduler.reassign_session(session_id, target_worker_id)
-        self.registry.assign_worker(session_id, target_worker_id)
+        publish_compute_owner()
         return ownership
 
     async def aclose(self) -> None:
@@ -560,6 +663,13 @@ class LiveKitServeRuntime:
         if not callable(dispatch):
             raise RuntimeError("Configured worker pool does not support motivation dispatch")
         dispatch(lease, payloads)
+
+    def _motivation_dispatch_owner(self, session_id: str) -> str | None:
+        """Return the worker route that will receive a Motivation dispatch."""
+        resolver = getattr(self.worker_pool, "dispatch_owner", None)
+        if not callable(resolver):
+            return None
+        return resolver(session_id)
 
     def _create_worker_pool(self) -> WorkerPool:
         security_level = self.security_level
@@ -715,21 +825,26 @@ class LiveKitServeRuntime:
         else:
             actual = current_workers
         migrations = 0
-        for session_id, target_worker_id in decision.placement.items():
-            record = self.registry.require(session_id)
-            if target_worker_id is None or target_worker_id == record.worker_id or record.pipeline_session_id is None:
-                continue
-            try:
-                await self.migrate_session(session_id, target_worker_id)
-                migrations += 1
-            except Exception as exc:
-                self._last_migration_error = str(exc)
-                logger.warning(
-                    "TurboServe placement move failed: session=%s target=%s error=%s",
-                    session_id,
-                    target_worker_id,
-                    exc,
-                )
+        if not self._motivation_owns_placement:
+            for session_id, target_worker_id in decision.placement.items():
+                record = self.registry.require(session_id)
+                if (
+                    target_worker_id is None
+                    or target_worker_id == record.worker_id
+                    or record.pipeline_session_id is None
+                ):
+                    continue
+                try:
+                    await self.migrate_session(session_id, target_worker_id)
+                    migrations += 1
+                except Exception as exc:
+                    self._last_migration_error = str(exc)
+                    logger.warning(
+                        "TurboServe placement move failed: session=%s target=%s error=%s",
+                        session_id,
+                        target_worker_id,
+                        exc,
+                    )
         if decision.worker_budget < actual:
             actual = await scale_to(decision.worker_budget)
         action = str(decision.metadata["autoscale_action"])
@@ -762,7 +877,7 @@ class LiveKitServeRuntime:
 
     async def _rebalance_once(self) -> None:
         """Commit at most one profitable chunk-boundary migration per control tick."""
-        if not self.config.turboserve_rebalance_enabled:
+        if not self._background_rebalance_enabled:
             return
         migrate = getattr(self.worker_pool, "migrate_session", None)
         snapshot_fn = getattr(self.worker_pool, "turboserve_snapshot", None)
