@@ -4,6 +4,7 @@ import asyncio
 from typing import Any
 
 import pytest
+import torch
 
 from telefuser.service.livekit.config import LiveKitServeConfig
 from telefuser.service.livekit.nccl_process_worker_pool import (
@@ -11,6 +12,7 @@ from telefuser.service.livekit.nccl_process_worker_pool import (
     _NCCL_INIT_PARENT_TIMEOUT_SECONDS,
     NCCLProcessLiveKitWorkerPool,
     _pump_model_outputs,
+    _validate_nccl_source_leaves,
 )
 from telefuser.service.livekit.process_worker_pool import (
     ProcessLiveKitWorkerPool,
@@ -84,6 +86,11 @@ def _model_output_eos(session_id: str) -> dict[str, Any]:
         "worker_id": "worker-0",
         "session_id": session_id,
     }
+
+
+def test_nccl_source_preflight_rejects_cpu_leaves_before_peer_receive() -> None:
+    with pytest.raises(RuntimeError, match="source tensors must reside on CUDA"):
+        _validate_nccl_source_leaves({("taew_decode_state", "decoder_memory"): torch.zeros(1)})
 
 
 async def _wait_for_count(events: _EventCollector, count: int) -> None:
@@ -355,6 +362,61 @@ def test_latest_parent_queue_replacement_rebates_source_publisher_credit() -> No
     ]
 
 
+
+def test_parent_ignores_late_source_eos_after_progressive_route_flip() -> None:
+    pool = _pool()
+    pool._active_workers = {"worker-0", "worker-1"}
+    sent: list[tuple[str, dict[str, Any]]] = []
+    pool._send = lambda worker_id, command: sent.append((worker_id, command))
+    pool.create_model_session("worker-0", "pipeline-1", {})
+    sent.clear()
+    pool._pipeline_routes["pipeline-1"] = "worker-1"
+    pool._dispatch_event(_model_output_eos("pipeline-1"))
+    assert pool._pipeline_routes["pipeline-1"] == "worker-1"
+    assert "pipeline-1" in pool._model_outputs
+    assert sent == []
+
+
+def test_model_session_ready_ack_blocks_until_child_event() -> None:
+    async def run() -> None:
+        pool = _pool()
+        pool._send = lambda worker_id, command: None
+        pool.create_model_session("worker-0", "pipeline-ready", {})
+        waiter = asyncio.create_task(pool.wait_model_session_ready("pipeline-ready", timeout=1.0))
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        pool._dispatch_event(
+            {
+                "type": "model_session_ready",
+                "worker_id": "worker-0",
+                "session_id": "pipeline-ready",
+            }
+        )
+        await waiter
+        assert "pipeline-ready" not in pool._model_session_ready
+
+    asyncio.run(run())
+
+
+def test_model_session_ready_ack_propagates_child_failure() -> None:
+    async def run() -> None:
+        pool = _pool()
+        pool._send = lambda worker_id, command: None
+        pool.create_model_session("worker-0", "pipeline-failed", {})
+        pool._dispatch_event(
+            {
+                "type": "model_session_failed",
+                "worker_id": "worker-0",
+                "session_id": "pipeline-failed",
+                "error": "model init failed",
+            }
+        )
+        with pytest.raises(RuntimeError, match="model init failed"):
+            await pool.wait_model_session_ready("pipeline-failed", timeout=1.0)
+        assert "pipeline-failed" not in pool._model_session_ready
+
+    asyncio.run(run())
+
 def test_late_control_for_released_route_is_dropped() -> None:
     pool = _pool()
     sent: list[tuple[str, dict[str, Any]]] = []
@@ -371,7 +433,7 @@ def test_late_control_for_released_route_is_dropped() -> None:
     assert sent == []
 
 
-def test_migration_drain_waits_for_child_queue_and_publisher_frames(monkeypatch) -> None:
+def test_migration_drain_waits_for_child_queue_but_not_publisher_frames(monkeypatch) -> None:
     async def run() -> None:
         pool = _pool()
         calls: list[tuple[str, object]] = []
@@ -405,24 +467,18 @@ def test_migration_drain_waits_for_child_queue_and_publisher_frames(monkeypatch)
         monkeypatch.setattr(pool, "_wait_for_model_output_drain", fake_wait_for_model_output_drain)
         monkeypatch.setattr(pool, "_request", fake_request)
 
-        await pool._drain_model_outputs_for_migration("pipeline-1", source_worker_id="worker-0", timeout=1.0)
+        status = await pool._drain_model_outputs_for_migration(
+            "pipeline-1", source_worker_id="worker-0", timeout=1.0
+        )
 
-        assert [kind for kind, _ in calls] == [
-            "parent_drain",
-            "child_status",
-            "parent_drain",
-            "child_status",
-            "parent_drain",
-            "child_status",
-            "parent_drain",
-            "child_status",
-        ]
-        assert [value for kind, value in calls if kind == "child_status"] == [
-            {"in_flight": False, "output_queue_empty": False, "publisher_unsubmitted_frames": 0},
-            {"in_flight": False, "output_queue_empty": True, "publisher_unsubmitted_frames": 12},
-            {"in_flight": False, "output_queue_empty": True, "publisher_unsubmitted_frames": 0},
-            {"in_flight": False, "output_queue_empty": True, "publisher_unsubmitted_frames": 0},
-        ]
+        assert [kind for kind, _ in calls] == ["child_status", "child_status"]
+        assert status == {
+            "in_flight": False,
+            "output_queue_empty": True,
+            "publisher_unsubmitted_frames": 12,
+        }
+
+    asyncio.run(run())
 
 
 

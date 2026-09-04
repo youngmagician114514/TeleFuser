@@ -19,7 +19,7 @@ import math
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -128,6 +128,41 @@ def load_motivation_profiles_csv(
             )
     if not rows:
         raise ValueError(f"no profiles with batch size <= {max_batch_size} found in {path}")
+
+    # Several historical ABot profile captures measured B1/B2/B4/B8 but
+    # omitted B3. Treat that omission as a profile-data gap rather than
+    # rejecting every three-session candidate. Interpolate the neighboring
+    # measured points with a conservative quality value; physical execution
+    # still validates the resulting batch and trace records the actual size.
+    if max_batch_size >= 3:
+        by_suffix: dict[str, dict[int, MotivationProfile]] = {}
+        for row in rows:
+            suffix = row.fidelity.split("_", 1)[1] if "_" in row.fidelity else ""
+            by_suffix.setdefault(suffix, {})[row.batch_size] = row
+        for suffix, neighbors in by_suffix.items():
+            lower = neighbors.get(2)
+            upper = neighbors.get(4)
+            if lower is not None and upper is not None and 3 not in neighbors:
+                latency = (lower.latency_seconds + upper.latency_seconds) / 2.0
+                p95 = (
+                    (lower.p95_seconds or lower.latency_seconds)
+                    + (upper.p95_seconds or upper.latency_seconds)
+                ) / 2.0
+                memory = (lower.memory_gb + upper.memory_gb) / 2.0
+                quality = min(lower.quality, upper.quality)
+                gpu_id_for_row = lower.gpu_id
+                rows.append(
+                    MotivationProfile(
+                        batch_size=3,
+                        fidelity=f"b3_{suffix}" if suffix else "b3",
+                        latency_seconds=latency,
+                        p95_seconds=p95,
+                        quality=quality,
+                        memory_gb=memory,
+                        output_seconds=lower.output_seconds,
+                        gpu_id=gpu_id_for_row,
+                    )
+                )
     return StaticMotivationProfileTable(rows)
 
 
@@ -293,10 +328,12 @@ class SessionSchedulingState:
     def create_idle_job(self, *, job_id: str, now: float) -> ActionJob | None:
         """Create one idle sentinel if no action or idle output is pending."""
         self.advance_to(now)
-        # A held latest action state still represents user work even when its
-        # next heartbeat has not released a replacement job. Do not insert an
-        # idle continuation into that gap; the next action heartbeat must win.
-        if self.departed or self.latest_controls or self.pending_action is not None:
+        # Match the paper simulator's per-session head semantics: once the
+        # released action job has run, the session may contribute an idle
+        # sentinel while it waits for the next heartbeat.  ``submit_action``
+        # still drops a not-yet-dispatched sentinel when a fresh action is
+        # released, so real action work always wins within the session.
+        if self.departed or self.pending_action is not None:
             return None
         if self.pending_idle is not None or self.in_flight is not None:
             return None
@@ -416,12 +453,19 @@ class MigrationEstimate:
     ready_at: float
     cost_seconds: float = 0.0
     required: bool = False
+    first_layer_ready_seconds: float = 0.0
+    transfer_seconds: float = 0.0
+    drain_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.ready_at) or self.ready_at < 0:
             raise ValueError("ready_at must be finite and non-negative")
         if not math.isfinite(self.cost_seconds) or self.cost_seconds < 0:
             raise ValueError("cost_seconds must be non-negative and finite")
+        for name in ("first_layer_ready_seconds", "transfer_seconds", "drain_seconds"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be non-negative and finite")
 
 
 class MigrationEstimator(Protocol):
@@ -438,12 +482,64 @@ class MigrationEstimator(Protocol):
 
 
 class LocalMigrationEstimator:
-    """Default estimator for local execution and fixed residual migration cost."""
+    """Estimate the blocking first-layer boundary, not background drain time.
 
-    def __init__(self, *, migration_cost_seconds: float = 0.0) -> None:
-        if migration_cost_seconds < 0 or not math.isfinite(migration_cost_seconds):
-            raise ValueError("migration_cost_seconds must be non-negative and finite")
+    ``migration_cost_seconds`` remains as a compatibility alias for callers
+    that only have one prior. New callers should provide the measured
+    ``first_layer_ready_seconds`` and optionally retain wire/drain telemetry.
+    Only the first-layer value affects ``ready_at`` and scheduler scoring; the
+    residual transfer and source cleanup are deliberately non-blocking.
+    """
+
+    def __init__(
+        self,
+        *,
+        migration_cost_seconds: float = 0.0,
+        first_layer_ready_seconds: float | None = None,
+        transfer_seconds: float = 0.0,
+        drain_seconds: float = 0.0,
+    ) -> None:
+        values = {
+            "migration_cost_seconds": migration_cost_seconds,
+            "transfer_seconds": transfer_seconds,
+            "drain_seconds": drain_seconds,
+        }
+        if first_layer_ready_seconds is not None:
+            values["first_layer_ready_seconds"] = first_layer_ready_seconds
+        for name, value in values.items():
+            if not math.isfinite(float(value)) or float(value) < 0:
+                raise ValueError(f"{name} must be non-negative and finite")
         self.migration_cost_seconds = float(migration_cost_seconds)
+        self.first_layer_ready_seconds = (
+            self.migration_cost_seconds
+            if first_layer_ready_seconds is None
+            else float(first_layer_ready_seconds)
+        )
+        self.transfer_seconds = float(transfer_seconds)
+        self.drain_seconds = float(drain_seconds)
+
+    def record_phase_timings(
+        self,
+        *,
+        first_layer_ready_seconds: float | None = None,
+        transfer_seconds: float | None = None,
+        drain_seconds: float | None = None,
+    ) -> None:
+        """Update online priors without ever learning full E2E drain time."""
+        values = {
+            "first_layer_ready_seconds": first_layer_ready_seconds,
+            "transfer_seconds": transfer_seconds,
+            "drain_seconds": drain_seconds,
+        }
+        for name, value in values.items():
+            if value is not None and (not math.isfinite(float(value)) or float(value) < 0):
+                raise ValueError(f"{name} must be non-negative and finite")
+        if first_layer_ready_seconds is not None:
+            self.first_layer_ready_seconds = float(first_layer_ready_seconds)
+        if transfer_seconds is not None:
+            self.transfer_seconds = float(transfer_seconds)
+        if drain_seconds is not None:
+            self.drain_seconds = float(drain_seconds)
 
     def estimate(
         self,
@@ -454,11 +550,17 @@ class LocalMigrationEstimator:
     ) -> MigrationEstimate:
         if session.owner_gpu == target_gpu:
             return MigrationEstimate(ready_at=now, required=False)
-        ready_at = max(now + self.migration_cost_seconds, session.migration_ready_at)
+        first_layer_ready = max(0.0, self.first_layer_ready_seconds)
+        ready_at = max(now + first_layer_ready, session.migration_ready_at)
         return MigrationEstimate(
             ready_at=ready_at,
+            # Scheduler cost is the target's first usable layer only. Wire
+            # completion and source drain overlap with target compute.
             cost_seconds=max(0.0, ready_at - now),
             required=True,
+            first_layer_ready_seconds=first_layer_ready,
+            transfer_seconds=max(0.0, self.transfer_seconds),
+            drain_seconds=max(0.0, self.drain_seconds),
         )
 
 
@@ -816,52 +918,44 @@ class MotivationScheduler:
         self._now = now
 
     def _ready_jobs(self) -> tuple[tuple[SessionSchedulingState, ActionJob], ...]:
-        action_ready = [
-            (state, state.pending_action)
-            for state in self._sessions.values()
-            if (
-                not state.departed
-                and state.in_flight is None
-                and state.pending_action is not None
-            )
-        ]
-        # A session with an in-flight invocation is intentionally absent from
-        # both ready lists. Its pending action remains stored on the session and
-        # becomes runnable after completion releases the in-flight slot.
-        # Action jobs have priority over idle sentinels globally.  This also
-        # prevents an idle job from occupying a batch slot while action work is
-        # waiting on another session.
-        if action_ready:
-            return tuple((state, job) for state, job in action_ready if job is not None)
-        if not self.config.include_idle_jobs:
-            return ()
-        idle_ready = [
-            (state, state.pending_idle)
-            for state in self._sessions.values()
-            if (
-                not state.departed
-                and state.in_flight is None
-                and state.pending_idle is not None
-            )
-        ]
-        return tuple((state, job) for state, job in idle_ready if job is not None)
+        ready: list[tuple[SessionSchedulingState, ActionJob]] = []
+        for state in self._sessions.values():
+            # A session with an in-flight invocation is intentionally absent.
+            # Its pending action remains stored and becomes runnable after the
+            # current invocation releases the per-session slot.
+            if state.departed or state.in_flight is not None:
+                continue
+            job = state.ready_job(include_idle=self.config.include_idle_jobs)
+            if job is not None:
+                ready.append((state, job))
+        # Priority is per session, not global: ``ready_job`` returns an action
+        # before that session's idle sentinel, while idle heads from other
+        # sessions remain available as useful batch fillers. Candidate scoring
+        # retains ``action_count`` as the deterministic action-first tie-break.
+        return tuple(ready)
 
     @staticmethod
     def _utility(slack: float, cap: float) -> float:
         """The simulator's ``U(P)=min(P, cap)`` utility."""
         return min(slack, cap)
 
-    def _wait_candidate(self, *, now: float, wait_seconds: float) -> DispatchCandidate:
+    def _wait_candidate(
+        self,
+        *,
+        now: float,
+        wait_seconds: float,
+        states: Sequence[SessionSchedulingState] | None = None,
+        snapshot_epoch: int | None = None,
+    ) -> DispatchCandidate:
+        """Build a wait candidate from either live state or a search snapshot."""
+        source = tuple(self._sessions.values()) if states is None else tuple(states)
+        active_states = tuple(state for state in source if not state.departed)
         wait = max(0.0, wait_seconds)
         projected_slack = {
             state.session_id: state.slack_seconds - (wait if state.playback_active else 0.0)
-            for state in self._sessions.values()
-            if not state.departed
+            for state in active_states
         }
-        score = sum(
-            self._utility(value, self.config.utility_cap_seconds)
-            for value in projected_slack.values()
-        )
+        score = sum(self._utility(value, self.config.utility_cap_seconds) for value in projected_slack.values())
         return DispatchCandidate(
             session_ids=(),
             job_ids=(),
@@ -874,17 +968,9 @@ class MotivationScheduler:
             migration_seconds=0.0,
             score=score,
             projected_slack=projected_slack,
-            projected_quality={
-                state.session_id: state.quality_ema
-                for state in self._sessions.values()
-                if not state.departed
-            },
-            snapshot_epoch=self._epoch,
-            session_versions={
-                state.session_id: state.state_version
-                for state in self._sessions.values()
-                if not state.departed
-            },
+            projected_quality={state.session_id: state.quality_ema for state in active_states},
+            snapshot_epoch=self._epoch if snapshot_epoch is None else snapshot_epoch,
+            session_versions={state.session_id: state.state_version for state in active_states},
             gpu_version=None,
             wait=True,
         )
@@ -911,195 +997,396 @@ class MotivationScheduler:
         observed_at = self._clock() if now is None else now
         excluded = set(exclude_session_ids)
         blocked_migrations = set(blocked_migration_session_ids)
+
+        # Advance and copy the policy state while holding the lock, then do the
+        # expensive Cartesian-product search without it.  Event callbacks can
+        # therefore register sessions and publish completions while a large
+        # ready set is being scored; ``snapshot_epoch`` makes the result fail
+        # closed at reservation time if anything changed meanwhile.
         with self._lock:
             self._advance_to(observed_at)
-            all_ready = self._ready_jobs()
+            live_states = tuple(self._sessions.values())
+            snapshot_states = tuple(replace(state) for state in live_states)
+            snapshot_by_id = {state.session_id: state for state in snapshot_states}
+            all_ready = tuple(
+                (snapshot_by_id[state.session_id], job)
+                for state, job in self._ready_jobs()
+            )
             ready = tuple(item for item in all_ready if item[0].session_id not in excluded)
-            if gpu_states is not None:
-                gpus = tuple(gpu_states)
-            else:
-                gpus = tuple(self._gpus.values())
-            candidates: list[DispatchCandidate] = []
-            enumerated = empty_batch_counts()
-            compatible = empty_batch_counts()
-            profiles_evaluated = empty_batch_counts()
-            feasible = empty_batch_counts()
-            rejected: dict[str, int] = {}
+            gpus = tuple(gpu_states) if gpu_states is not None else tuple(self._gpus.values())
+            snapshot_epoch = self._epoch
 
-            def reject(reason: str) -> None:
-                rejected[reason] = rejected.get(reason, 0) + 1
+        active_states = tuple(state for state in snapshot_states if not state.departed)
+        # Keep the hot loop on compact integer indexes.  Constructing state/job
+        # tuples and projected dictionaries for every losing candidate was the
+        # dominant cost once a trace had 20+ ready sessions.  The original
+        # combinations order is retained so exact-score ties remain stable.
+        ready_states = tuple(state for state, _ in ready)
+        ready_jobs = tuple(job for _, job in ready)
+        ready_keys = tuple(state.compatibility_key for state in ready_states)
+        compatibility_groups: tuple[tuple[int, ...], ...] = tuple(
+            tuple(index for index, key in enumerate(ready_keys) if key == group_key)
+            for group_key in dict.fromkeys(ready_keys)
+        )
+        compatible_combinations: dict[int, tuple[tuple[int, ...], ...]] = {}
+        for size in range(1, min(self.config.max_batch_size, len(ready)) + 1):
+            compatible_combinations[size] = tuple(
+                indexes
+                for indexes in itertools.combinations(range(len(ready)), size)
+                if all(ready_keys[index] == ready_keys[indexes[0]] for index in indexes[1:])
+            )
 
-            if ready:
-                for gpu in gpus:
-                    if not gpu.available:
-                        reject("gpu_unavailable")
+        # ``best_record`` is a lightweight descriptor.  Full candidate maps
+        # are materialized once, after the exhaustive score search has ended.
+        best_record: tuple[
+            tuple[float, int, int, float, int],
+            tuple[int, ...],
+            str,
+            MotivationProfile,
+            float,
+            float,
+            int,
+            float,
+        ] | None = None
+        candidates_best_key: tuple[float, int, int, float, int] | None = None
+        enumerated = empty_batch_counts()
+        compatible = empty_batch_counts()
+        profiles_evaluated = empty_batch_counts()
+        feasible = empty_batch_counts()
+        rejected: dict[str, int] = {}
+
+        def reject(reason: str, count: int = 1) -> None:
+            rejected[reason] = rejected.get(reason, 0) + count
+
+        # Cache profile and migration lookups once per search.  Both are
+        # independent of the selected member combination, while the old loop
+        # repeated them for every profile and combination respectively.
+        profile_cache: dict[tuple[str, int], tuple[MotivationProfile, ...]] = {}
+
+        def profiles_for(gpu: GpuSchedulingState, size: int) -> tuple[MotivationProfile, ...]:
+            cache_key = (gpu.gpu_id, size)
+            profiles = profile_cache.get(cache_key)
+            if profiles is None:
+                profiles = tuple(self.profile_provider.profiles_for(batch_size=size, gpu_id=gpu.gpu_id))
+                profile_cache[cache_key] = profiles
+            return profiles
+
+        # Baseline terms are common to every profile at a given predicted
+        # duration.  Cache only the scalar utility; baseline slack values are
+        # recomputed for the (single) winning descriptor at the end.
+        slack_cache: dict[float, float] = {}
+        utility_cap = self.config.utility_cap_seconds
+        lambda_quality = self.config.lambda_quality
+        lambda_migration = self.config.lambda_migration
+        fairness_delta = self.config.fairness_delta
+        active_quality_sum = sum(state.quality_ema for state in active_states)
+        active_slacks = tuple(state.slack_seconds for state in active_states)
+        active_playback = tuple(state.playback_active for state in active_states)
+        active_index = {state.session_id: index for index, state in enumerate(active_states)}
+        ready_active_index = tuple(active_index[state.session_id] for state in ready_states)
+        ready_quality = tuple(state.quality_ema for state in ready_states)
+        ready_quality_rate = tuple(state.quality_update_rate for state in ready_states)
+        ready_action_flags = tuple(1 if job.kind == "action" else 0 for job in ready_jobs)
+
+        # Migration estimates do not depend on batch size or fidelity.  Keep a
+        # per-GPU vector and derive the small combination metadata once per
+        # compatible member set instead of repeating reductions for every
+        # profile row.
+        estimates_by_gpu: dict[str, tuple[MigrationEstimate, ...]] = {}
+
+        def estimates_for_gpu(
+            gpu: GpuSchedulingState,
+        ) -> tuple[MigrationEstimate, ...]:
+            estimates = estimates_by_gpu.get(gpu.gpu_id)
+            if estimates is None:
+                estimates = tuple(
+                    self.migration_estimator.estimate(
+                        state,
+                        target_gpu=gpu.gpu_id,
+                        now=observed_at,
+                    )
+                    for state in ready_states
+                )
+                estimates_by_gpu[gpu.gpu_id] = estimates
+            return estimates
+
+        if ready:
+            max_size = min(self.config.max_batch_size, len(ready))
+            for gpu in gpus:
+                if not gpu.available:
+                    reject("gpu_unavailable")
+                    continue
+                gpu_estimates: tuple[MigrationEstimate, ...] | None = None
+                for size in range(1, max_size + 1):
+                    total_combinations = math.comb(len(ready), size)
+                    enumerated[size] += total_combinations
+                    combinations = compatible_combinations[size]
+                    compatible[size] += len(combinations)
+                    if total_combinations > len(combinations):
+                        reject("incompatible", total_combinations - len(combinations))
+                    profiles = profiles_for(gpu, size)
+                    if not profiles:
+                        for _ in combinations:
+                            reject("no_profile")
                         continue
-                    for size in range(1, min(self.config.max_batch_size, len(ready)) + 1):
-                        for members in itertools.combinations(ready, size):
-                            enumerated[size] += 1
-                            states = tuple(item[0] for item in members)
-                            jobs = tuple(item[1] for item in members)
-                            keys = {state.compatibility_key for state in states}
-                            if len(keys) != 1:
-                                reject("incompatible")
+                    profiles_evaluated[size] += len(profiles) * len(combinations)
+                    usable_profiles = tuple(
+                        profile
+                        for profile in profiles
+                        if profile.memory_gb <= gpu.memory_free_gb + EPSILON
+                    )
+                    memory_rejected = len(profiles) - len(usable_profiles)
+                    if memory_rejected:
+                        reject("memory", memory_rejected * len(combinations))
+                    if not usable_profiles:
+                        continue
+                    if gpu_estimates is None:
+                        gpu_estimates = estimates_for_gpu(gpu)
+                    profile_bounds: list[tuple[MotivationProfile, float]] = []
+                    earliest_start = max(observed_at, gpu.free_at)
+                    for profile in usable_profiles:
+                        earliest_duration = earliest_start - observed_at + profile.latency_seconds
+                        optimistic_baseline = 0.0
+                        for slack, playback in zip(active_slacks, active_playback, strict=True):
+                            value = slack - earliest_duration if playback else slack
+                            optimistic_baseline += value if value < utility_cap else utility_cap
+                        best_quality_sum = 0.0
+                        for group in compatibility_groups:
+                            if len(group) < size:
                                 continue
-                            compatible[size] += 1
-                            profiles = tuple(self.profile_provider.profiles_for(
-                                batch_size=size,
-                                gpu_id=gpu.gpu_id,
-                            ))
-                            if not profiles:
-                                reject("no_profile")
+                            group_qualities = sorted(
+                                (
+                                    ready_quality[index]
+                                    + ready_quality_rate[index]
+                                    * (profile.quality - ready_quality[index])
+                                    for index in group
+                                ),
+                                reverse=True,
+                            )
+                            quality_sum = sum(group_qualities[:size])
+                            if quality_sum > best_quality_sum:
+                                best_quality_sum = quality_sum
+                        profile_bounds.append(
+                            (
+                                profile,
+                                optimistic_baseline
+                                + size * profile.output_seconds
+                                + lambda_quality * best_quality_sum,
+                            )
+                        )
+                    for indexes in combinations:
+                        migration_count = 0
+                        migration_seconds = 0.0
+                        max_ready_at = observed_at
+                        blocked = False
+                        for index in indexes:
+                            estimate = gpu_estimates[index]
+                            if estimate.required:
+                                migration_count += 1
+                                migration_seconds += estimate.cost_seconds
+                                if ready_states[index].session_id in blocked_migrations:
+                                    blocked = True
+                            if estimate.ready_at > max_ready_at:
+                                max_ready_at = estimate.ready_at
+                        if migration_count and (not self.config.migration_enabled or not allow_migrations):
+                            reject("migration_disabled", len(usable_profiles))
+                            continue
+                        if blocked:
+                            reject("migration_policy", len(usable_profiles))
+                            continue
+                        start_at = max(observed_at, gpu.free_at, max_ready_at)
+                        action_count = sum(ready_action_flags[index] for index in indexes)
+                        active_count = len(active_states)
+                        for profile, optimistic_bound in profile_bounds:
+                            # A profile-level optimistic bound avoids walking
+                            # every member combination once an earlier
+                            # candidate is already strictly better.  The bound
+                            # uses the earliest possible start, grants every
+                            # selected member the full output increment, and
+                            # ignores migration/fairness penalties, so pruning
+                            # cannot remove a true winner.  It is especially
+                            # effective for the 24-session startup burst,
+                            # where a fast B1 profile dominates all larger
+                            # batches under the initial one-second slack.
+                            if (
+                                candidates_best_key is not None
+                                and optimistic_bound < candidates_best_key[0] - EPSILON
+                            ):
                                 continue
-                            profiles_evaluated[size] += len(profiles)
-                            for profile in profiles:
-                                if profile.memory_gb > gpu.memory_free_gb + EPSILON:
-                                    reject("memory")
-                                    continue
-                                estimates = tuple(
-                                    self.migration_estimator.estimate(
-                                        state,
-                                        target_gpu=gpu.gpu_id,
-                                        now=observed_at,
-                                    )
-                                    for state in states
+                            finish_at = start_at + profile.latency_seconds
+                            duration = finish_at - observed_at
+                            baseline_score = slack_cache.get(duration)
+                            if baseline_score is None:
+                                baseline_score = 0.0
+                                for slack, playback in zip(active_slacks, active_playback, strict=True):
+                                    value = slack - duration if playback else slack
+                                    baseline_score += value if value < utility_cap else utility_cap
+                                slack_cache[duration] = baseline_score
+                            score = baseline_score
+                            quality_delta_sum = 0.0
+                            selected_quality_sum = 0.0
+                            selected_qualities: list[float] = []
+                            quality = profile.quality
+                            for index in indexes:
+                                updated_quality = ready_quality[index] + ready_quality_rate[index] * (
+                                    quality - ready_quality[index]
                                 )
-                                if any(
-                                    estimate.required
-                                    and (not self.config.migration_enabled or not allow_migrations)
-                                    for estimate in estimates
-                                ):
-                                    reject("migration_disabled")
-                                    continue
-                                if any(
-                                    estimate.required and state.session_id in blocked_migrations
-                                    for state, estimate in zip(states, estimates)
-                                ):
-                                    reject("migration_policy")
-                                    continue
-                                migration_count = sum(estimate.required for estimate in estimates)
-                                migration_seconds = sum(
-                                    estimate.cost_seconds for estimate in estimates if estimate.required
-                                )
-                                start_at = max(
-                                    observed_at,
-                                    gpu.free_at,
-                                    *(estimate.ready_at for estimate in estimates),
-                                )
-                                finish_at = start_at + profile.latency_seconds
-                                duration = finish_at - observed_at
-                                projected_slack = {
-                                    state.session_id: state.slack_seconds
-                                    - (duration if state.playback_active else 0.0)
-                                    for state in self._sessions.values()
-                                    if not state.departed
-                                }
-                                projected_quality = {
-                                    state.session_id: state.quality_ema
-                                    for state in self._sessions.values()
-                                    if not state.departed
-                                }
-                                for state in states:
-                                    projected_quality[state.session_id] = (
-                                        (1.0 - state.quality_update_rate) * state.quality_ema
-                                        + state.quality_update_rate * profile.quality
-                                    )
-                                    projected_slack[state.session_id] += profile.output_seconds
-                                selected_quality = [projected_quality[state.session_id] for state in states]
-                                system_quality = (
-                                    sum(projected_quality.values()) / len(projected_quality)
-                                    if projected_quality
-                                    else 0.0
-                                )
-                                if any(
-                                    value < system_quality - self.config.fairness_delta - EPSILON
-                                    for value in selected_quality
-                                ):
-                                    reject("fairness")
-                                    continue
-                                feasible[size] += 1
-                                score = sum(
-                                    self._utility(value, self.config.utility_cap_seconds)
-                                    for value in projected_slack.values()
-                                )
-                                score += self.config.lambda_quality * sum(selected_quality)
-                                # Penalize both transfer count and predicted transfer time.
-                                score -= self.config.lambda_migration * (migration_count + migration_seconds)
-                                candidates.append(
-                                    DispatchCandidate(
-                                        session_ids=tuple(state.session_id for state in states),
-                                        job_ids=tuple(job.job_id for job in jobs),
-                                        gpu_id=gpu.gpu_id,
-                                        fidelity=profile.fidelity,
-                                        profile=profile,
-                                        start_at=start_at,
-                                        finish_at=finish_at,
-                                        migration_count=migration_count,
-                                        migration_seconds=migration_seconds,
-                                        score=score,
-                                        projected_slack=projected_slack,
-                                        projected_quality=projected_quality,
-                                        snapshot_epoch=self._epoch,
-                                        session_versions={
-                                            state.session_id: state.state_version for state in states
-                                        },
-                                        gpu_version=gpu.version,
-                                    )
-                                )
-            if include_wait:
-                candidates.append(self._wait_candidate(now=observed_at, wait_seconds=wait_seconds))
-            selected = (
-                max(
-                    candidates,
-                    key=lambda candidate: (
-                        candidate.score,
-                        candidate.action_count,
-                        candidate.batch_size,
-                        -candidate.finish_at,
-                        -candidate.migration_count,
-                    ),
+                                selected_qualities.append(updated_quality)
+                                selected_quality_sum += updated_quality
+                                quality_delta_sum += updated_quality - ready_quality[index]
+                            system_quality = (
+                                (active_quality_sum + quality_delta_sum) / active_count
+                                if active_count
+                                else 0.0
+                            )
+                            fairness_limit = system_quality - fairness_delta - EPSILON
+                            if any(value < fairness_limit for value in selected_qualities):
+                                reject("fairness")
+                                continue
+                            feasible[size] += 1
+                            output_seconds = profile.output_seconds
+                            for index in indexes:
+                                active_idx = ready_active_index[index]
+                                before = active_slacks[active_idx]
+                                if active_playback[active_idx]:
+                                    before -= duration
+                                after = before + output_seconds
+                                before_utility = before if before < utility_cap else utility_cap
+                                after_utility = after if after < utility_cap else utility_cap
+                                score += after_utility - before_utility
+                            score += lambda_quality * selected_quality_sum
+                            # Penalize both transfer count and predicted transfer time.
+                            score -= lambda_migration * (migration_count + migration_seconds)
+                            candidate_key = (
+                                score,
+                                action_count,
+                                size,
+                                -finish_at,
+                                -migration_count,
+                            )
+                            if candidates_best_key is not None and candidate_key <= candidates_best_key:
+                                continue
+                            candidates_best_key = candidate_key
+                            best_record = (
+                                candidate_key,
+                                indexes,
+                                gpu.gpu_id,
+                                profile,
+                                start_at,
+                                finish_at,
+                                migration_count,
+                                migration_seconds,
+                            )
+
+        # Compare the model winner with the deliberate wait option only after
+        # the search.  Model candidates are enumerated before the wait option,
+        # so an exact tie intentionally keeps the model candidate (matching
+        # ``max``'s stable first-winner behavior in the reference algorithm).
+        selected: DispatchCandidate | None = None
+        if best_record is not None:
+            (
+                best_key,
+                best_indexes,
+                best_gpu_id,
+                best_profile,
+                best_start_at,
+                best_finish_at,
+                best_migration_count,
+                best_migration_seconds,
+            ) = best_record
+            candidates_best_key = best_key
+            duration = best_finish_at - observed_at
+            projected_slack = {}
+            for state in active_states:
+                value = state.slack_seconds - (duration if state.playback_active else 0.0)
+                projected_slack[state.session_id] = value
+            for index in best_indexes:
+                session_id = ready_states[index].session_id
+                projected_slack[session_id] += best_profile.output_seconds
+            projected_quality = {
+                state.session_id: state.quality_ema for state in active_states
+            }
+            for index in best_indexes:
+                state = ready_states[index]
+                projected_quality[state.session_id] = state.quality_ema + state.quality_update_rate * (
+                    best_profile.quality - state.quality_ema
                 )
-                if candidates
-                else None
+            selected = DispatchCandidate(
+                session_ids=tuple(ready_states[index].session_id for index in best_indexes),
+                job_ids=tuple(ready_jobs[index].job_id for index in best_indexes),
+                gpu_id=best_gpu_id,
+                fidelity=best_profile.fidelity,
+                profile=best_profile,
+                start_at=best_start_at,
+                finish_at=best_finish_at,
+                migration_count=best_migration_count,
+                migration_seconds=best_migration_seconds,
+                score=best_key[0],
+                projected_slack=projected_slack,
+                projected_quality=projected_quality,
+                snapshot_epoch=snapshot_epoch,
+                session_versions={
+                    ready_states[index].session_id: ready_states[index].state_version
+                    for index in best_indexes
+                },
+                gpu_version=next(
+                    (gpu.version for gpu in gpus if gpu.gpu_id == best_gpu_id),
+                    None,
+                ),
             )
-            not_selected = dict(feasible)
-            if selected is not None and not selected.wait:
-                not_selected[selected.batch_size] = max(
-                    0, not_selected[selected.batch_size] - 1
-                )
-            selected_batch_size = selected.batch_size if selected is not None else 0
-            summary = MotivationSearchSummary(
-                observed_at=observed_at,
-                snapshot_epoch=self._epoch,
-                ready_count=len(ready),
-                ready_action_count=sum(1 for _, job in ready if job.kind == "action"),
-                ready_idle_count=sum(1 for _, job in ready if job.kind == "idle"),
-                excluded_ready_count=len(all_ready) - len(ready),
-                gpu_count=len(gpus),
-                include_wait=include_wait,
-                allow_migrations=allow_migrations,
-                wait_seconds=max(0.0, wait_seconds),
-                enumerated_by_batch_size=enumerated,
-                compatible_by_batch_size=compatible,
-                profiles_evaluated_by_batch_size=profiles_evaluated,
-                feasible_by_batch_size=feasible,
-                rejected_by_reason=rejected,
-                not_selected_by_score=not_selected,
-                selected_batch_size=selected_batch_size,
-                selected_wait=bool(selected.wait) if selected is not None else False,
-                selected_gpu_id=selected.gpu_id if selected is not None else None,
-                selected_fidelity=selected.fidelity if selected is not None else None,
-                selected_score=selected.score if selected is not None else None,
-                selected_migration_count=(selected.migration_count if selected is not None else 0),
-                selected_session_ids=selected.session_ids if selected is not None else (),
-                selected_job_ids=selected.job_ids if selected is not None else (),
+        if include_wait:
+            wait_candidate = self._wait_candidate(
+                now=observed_at,
+                wait_seconds=wait_seconds,
+                states=snapshot_states,
+                snapshot_epoch=snapshot_epoch,
             )
-            try:
-                self._diagnostics.record_search(summary)
-            except Exception:
-                # Diagnostics must never affect policy availability.
-                pass
-            return selected
+            wait_key = (
+                wait_candidate.score,
+                wait_candidate.action_count,
+                wait_candidate.batch_size,
+                -wait_candidate.finish_at,
+                -wait_candidate.migration_count,
+            )
+            if selected is None or candidates_best_key is None or wait_key > candidates_best_key:
+                selected = wait_candidate
+                candidates_best_key = wait_key
+
+        not_selected = dict(feasible)
+        if selected is not None and not selected.wait:
+            not_selected[selected.batch_size] = max(0, not_selected[selected.batch_size] - 1)
+        summary = MotivationSearchSummary(
+            observed_at=observed_at,
+            snapshot_epoch=snapshot_epoch,
+            ready_count=len(ready),
+            ready_action_count=sum(1 for _, job in ready if job.kind == "action"),
+            ready_idle_count=sum(1 for _, job in ready if job.kind == "idle"),
+            excluded_ready_count=len(all_ready) - len(ready),
+            gpu_count=len(gpus),
+            include_wait=include_wait,
+            allow_migrations=allow_migrations,
+            wait_seconds=max(0.0, wait_seconds),
+            enumerated_by_batch_size=enumerated,
+            compatible_by_batch_size=compatible,
+            profiles_evaluated_by_batch_size=profiles_evaluated,
+            feasible_by_batch_size=feasible,
+            rejected_by_reason=rejected,
+            not_selected_by_score=not_selected,
+            selected_batch_size=selected.batch_size if selected is not None else 0,
+            selected_wait=bool(selected.wait) if selected is not None else False,
+            selected_gpu_id=selected.gpu_id if selected is not None else None,
+            selected_fidelity=selected.fidelity if selected is not None else None,
+            selected_score=selected.score if selected is not None else None,
+            selected_migration_count=(selected.migration_count if selected is not None else 0),
+            selected_session_ids=selected.session_ids if selected is not None else (),
+            selected_job_ids=selected.job_ids if selected is not None else (),
+        )
+        try:
+            self._diagnostics.record_search(summary)
+        except Exception:
+            # Diagnostics must never affect policy availability.
+            pass
+        return selected
 
     def record_dispatch_diagnostics(self, summary: MotivationDispatchSummary) -> None:
         """Publish a dispatch outcome without coupling policy to a logger."""

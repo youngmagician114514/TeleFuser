@@ -348,6 +348,44 @@ def test_default_scheduler_coalesces_compatible_sessions() -> None:
     service.stop()
 
 
+
+def test_policy_batch_executes_exact_selected_members_in_one_physical_call() -> None:
+    service, pipeline = _service(output_queue_size=4, max_batch_size=2, control_idle_timeout=30)
+    service.configure_session_capacity(2)
+    first = _create(service, "policy-first")
+    second = _create(service, "policy-second")
+    first_state = service._session(first)
+    second_state = service._session(second)
+    assert first_state is not None and second_state is not None
+    try:
+        assert _take_and_notify(service, first_state)["type"] == "preview"
+        assert _take_and_notify(service, second_state)["type"] == "preview"
+        with service._scheduler_condition:
+            service._scheduler_paused = True
+        motivation = {
+            "kind": "action",
+            "batch_size": 2,
+            "fidelity": "b2_s2_w6_rho0_bf16",
+            "one_shot": True,
+        }
+        service.push_batch(
+            [
+                (first, {"type": "control_state", "controls": ["KeyW"], "motivation": motivation}),
+                (second, {"type": "control_state", "controls": ["KeyD"], "motivation": motivation}),
+            ]
+        )
+        assert first_state.in_flight is True
+        assert second_state.in_flight is True
+        with service._scheduler_condition:
+            service._scheduler_paused = False
+            service._scheduler_condition.notify_all()
+        assert _take_and_notify(service, first_state)["scheduler"]["batch_size"] == 2
+        assert _take_and_notify(service, second_state)["scheduler"]["batch_size"] == 2
+        assert pipeline.batch_sizes[-1] == 2
+        assert pipeline.fidelity_calls[-1].name == "b2_s2_w6_rho0_bf16"
+    finally:
+        service.stop()
+
 def test_motivation_one_shot_control_emits_one_chunk() -> None:
     service, pipeline = _service(output_queue_size=4, max_batch_size=1, control_idle_timeout=30)
     service.configure_session_capacity(1)
@@ -368,7 +406,9 @@ def test_motivation_one_shot_control_emits_one_chunk() -> None:
                 },
             },
         )
-        assert _take_and_notify(service, state)["type"] == "chunk"
+        payload = _take_and_notify(service, state)
+        assert payload["type"] == "chunk"
+        assert payload["scheduler"]["motivation_job_id"] == "session:action:1"
         time.sleep(0.05)
         assert len(pipeline.generate_calls) == 1
         assert pipeline.fidelity_calls[0].name == "b1_s2_w6_rho0_bf16"

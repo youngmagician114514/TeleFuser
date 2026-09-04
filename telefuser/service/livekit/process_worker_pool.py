@@ -223,16 +223,37 @@ class ProcessLiveKitWorkerPool:
             raise
 
     def dispatch_batch(self, lease: Any, payloads: list[tuple[str, dict]]) -> None:
-        """Send a policy-selected batch to the owning child process."""
-        del lease
+        """Send a policy-selected batch to one owning child process.
+
+        The physical route is checked against the reserved candidate before
+        enqueueing. The job/session metadata lets a child report an execution
+        failure back to the Motivation bridge, which can then roll back the
+        reservation even though IPC dispatch itself is asynchronous.
+        """
+        expected_worker_id = getattr(getattr(lease, "candidate", None), "gpu_id", None)
+        job_ids = [str(job.job_id) for job in getattr(lease, "jobs", ())]
+        session_ids = [str(session_id) for session_id, _ in payloads]
         grouped: dict[str, list[tuple[str, dict]]] = {}
         for session_id, chunk in payloads:
             worker_id = self._session_workers.get(session_id)
             if worker_id is None:
                 raise RuntimeError(f"Session {session_id!r} is not assigned to a live worker")
+            if expected_worker_id is not None and worker_id != expected_worker_id:
+                raise RuntimeError(
+                    f"Motivation owner mismatch for {session_id!r}: "
+                    f"candidate={expected_worker_id!r} actual={worker_id!r}"
+                )
             grouped.setdefault(worker_id, []).append((session_id, dict(chunk)))
         for worker_id, items in grouped.items():
-            self._send(worker_id, {"type": "dispatch_batch", "items": items})
+            self._send(
+                worker_id,
+                {
+                    "type": "dispatch_batch",
+                    "items": items,
+                    "motivation_job_ids": job_ids,
+                    "motivation_session_ids": session_ids,
+                },
+            )
 
     async def stop_session(self, session_id: str) -> None:
         """Stop a child-owned room and wait for model-state cleanup."""
@@ -413,6 +434,15 @@ class ProcessLiveKitWorkerPool:
         if event_type == "model_dispatch_trace":
             self._record_dispatch_trace(event)
             return
+        if event_type == "motivation_dispatch_failed":
+            callback = getattr(self._event_sink, "on_motivation_dispatch_failed", None)
+            if callable(callback):
+                callback(
+                    job_ids=tuple(str(value) for value in event.get("job_ids", ())),
+                    session_ids=tuple(str(value) for value in event.get("session_ids", ())),
+                    error=str(event.get("error", "physical batch dispatch failed")),
+                )
+            return
         worker_id = event.get("worker_id")
         if event_type == "worker_ready":
             future = self._startup.get(worker_id)
@@ -492,7 +522,7 @@ class ProcessLiveKitWorkerPool:
                     continue
                 if worker_id in self._stopping_workers:
                     error = None
-                    if handle.process.exitcode != 0:
+                    if handle.process.exitcode not in (0, -15):
                         error = f"Worker process exited during shutdown with code {handle.process.exitcode}"
                     self._resolve_pending_requests(worker_id, error)
                     self._discard_handle(worker_id)
@@ -501,10 +531,16 @@ class ProcessLiveKitWorkerPool:
                     continue
                 self._handle_unexpected_exit(worker_id, handle.process.exitcode)
 
-    def _handle_unexpected_exit(self, worker_id: str, exitcode: int | None) -> None:
+    def _handle_unexpected_exit(
+        self,
+        worker_id: str,
+        exitcode: int | None,
+        *,
+        expected: bool = False,
+    ) -> None:
         self._active_workers.discard(worker_id)
-        self._event_sink.on_worker_status(worker_id, "failed")
-        error = f"Worker process exited unexpectedly with code {exitcode}"
+        self._event_sink.on_worker_status(worker_id, "stopped" if expected else "failed")
+        error = None if expected else f"Worker process exited unexpectedly with code {exitcode}"
         self._resolve_pending_requests(worker_id, error)
         for session_id, owner in tuple(self._session_workers.items()):
             if owner == worker_id:
@@ -739,7 +775,22 @@ async def _run_process_worker(
                     )
                 elif command_type == "dispatch_batch":
                     items = [(str(session_id), dict(chunk)) for session_id, chunk in command["items"]]
-                    worker.dispatch_batch(items)
+                    try:
+                        worker.dispatch_batch(items)
+                    except Exception as exc:
+                        if command.get("motivation_job_ids"):
+                            events.put(
+                                {
+                                    "type": "motivation_dispatch_failed",
+                                    "worker_id": spec.worker_id,
+                                    "job_ids": [str(value) for value in command.get("motivation_job_ids", ())],
+                                    "session_ids": [
+                                        str(value) for value in command.get("motivation_session_ids", ())
+                                    ],
+                                    "error": repr(exc),
+                                }
+                            )
+                        raise
                 elif command_type == "stop_session":
                     session_id = command["session_id"]
                     await worker.stop_session(session_id)

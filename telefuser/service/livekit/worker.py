@@ -26,6 +26,7 @@ _CONTROLLER_JOIN_TIMEOUT_SECONDS = 60.0
 _VIDEO_DRAIN_GRACE_SECONDS = 0.5
 _DELIVERY_ACK_TIMEOUT_SECONDS = 15.0
 _VIDEO_TRACK_SUBSCRIPTION_GRACE_SECONDS = 2.0
+_PIPELINE_SESSION_READY_TIMEOUT_SECONDS = 120.0
 
 
 class WorkerEventSink(Protocol):
@@ -119,6 +120,7 @@ class LiveKitWorker:
         self.gpu_num = gpu_num
         self._active_session_id: str | None = None
         self._pipeline_session_id: str | None = None
+        self._pipeline_session_registered = False
         # LiveKit data can arrive after the controller joins but before the
         # worker has finished creating its pipeline session. Keep only the
         # latest control state; this matches the action-channel coalescing
@@ -169,10 +171,21 @@ class LiveKitWorker:
             self.event_sink.on_worker_status(self.worker_id, "starting_pipeline")
             self.event_sink.on_session_status(record.session_id, "starting_pipeline")
             if self.pipeline_adapter.stream_mode == STREAM_MODE_BIDIRECTIONAL:
+                self._pipeline_session_registered = False
                 self._pipeline_session_id = self.pipeline_adapter.create_session(record.config)
+                wait_session_ready = getattr(self.pipeline_adapter, "wait_session_ready", None)
+                if callable(wait_session_ready):
+                    await asyncio.wait_for(
+                        wait_session_ready(self._pipeline_session_id),
+                        timeout=_PIPELINE_SESSION_READY_TIMEOUT_SECONDS,
+                    )
                 self._publisher_progress_sequence = 0
                 self._publisher_frame_tracking_enabled = self._enable_publisher_frame_tracking()
                 self.event_sink.on_pipeline_session(record.session_id, self._pipeline_session_id)
+                # The LiveKit RTC callback may run on another thread. Publish
+                # the route as registered only after the runtime has installed
+                # its Motivation session state, then replay the latest control.
+                self._pipeline_session_registered = True
                 self._flush_pending_control(record)
                 chunks = self.pipeline_adapter.pull_chunks(self._pipeline_session_id)
             elif self.pipeline_adapter.stream_mode == STREAM_MODE_SERVER_PUSH:
@@ -229,7 +242,11 @@ class LiveKitWorker:
         if self._active_session_id != session_id:
             raise RuntimeError(f"Worker {self.worker_id} has no active session {session_id!r}")
         pipeline_session_id = self._pipeline_session_id
-        if pipeline_session_id is None:
+        pipeline_not_ready = pipeline_session_id is None or (
+            self.pipeline_adapter.stream_mode == STREAM_MODE_BIDIRECTIONAL
+            and not self._pipeline_session_registered
+        )
+        if pipeline_not_ready:
             raise RuntimeError(f"Session {session_id!r} has not created its pipeline state yet")
         self.pipeline_adapter.push_chunk(pipeline_session_id, chunk)
 
@@ -373,9 +390,13 @@ class LiveKitWorker:
             self._deliver_control_chunk(record, pending)
 
     def _deliver_control_chunk(self, record: SessionRecord, chunk: dict[str, Any]) -> None:
-        """Deliver a normalized control or retain it until the pipeline exists."""
+        """Deliver a normalized control or retain it until registration completes."""
         pipeline_session_id = self._pipeline_session_id
-        if pipeline_session_id is None:
+        pipeline_not_ready = pipeline_session_id is None or (
+            self.pipeline_adapter.stream_mode == STREAM_MODE_BIDIRECTIONAL
+            and not self._pipeline_session_registered
+        )
+        if pipeline_not_ready:
             if chunk.get("type") == "stop":
                 self._pending_control_chunk = None
                 self._stop_event.set()
@@ -547,6 +568,7 @@ class LiveKitWorker:
     async def _close_active_session(self) -> None:
         pipeline_session_id = self._pipeline_session_id
         self._pipeline_session_id = None
+        self._pipeline_session_registered = False
         self._pending_control_chunk = None
         if pipeline_session_id is not None:
             with contextlib.suppress(Exception):

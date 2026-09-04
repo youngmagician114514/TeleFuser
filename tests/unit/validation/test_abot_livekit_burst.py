@@ -472,3 +472,49 @@ def test_checked_in_workloads_resolve_repo_native_images() -> None:
     for scenario_path in scenario_paths:
         scenario = wave.load_scenario(scenario_path)
         assert Path(scenario.session.image_path).is_relative_to(wave._REPO_ROOT)
+
+
+def test_phase_summary_counts_missing_first_frame_as_timeout(tmp_path: Path) -> None:
+    scenario = _load_scenario(tmp_path)
+    runner, _ = _runner_for_scheduling(scenario)
+    session = _session(0, scenario)
+    session.create_started_at = 0.0
+    session.first_active_control_at = 0.0
+    session.admission_status = "assigned"
+    runner._sessions = [session]
+
+    result = runner._summarize_phase(
+        scenario.phases[0],
+        phase_started=0.0,
+        phase_completed=20.0,
+        samples=[],
+    )
+    summary = result["summary"]
+    assert summary["admission"]["assigned_not_ready_sessions"] == 1
+    assert summary["admission"]["worker_ready_sessions"] == 0
+    assert summary["no_first_frame_sessions"] == 1
+    assert summary["first_frame_timeout_sessions"] == 1
+    assert summary["action_to_first_generated_seconds"]["count"] == 1
+    assert summary["action_to_first_generated_seconds"]["p95"] == pytest.approx(20.0)
+
+
+def test_phase_summary_counts_no_first_frame_before_grace_as_lower_bound(tmp_path: Path) -> None:
+    scenario = _load_scenario(tmp_path)
+    runner, _ = _runner_for_scheduling(scenario)
+    session = _session(0, scenario)
+    session.create_started_at = 0.0
+    session.first_active_control_at = 0.0
+    session.admission_status = "assigned"
+    runner._sessions = [session]
+
+    result = runner._summarize_phase(
+        scenario.phases[0],
+        phase_started=0.0,
+        phase_completed=2.0,
+        samples=[],
+    )
+    summary = result["summary"]
+    assert summary["no_first_frame_sessions"] == 1
+    assert summary["first_frame_timeout_sessions"] == 1
+    assert summary["action_to_first_generated_seconds"]["count"] == 1
+    assert summary["action_to_first_generated_seconds"]["p95"] == pytest.approx(2.0)

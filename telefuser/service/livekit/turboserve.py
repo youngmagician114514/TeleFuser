@@ -428,7 +428,9 @@ class TurboServeSchedulerConfig:
     capacity_per_worker: int = 1
     target_utilization: float = 0.9
     scale_in_hold_seconds: float = 5.0
-    migration_eta: float = 0.35
+    # Only the target first-layer-ready boundary blocks scheduling. Wire
+    # completion and source drain are tracked separately and overlap compute.
+    migration_eta: float = 0.01
     min_gain_ms: float = 40.0
     rebalance_iteration_limit: int = 3
 
@@ -448,10 +450,20 @@ class TurboServeSessionView:
 
 @dataclass(frozen=True)
 class TurboServeRuntimeCalibration:
-    """Measured values that replace the migration-model cold estimate."""
+    """Measured values for migration-aware placement.
+
+    ``average_migration_total_ms`` remains an observability fallback for old
+    backends. Split-aware backends should publish first-layer readiness; that
+    value is the only migration latency charged to a placement decision.
+    """
 
     average_migration_total_ms: float = 0.0
+    # Keep the original positional second field stable for older callers.
     base_chunk_latency_ms: float = 0.0
+    average_first_layer_ready_ms: float = 0.0
+    average_transfer_complete_ms: float = 0.0
+    average_blocking_drain_ms: float = 0.0
+    average_background_cleanup_ms: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -500,6 +512,11 @@ class TurboServeLatencyModel:
     )
 
     def migration_cost_ms(self, session: TurboServeSessionView, calibration: TurboServeRuntimeCalibration) -> float:
+        # Publisher/source drain overlaps target computation and is not a
+        # placement-blocking cost. Prefer measured first-layer readiness; the
+        # full-E2E value is retained only for pre-split backend compatibility.
+        if calibration.average_first_layer_ready_ms > 0:
+            return calibration.average_first_layer_ready_ms
         if calibration.average_migration_total_ms > 0:
             return calibration.average_migration_total_ms
         return self.migration_alpha_ms + session.state_size_mb / max(1e-9, self.migration_bandwidth_mb_per_ms)

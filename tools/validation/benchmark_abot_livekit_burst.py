@@ -540,6 +540,7 @@ class LiveKitWaveSession:
     create_started_at: float | None = field(default=None, init=False)
     created_at: float | None = field(default=None, init=False)
     connected_at: float | None = field(default=None, init=False)
+    worker_ready_at: float | None = field(default=None, init=False)
     initial_control_barrier_arrived_at: float | None = field(default=None, init=False)
     initial_control_barrier_released_at: float | None = field(default=None, init=False)
     first_media_frame_at: float | None = field(default=None, init=False)
@@ -704,7 +705,10 @@ class LiveKitWaveSession:
             data = payload.get("data") if isinstance(payload.get("data"), Mapping) else payload
             stage = data.get("stage") if isinstance(data, Mapping) else None
             if stage in {"worker_running", "runtime_ready"}:
-                self.record_event("worker_ready", session=self.logical_id, stage=stage)
+                now = time.perf_counter()
+                if self.worker_ready_at is None:
+                    self.worker_ready_at = now
+                    self.record_event("worker_ready", session=self.logical_id, stage=stage)
 
         @room.on("track_subscribed")
         def on_track_subscribed(track: Any, _publication: Any, _participant: Any) -> None:
@@ -809,7 +813,12 @@ class LiveKitWaveSession:
         except asyncio.CancelledError:
             raise
 
-    async def _publish_control_state(self, controls: tuple[str, ...]) -> None:
+    async def _publish_control_state(
+        self,
+        controls: tuple[str, ...],
+        *,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
         """Publish one reliable control heartbeat and retain its public state."""
         if self._room is None:
             return
@@ -817,6 +826,8 @@ class LiveKitWaveSession:
         if gate is not None and not gate.is_set():
             return
         payload = {"type": "control_state", "controls": list(controls)}
+        if metadata:
+            payload.update(metadata)
         await self._room.local_participant.publish_data(
             json.dumps(payload, separators=(",", ":")).encode("utf-8"),
             topic=_CONTROL_TOPIC,
@@ -900,6 +911,12 @@ class LiveKitWaveSession:
             "scheduled": self.scheduled_at is not None,
             "admission_contract_violation": self.admission_violation,
             "connected": self.connected,
+            "worker_ready": self.worker_ready_at is not None,
+            "worker_ready_seconds": (
+                round(self.worker_ready_at - self.create_started_at, 6)
+                if self.worker_ready_at is not None and self.create_started_at is not None
+                else None
+            ),
             "stop_requested": self.stop_requested,
             "departure_scheduled": self.departure_scheduled,
             "remote_session_deleted": self.remote_session_deleted,
@@ -1104,6 +1121,19 @@ class LiveKitWaveRunner:
             samples=self._samples[sample_start:],
         )
         self._phase_results.append(result)
+        admission_summary = result["summary"]["admission"]
+        assigned_not_ready = int(admission_summary["assigned_not_ready_sessions"])
+        if assigned_not_ready:
+            warning = (
+                f"Phase {phase.name!r}: {assigned_not_ready} API-assigned session(s) never reached "
+                "worker_ready; counted as admission timeout/failure."
+            )
+            self._warnings.append(warning)
+            self.record_event(
+                "admission_ready_mismatch",
+                phase=phase.name,
+                assigned_not_ready_sessions=assigned_not_ready,
+            )
         self.record_event("phase_completed", phase=phase.name, summary=result["summary"])
 
     def _schedule_transition(self, phase: Phase) -> None:
@@ -1458,11 +1488,28 @@ class LiveKitWaveRunner:
             and session.create_started_at <= phase_completed
             and (session.stopped_at is None or session.stopped_at >= phase_started)
         ]
-        action_to_first = [
-            session.first_generated_frame_at - session.first_active_control_at
-            for session in phase_sessions
-            if session.first_generated_frame_at is not None and session.first_active_control_at is not None
-        ]
+        action_to_first: list[float] = []
+        first_frame_timeout_sessions = 0
+        first_frame_failure_sessions = 0
+        no_first_frame_sessions = 0
+        for session in phase_sessions:
+            if session.first_generated_frame_at is not None and session.first_active_control_at is not None:
+                action_to_first.append(session.first_generated_frame_at - session.first_active_control_at)
+                continue
+            if session.first_generated_frame_at is not None:
+                continue
+            no_first_frame_sessions += 1
+            if session.error is not None:
+                first_frame_failure_sessions += 1
+            if session.first_active_control_at is not None:
+                # A phase-end observation with no first frame is always part
+                # of A2F. The elapsed value is a lower bound when the session
+                # has not yet crossed the normal first-generation grace; do
+                # not let that user disappear from the percentile population.
+                elapsed = max(0.0, phase_completed - session.first_active_control_at)
+                action_to_first.append(elapsed)
+                if session.error is None:
+                    first_frame_timeout_sessions += 1
         # The all-user SLO denominator includes every requested session after
         # its grace interval, including rejected, disconnected, or stalled users
         # as zero-FPS observations.
@@ -1475,6 +1522,14 @@ class LiveKitWaveRunner:
         demand_slo_hits = sum(value >= slo_threshold for value in demand_slo_observations)
         assigned_sessions = sum(session.admission_status == "assigned" for session in phase_population)
         queued_sessions = sum(session.admission_status == "queued" for session in phase_population)
+        worker_ready_sessions = sum(session.worker_ready_at is not None for session in phase_population)
+        assigned_not_ready_sessions = sum(
+            session.admission_status == "assigned" and session.worker_ready_at is None for session in phase_population
+        )
+        ready_not_assigned_sessions = sum(
+            session.worker_ready_at is not None and session.admission_status != "assigned"
+            for session in phase_population
+        )
         unassigned_sessions = len(phase_population) - assigned_sessions - queued_sessions
         admission_contract_satisfied = not self.scenario.admission.require_immediate_assignment or all(
             session.admission_status == "assigned" for session in phase_population
@@ -1491,6 +1546,14 @@ class LiveKitWaveRunner:
                 "phase_population_sessions": len(phase_population),
                 "assigned_sessions": assigned_sessions,
                 "queued_sessions": queued_sessions,
+                "worker_ready_sessions": worker_ready_sessions,
+                # ``assigned`` is an API placement offer; only the explicit
+                # worker-ready event is model admission. Keep both counts so
+                # an assigned-but-never-ready session cannot look successful.
+                "admitted_sessions": worker_ready_sessions,
+                "assigned_not_ready_sessions": assigned_not_ready_sessions,
+                "ready_not_assigned_sessions": ready_not_assigned_sessions,
+                "admission_ready_matches_assignment": assigned_not_ready_sessions == 0,
                 "unassigned_or_failed_sessions": unassigned_sessions,
                 "immediate_assignment_satisfied": admission_contract_satisfied,
             },
@@ -1500,6 +1563,9 @@ class LiveKitWaveRunner:
             "per_active_session_delivery_fps": _summary(active_session_fps),
             "per_session_delivery_fps": _summary(per_session_fps),
             "action_to_first_generated_seconds": _summary(action_to_first),
+            "no_first_frame_sessions": no_first_frame_sessions,
+            "first_frame_timeout_sessions": first_frame_timeout_sessions,
+            "first_frame_failure_sessions": first_frame_failure_sessions,
             "slo_target_fps": self.scenario.session.fps,
             "slo_tolerance_fps": self.scenario.slo_fps_tolerance,
             "slo_threshold_fps": round(slo_threshold, 6),
@@ -1588,7 +1654,7 @@ def _print_summary(result: Mapping[str, Any]) -> None:
     print("\\nABot LiveKit black-box user-wave results")
     print(
         "phase                         target  max-req  max-input  agg-FPS  FPS/demand  FPS/all-user  "
-        "admitted  demand-SLO  all-user-SLO  A2F-p95(s)"
+        "ready  demand-SLO  all-user-SLO  A2F-p95(s)"
     )
     for phase in result["phase_results"]:
         summary = phase["summary"]
@@ -1604,7 +1670,7 @@ def _print_summary(result: Mapping[str, Any]) -> None:
             f"{aggregate['mean']:>8.3f} "
             f"{summary['per_active_session_delivery_fps']['mean']:>10.3f} "
             f"{per_user['mean']:>13.3f} "
-            f"{admission['assigned_sessions']:>3}/{admission['phase_population_sessions']:<3} "
+            f"{admission['worker_ready_sessions']:>3}/{admission['phase_population_sessions']:<3} "
             f"{summary['demand_slo_sample_attainment'] * 100:>10.1f}% "
             f"{summary['slo_sample_attainment'] * 100:>12.1f}% "
             f"{a2f['p95']:>11.3f} "

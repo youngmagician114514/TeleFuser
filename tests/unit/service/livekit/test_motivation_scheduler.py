@@ -10,9 +10,11 @@ from telefuser.service.livekit.async_migration import (
 )
 from telefuser.service.livekit.motivation_scheduler import (
     GpuSchedulingState,
+    LocalMigrationEstimator,
     MotivationProfile,
     MotivationScheduler,
     MotivationSchedulerConfig,
+    SessionSchedulingState,
     StaticMotivationProfileTable,
     load_motivation_profiles_csv,
 )
@@ -147,13 +149,36 @@ def test_action_drops_only_a_pending_idle_sentinel() -> None:
     assert scheduler.session("s").pending_idle is None
 
 
-def test_idle_is_not_inserted_while_latest_action_state_is_held() -> None:
+def test_idle_can_follow_a_completed_action_before_the_next_heartbeat() -> None:
     scheduler = _scheduler()
     scheduler.register_session("s", owner_gpu="gpu-0", now=0.0)
-    scheduler.submit_action("s", ["W"], now=0.0, release=True)
+    action, _ = scheduler.submit_action("s", ["W"], now=0.0, release=True)
+    assert action is not None
+    candidate = scheduler.find_best(now=0.0, include_wait=False)
+    assert candidate is not None
+    scheduler.reserve(candidate, now=0.0)
+    scheduler.complete(candidate, completed_at=0.1)
 
-    assert scheduler.create_idle_job("s", now=0.1) is None
-    assert scheduler.session("s").pending_idle is None
+    idle = scheduler.create_idle_job("s", now=0.1)
+
+    assert idle is not None
+    assert scheduler.session("s").latest_controls == ("W",)
+
+
+def test_action_and_another_sessions_idle_head_can_share_a_batch() -> None:
+    scheduler = _scheduler(max_batch_size=2)
+    scheduler.register_session("action", owner_gpu="gpu-0", now=0.0, compatibility_key=(3,))
+    scheduler.register_session("idle", owner_gpu="gpu-0", now=0.0, compatibility_key=(3,))
+    action, _ = scheduler.submit_action("action", ["W"], now=0.0)
+    idle = scheduler.create_idle_job("idle", now=0.0)
+
+    candidate = scheduler.find_best(now=0.0, include_wait=False)
+
+    assert action is not None and idle is not None
+    assert candidate is not None
+    assert set(candidate.job_ids) == {action.job_id, idle.job_id}
+    assert candidate.batch_size == 2
+    assert candidate.action_count == 1
 
 
 def test_candidate_uses_global_slack_and_same_compatibility_key() -> None:
@@ -313,3 +338,36 @@ def test_profile_loader_reads_abot_offline_table(tmp_path) -> None:
     assert table.profiles_for(batch_size=1, gpu_id="gpu-0")[0].quality == pytest.approx(0.7)
     assert table.profiles_for(batch_size=4, gpu_id="gpu-0")[0].quality == pytest.approx(0.7)
     assert table.profiles_for(batch_size=8, gpu_id="gpu-0") == ()
+
+
+def test_profile_loader_synthesizes_missing_b3_between_b2_and_b4(tmp_path) -> None:
+    profile = tmp_path / "profile.csv"
+    profile.write_text(
+        "B,latency_ms,memory_GB,Q_world,config,latency_p95_ms\n"
+        "1,100,10,0.9,b1_lane,110\n"
+        "2,180,15,0.9,b2_lane,190\n"
+        "4,320,25,0.8,b4_lane,340\n",
+        encoding="utf-8",
+    )
+    table = load_motivation_profiles_csv(profile, max_batch_size=4)
+    rows = table.profiles_for(batch_size=3, gpu_id=None)
+    assert len(rows) == 1
+    assert rows[0].fidelity == "b3_lane"
+    assert rows[0].latency_seconds == pytest.approx(0.25)
+    assert rows[0].p95_seconds == pytest.approx(0.265)
+    assert rows[0].quality == pytest.approx(0.8)
+
+
+def test_migration_estimator_charges_first_layer_not_background_drain() -> None:
+    estimator = LocalMigrationEstimator(
+        first_layer_ready_seconds=0.01,
+        transfer_seconds=0.008,
+        drain_seconds=1.3,
+    )
+    session = SessionSchedulingState("s", "gpu-0", slack_seconds=1.0, quality_ema=0.8)
+    estimate = estimator.estimate(session, target_gpu="gpu-1", now=5.0)
+    assert estimate.required is True
+    assert estimate.cost_seconds == pytest.approx(0.01)
+    assert estimate.first_layer_ready_seconds == pytest.approx(0.01)
+    assert estimate.transfer_seconds == pytest.approx(0.008)
+    assert estimate.drain_seconds == pytest.approx(1.3)

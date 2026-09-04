@@ -34,6 +34,28 @@ class LiveKitPipelineAdapter:
         """Return the detected TeleFuser stream interaction mode."""
         return self.stream_service.stream_mode
 
+    @property
+    def uses_relative_rope(self) -> bool | None:
+        """Return the concrete ABot DiT's Relative-RoPE capability."""
+        denoise_stage = self.denoise_stage
+        dit = getattr(denoise_stage, "dit", None)
+        value = getattr(dit, "use_relative_rope", None)
+        return bool(value) if value is not None else None
+
+    @property
+    def denoise_stage(self) -> object | None:
+        """Expose the loaded pipeline's RoPE capability to ABot scheduling.
+
+        The ABot service uses this read-only capability when constructing a
+        batch key. Process-NCCL workers wrap the concrete service in
+        ``StreamPipelineService``; hiding ``denoise_stage`` makes the service
+        fail closed as Absolute-RoPE and unnecessarily separates sessions at
+        different latent cursors, even though Relative-RoPE supports them.
+        """
+        service = getattr(self.stream_service, "service", None)
+        pipeline = getattr(service, "pipeline", None)
+        return getattr(pipeline, "denoise_stage", None)
+
     async def aclose(self) -> None:
         """Stop the wrapped stream service."""
         await self.stream_service.aclose()
@@ -47,6 +69,12 @@ class LiveKitPipelineAdapter:
     def push_batch(self, items: list[tuple[str, dict]]) -> None:
         """Apply policy-selected controls while holding the service boundary."""
         push_batch = getattr(self.stream_service, "push_batch", None)
+        if not callable(push_batch):
+            # The wrapper owns transport lifecycle while the concrete pipeline
+            # service owns the atomic scheduling boundary. ABot exposes
+            # push_batch on that nested service; checking only the wrapper
+            # silently fell back to one push_chunk per member.
+            push_batch = getattr(getattr(self.stream_service, "service", None), "push_batch", None)
         if callable(push_batch):
             push_batch(items)
             return

@@ -603,3 +603,103 @@ def test_livekit_worker_releases_unpublished_frame_credit_on_publish_failure_or_
 
     asyncio.run(run(RuntimeError("publish failed")))
     asyncio.run(run(asyncio.CancelledError()))
+
+
+def test_livekit_worker_waits_for_model_ready_before_running_status() -> None:
+    async def _run() -> None:
+        class ReadyAdapter(FakePipelineAdapter):
+            def __init__(self) -> None:
+                super().__init__()
+                self.ready_started = asyncio.Event()
+                self.ready_gate = asyncio.Event()
+
+            async def wait_session_ready(self, session_id: str) -> None:
+                assert session_id == "pipeline-session-1"
+                self.ready_started.set()
+                await self.ready_gate.wait()
+
+        adapter = ReadyAdapter()
+        sink = FakeSink()
+        worker = LiveKitWorker(
+            worker_id="worker-0",
+            config=LiveKitServeConfig(
+                livekit_url="wss://livekit.example",
+                livekit_api_key="key",
+                livekit_api_secret="secret",
+            ),
+            pipeline_file="pipeline.py",
+            token_service=FakeTokenService(),
+            event_sink=sink,
+            pipeline_adapter=adapter,
+            room_client=FakeRoomClient(),
+        )
+        record = SessionRecord(
+            session_id="session-ready",
+            room_name="room-ready",
+            controller_identity="controller",
+            status="assigned",
+            worker_id="worker-0",
+            config={"session_id": "session-ready", "fps": 12},
+            created_at=0,
+            updated_at=0,
+        )
+
+        task = asyncio.create_task(worker.run_session(record))
+        await adapter.ready_started.wait()
+        assert sink.pipeline_sessions == []
+        assert ("session-ready", "running", None) not in sink.session_statuses
+
+        adapter.ready_gate.set()
+        await adapter.output_queue.put(None)
+        await task
+        assert sink.pipeline_sessions == [("session-ready", "pipeline-session-1")]
+        assert sink.session_statuses[-1] == ("session-ready", "running", None)
+
+    asyncio.run(_run())
+
+
+def test_livekit_worker_buffers_control_until_motivation_registration() -> None:
+    async def _run() -> None:
+        config = LiveKitServeConfig(
+            livekit_url="wss://livekit.example", livekit_api_key="key", livekit_api_secret="secret"
+        )
+        adapter = FakePipelineAdapter()
+        room = FakeRoomClient()
+
+        class RegistrationRaceSink(FakeSink):
+            def on_pipeline_session(self, session_id: str, pipeline_session_id: str) -> None:
+                super().on_pipeline_session(session_id, pipeline_session_id)
+                room.emit_control({"type": "control", "event": "press", "key": "ArrowUp"})
+
+        sink = RegistrationRaceSink()
+        worker = LiveKitWorker(
+            worker_id="worker-0",
+            config=config,
+            pipeline_file="pipeline.py",
+            token_service=FakeTokenService(),
+            event_sink=sink,
+            pipeline_adapter=adapter,
+            room_client=room,
+        )
+        record = SessionRecord(
+            session_id="session-1",
+            room_name="room-1",
+            controller_identity="controller",
+            status="assigned",
+            worker_id="worker-0",
+            config={"session_id": "session-1", "fps": 16},
+            created_at=0,
+            updated_at=0,
+        )
+
+        await worker.start(skip_validation=True)
+        task = asyncio.create_task(worker.run_session(record))
+        await _wait_for(lambda: len(adapter.pushed) == 1)
+        await adapter.output_queue.put(None)
+        await task
+
+        assert adapter.pushed == [
+            ("pipeline-session-1", {"type": "control", "event": "press", "key": "ArrowUp"})
+        ]
+
+    asyncio.run(_run())

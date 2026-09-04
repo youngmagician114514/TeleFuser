@@ -7,6 +7,7 @@ state, so a committed migration changes only the model route, not the room.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import json
 import socket
@@ -61,8 +62,23 @@ _TERMINAL_OUTPUT_TYPES = frozenset({"error", "done"})
 _NCCL_INIT_GROUP_TIMEOUT_SECONDS = 180.0
 _NCCL_INIT_PARENT_TIMEOUT_SECONDS = 210.0
 _MIGRATION_COMMAND_TIMEOUT_SECONDS = 300.0
+_MODEL_SESSION_READY_TIMEOUT_SECONDS = 120.0
 
 _MigrationResult = TypeVar("_MigrationResult")
+
+
+def _validate_nccl_source_leaves(leaves: dict[tuple[Any, ...], torch.Tensor]) -> None:
+    """Reject a mixed/CPU source tree before a peer is asked to receive it."""
+
+    non_cuda_paths = [path for path, tensor in leaves.items() if tensor.device.type != "cuda"]
+    if not non_cuda_paths:
+        return
+    preview = ", ".join(repr(path) for path in non_cuda_paths[:4])
+    suffix = "..." if len(non_cuda_paths) > 4 else ""
+    raise RuntimeError(
+        "NCCL migration source tensors must reside on CUDA; "
+        f"found CPU leaves at {preview}{suffix}"
+    )
 
 
 @dataclass(frozen=True)
@@ -217,6 +233,10 @@ async def _pump_model_outputs(
 
 class _ProcessPipelineAdapter:
     stream_mode = STREAM_MODE_BIDIRECTIONAL
+    # The concrete ABot pipeline lives in the child model process. Its native
+    # batched path supports per-session cursors under Relative-RoPE, so expose
+    # that immutable capability to the parent-side scheduler explicitly.
+    uses_relative_rope = True
 
     def __init__(self, pool: "NCCLProcessLiveKitWorkerPool", initial_worker_id: str) -> None:
         self._pool = pool
@@ -226,6 +246,13 @@ class _ProcessPipelineAdapter:
         session_id = str(config["session_id"])
         self._pool.create_model_session(self._initial_worker_id, session_id, config)
         return session_id
+
+    async def wait_session_ready(self, session_id: str) -> None:
+        """Wait until the child has created the model-owned session."""
+        await self._pool.wait_model_session_ready(
+            session_id,
+            timeout=_MODEL_SESSION_READY_TIMEOUT_SECONDS,
+        )
 
     def push_chunk(self, session_id: str, chunk: dict) -> None:
         self._pool.push_model_chunk(session_id, chunk)
@@ -314,11 +341,23 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         self._provisional_migration_controls: dict[str, list[dict]] = {}
         self._provisional_model_events: dict[str, list[dict[str, Any]]] = {}
         self._migration_ready_waiters: dict[str, asyncio.Future[None]] = {}
+        self._model_session_ready: dict[str, concurrent.futures.Future[str]] = {}
+        # A LiveKit room can depart while its model state is being transferred.
+        # Defer the route teardown until the migration transaction has either
+        # committed the target or restored the source; closing the source in
+        # the middle of a P2P copy can invalidate NCCL buffers on both peers.
+        self._active_migrations: set[str] = set()
+        self._deferred_model_closes: set[str] = set()
         # Worker snapshots include scalar timings/counters plus the bounded
         # scheduler mode string (``batched`` or ``round_robin``).
         self._worker_runtime_metrics: dict[str, dict[str, float | int | str]] = {}
         self._session_runtime_metrics: dict[str, dict[str, float | int | str]] = {}
         self._migration_total_ms: list[float] = []
+        self._migration_first_layer_ms: list[float] = []
+        self._migration_transfer_complete_ms: list[float] = []
+        self._migration_drain_ms: list[float] = []
+        self._migration_background_cleanup_ms: list[float] = []
+        self._migration_deferred_publisher_frames = 0
         self._migration_cleanup_failures = 0
         self._migration_diagnostics = MigrationDiagnostics()
         self._nccl_ranks: dict[str, int] = {}
@@ -329,18 +368,38 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         # isolated-worker modes. Recreating it here would reject the path it
         # has just created, preventing a traced process-NCCL run from starting.
 
-    def _handle_unexpected_exit(self, worker_id: str, exitcode: int | None) -> None:
+    def _handle_unexpected_exit(
+        self,
+        worker_id: str,
+        exitcode: int | None,
+        *,
+        expected: bool = False,
+    ) -> None:
         """Attach migration context before the base pool tears down a dead worker."""
 
+        # The suite terminates the server process group with SIGTERM after it
+        # has persisted metrics.  That signal reaches children at the same
+        # time as the parent's cleanup coroutine, so the monitor can observe
+        # ``-15`` before ``_stopping_workers`` is populated.  Treat it as a
+        # normal teardown and keep it out of migration-failure diagnostics.
+        expected = expected or exitcode == -15 or (exitcode == 0 and self._closing)
         diagnostics = getattr(self, "_migration_diagnostics", None)
-        if isinstance(diagnostics, MigrationDiagnostics):
-            diagnostics.record_worker_exit(worker_id, exitcode)
-        logger.error(
-            f"NCCL worker exited unexpectedly: worker={worker_id} exit_code={exitcode} "
-            "active_migrations="
-            f"{diagnostics.snapshot().get('active', 0) if isinstance(diagnostics, MigrationDiagnostics) else 0}"
-        )
-        super()._handle_unexpected_exit(worker_id, exitcode)
+        if expected:
+            logger.info(f"NCCL worker exited during normal shutdown: worker={worker_id} exit_code={exitcode}")
+        else:
+            if isinstance(diagnostics, MigrationDiagnostics):
+                diagnostics.record_worker_exit(worker_id, exitcode)
+            logger.error(
+                f"NCCL worker exited unexpectedly: worker={worker_id} exit_code={exitcode} "
+                "active_migrations="
+                f"{diagnostics.snapshot().get('active', 0) if isinstance(diagnostics, MigrationDiagnostics) else 0}"
+            )
+        error = None if expected else RuntimeError(f"Worker process exited unexpectedly with code {exitcode}")
+        readiness_error = error or RuntimeError(f"Worker process shut down before model readiness (code {exitcode})")
+        for session_id, ready in tuple(self._model_session_ready.items()):
+            if self._session_workers.get(session_id) == worker_id and not ready.done():
+                ready.set_exception(readiness_error)
+        super()._handle_unexpected_exit(worker_id, exitcode, expected=expected)
 
     async def start(self, *, skip_validation: bool = False) -> None:
         # ``ProcessLiveKitWorkerPool.start`` calls this class's ``scale_to``
@@ -391,8 +450,10 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         task.add_done_callback(lambda done, sid=record.session_id: self._transport_task_done(sid, done))
 
     def dispatch_batch(self, lease: Any, payloads: list[tuple[str, dict]]) -> None:
-        """Send a policy-selected batch through the parent transport routes."""
+        """Send one policy-selected batch through the parent transport routes."""
         expected_worker_id = getattr(getattr(lease, "candidate", None), "gpu_id", None)
+        job_ids = [str(job.job_id) for job in getattr(lease, "jobs", ())]
+        session_ids = [str(session_id) for session_id, _ in payloads]
         grouped: dict[str, list[tuple[str, dict]]] = {}
         for session_id, chunk in payloads:
             runner = self._transport_workers.get(session_id)
@@ -408,7 +469,15 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                 )
             grouped.setdefault(worker_id, []).append((runner.pipeline_session_id, dict(chunk)))
         for worker_id, items in grouped.items():
-            self._send(worker_id, {"type": "model_push_batch", "items": items})
+            self._send(
+                worker_id,
+                {
+                    "type": "model_push_batch",
+                    "items": items,
+                    "motivation_job_ids": job_ids,
+                    "motivation_session_ids": session_ids,
+                },
+            )
 
     def dispatch_owner(self, session_id: str) -> str | None:
         """Resolve a LiveKit transport session to its physical model route."""
@@ -427,6 +496,8 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                 await asyncio.wait_for(asyncio.shield(task), timeout=15.0)
 
     def create_model_session(self, worker_id: str, session_id: str, config: dict) -> None:
+        if session_id in self._model_session_ready:
+            raise RuntimeError(f"Model session {session_id!r} is already being created")
         output: asyncio.Queue[_ModelOutput | None] = asyncio.Queue(maxsize=_MODEL_OUTPUT_PARENT_QUEUE_SIZE)
         drained = asyncio.Event()
         drained.set()
@@ -438,15 +509,42 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         self._publisher_frame_tracking[session_id] = True
         self._session_workers[session_id] = worker_id
         self._ownership.register(session_id, worker_id)
-        self._send(
-            worker_id,
-            {
-                "type": "model_create",
-                "session_id": session_id,
-                "config": dict(config),
-                "model_output_credit_window": _MODEL_OUTPUT_PARENT_QUEUE_SIZE,
-            },
-        )
+        # A concurrent future is loop-independent because session creation is
+        # submitted synchronously while readiness is awaited by the transport
+        # task. This also keeps direct pool tests usable outside asyncio.run().
+        ready: concurrent.futures.Future[str] = concurrent.futures.Future()
+        self._model_session_ready[session_id] = ready
+        try:
+            self._send(
+                worker_id,
+                {
+                    "type": "model_create",
+                    "session_id": session_id,
+                    "config": dict(config),
+                    "model_output_credit_window": _MODEL_OUTPUT_PARENT_QUEUE_SIZE,
+                },
+            )
+        except Exception:
+            self._model_session_ready.pop(session_id, None)
+            self._model_outputs.pop(session_id, None)
+            self._model_output_drained.pop(session_id, None)
+            self._model_output_dropped.pop(session_id, None)
+            self._pipeline_routes.pop(session_id, None)
+            self._session_workers.pop(session_id, None)
+            self._ownership.release(session_id)
+            ready.cancel()
+            raise
+
+    async def wait_model_session_ready(self, session_id: str, *, timeout: float) -> None:
+        """Wait for a child model-create ACK, failing closed on timeout."""
+        ready = self._model_session_ready.get(session_id)
+        if ready is None:
+            raise RuntimeError(f"Model session {session_id!r} has no pending readiness ACK")
+        try:
+            await asyncio.wait_for(asyncio.wrap_future(ready), timeout=timeout)
+        finally:
+            if ready.done():
+                self._model_session_ready.pop(session_id, None)
 
     def push_model_chunk(self, session_id: str, chunk: dict) -> None:
         if session_id in self._provisional_migration_controls:
@@ -546,6 +644,16 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         return True
 
     def close_model_session(self, session_id: str) -> None:
+        if session_id in self._active_migrations:
+            self._deferred_model_closes.add(session_id)
+            return
+        self._close_model_session_now(session_id)
+
+    def _close_model_session_now(self, session_id: str) -> None:
+        """Release a model route after any in-flight migration has settled."""
+        ready = self._model_session_ready.pop(session_id, None)
+        if ready is not None and not ready.done():
+            ready.set_exception(RuntimeError(f"Model session {session_id!r} was closed before readiness"))
         worker_id = self._pipeline_routes.pop(session_id, None)
         self._session_workers.pop(session_id, None)
         self._ownership.release(session_id)
@@ -688,14 +796,24 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
             await asyncio.wait_for(drained.wait(), timeout=timeout)
 
     @staticmethod
-    def _source_model_output_drain_complete(status: object) -> bool:
+    def _source_model_output_drain_complete(
+        status: object, *, require_publisher: bool = True
+    ) -> bool:
+        """Return whether source model state is quiescent for migration.
+
+        Publisher-owned frames are transport data, not model state. Progressive
+        SST may therefore start once the child service queue is empty; those
+        already-materialized frames continue draining through the parent while
+        the target receives state. Callers that are closing a route can retain
+        the stricter publisher check explicitly.
+        """
         if not isinstance(status, dict):
             return False
-        return bool(
-            not status.get("in_flight", True)
-            and status.get("output_queue_empty", False)
-            and int(status.get("publisher_unsubmitted_frames", 1)) == 0
-        )
+        if status.get("in_flight", True) or not status.get("output_queue_empty", False):
+            return False
+        if require_publisher and int(status.get("publisher_unsubmitted_frames", 1)) != 0:
+            return False
+        return True
 
     async def _drain_model_outputs_for_migration(
         self,
@@ -703,25 +821,20 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         *,
         source_worker_id: str,
         timeout: float,
-    ) -> None:
-        """Drain child Fq and parent publisher Fp before copying model state.
+    ) -> dict[str, Any]:
+        """Quiesce model output before SST while publisher frames drain in background.
 
-        The child pump intentionally remains active until the source service
-        reports no queued model output and no publisher-owned frames. Each
-        status request is a command-queue barrier, so it follows all earlier
-        publisher-progress commands for this child. A parent drain after the
-        barrier accounts for model-output events emitted before that barrier.
+        The child service queue is the model-state boundary. Once it is empty
+        and no model output is in flight, no future source computation can
+        mutate the snapshot. Parent-transport/publisher frames may still be
+        outstanding (bounded by the output credit window); they remain on the
+        existing LiveKit route while the target imports state.
         """
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("Timed out draining model output before NCCL migration")
-            await self._wait_for_model_output_drain(session_id, timeout=remaining)
-
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("Timed out waiting for source drain status before NCCL migration")
             status_event = await self._request(
                 source_worker_id,
                 "model_output_drain_status",
@@ -729,29 +842,9 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                 timeout=remaining,
             )
             status = status_event.get("result")
-            if not self._source_model_output_drain_complete(status):
-                await asyncio.sleep(0.001)
-                continue
-
-            # The source barrier follows all of its model-output events; drain
-            # those parent transport payloads before accepting the snapshot.
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("Timed out draining parent transport before NCCL migration")
-            await self._wait_for_model_output_drain(session_id, timeout=remaining)
-
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("Timed out confirming source drain before NCCL migration")
-            final_event = await self._request(
-                source_worker_id,
-                "model_output_drain_status",
-                session_id=session_id,
-                timeout=remaining,
-            )
-            if self._source_model_output_drain_complete(final_event.get("result")):
-                return
-            await asyncio.sleep(0.001)
+            if self._source_model_output_drain_complete(status, require_publisher=False):
+                return dict(status) if isinstance(status, dict) else {}
+            await asyncio.sleep(min(0.005, max(0.001, deadline - time.monotonic())))
 
     async def _run_migration_phase(
         self,
@@ -828,6 +921,7 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                 f"NCCL migration started: transfer={token.token_id} "
                 f"source={source_worker_id} target={target_worker_id}"
             )
+            self._active_migrations.add(pipeline_session_id)
             self._migrating_controls[pipeline_session_id] = []
             started = time.monotonic()
             source_output_paused = False
@@ -887,7 +981,8 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                 # ABot marks only this session as migrating and waits for its
                 # own boundary. Other sessions on both workers keep running
                 # while the state transfer is prepared.
-                await self._run_migration_phase(
+                drain_started = time.monotonic()
+                drain_status = await self._run_migration_phase(
                     token.token_id,
                     "drain",
                     lambda: self._drain_model_outputs_for_migration(
@@ -896,6 +991,11 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                         timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
                     ),
                 )
+                self._migration_drain_ms.append((time.monotonic() - drain_started) * 1000.0)
+                if isinstance(drain_status, dict):
+                    self._migration_deferred_publisher_frames += max(
+                        0, int(drain_status.get("publisher_unsubmitted_frames", 0))
+                    )
 
                 async def pause_and_verify() -> None:
                     nonlocal source_output_paused
@@ -915,7 +1015,9 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                         session_id=pipeline_session_id,
                         timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
                     )
-                    if not self._source_model_output_drain_complete(paused_status_event.get("result")):
+                    if not self._source_model_output_drain_complete(
+                        paused_status_event.get("result"), require_publisher=False
+                    ):
                         raise RuntimeError("Source output changed while preparing NCCL migration")
 
                 await self._run_migration_phase(token.token_id, "pause", pause_and_verify)
@@ -1013,6 +1115,14 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                         report = event.get("result") if isinstance(event, dict) else None
                         if isinstance(report, dict) and isinstance(report.get("groups"), list):
                             diagnostics.set_transport_report(token.token_id, report)
+                            progress_report = report.get("progress")
+                            if isinstance(progress_report, dict):
+                                first_layer_ms = progress_report.get("first_layer_ready_ms")
+                                transfer_complete_ms = progress_report.get("transfer_complete_ms")
+                                if isinstance(first_layer_ms, int | float) and float(first_layer_ms) >= 0:
+                                    self._migration_first_layer_ms.append(float(first_layer_ms))
+                                if isinstance(transfer_complete_ms, int | float) and float(transfer_complete_ms) >= 0:
+                                    self._migration_transfer_complete_ms.append(float(transfer_complete_ms))
                             break
                 async def commit_route() -> TurboServeOwnership:
                     ownership = self._ownership.commit_migration(token)
@@ -1027,6 +1137,7 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                 # to roll back to state that may already have been deleted.
                 completed = True
                 self._provisional_migration_controls.pop(pipeline_session_id, None)
+                cleanup_started = time.monotonic()
                 try:
                     await self._run_migration_phase(
                         token.token_id,
@@ -1044,6 +1155,8 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                         f"NCCL source cleanup failed after committed migration: "
                         f"session={pipeline_session_id} source={source_worker_id} error={exc}"
                     )
+                finally:
+                    self._migration_background_cleanup_ms.append((time.monotonic() - cleanup_started) * 1000.0)
                 staged_events = self._provisional_model_events.pop(pipeline_session_id, [])
                 for event in staged_events:
                     self._dispatch_event(event)
@@ -1080,9 +1193,19 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                 # without allowing a stale active transfer in the snapshot.
                 if not completed and isinstance(diagnostics, MigrationDiagnostics):
                     diagnostics.finish(token.token_id, outcome="aborted", error="migration interrupted")
+                self._active_migrations.discard(pipeline_session_id)
+                if pipeline_session_id in self._deferred_model_closes:
+                    self._deferred_model_closes.discard(pipeline_session_id)
+                    with contextlib.suppress(Exception):
+                        self._close_model_session_now(pipeline_session_id)
 
     def turboserve_snapshot(self) -> dict[str, object]:
         snapshot = super().turboserve_snapshot()
+        migration_total_ms = tuple(getattr(self, "_migration_total_ms", ()))
+        migration_first_layer_ms = tuple(getattr(self, "_migration_first_layer_ms", ()))
+        migration_transfer_complete_ms = tuple(getattr(self, "_migration_transfer_complete_ms", ()))
+        migration_drain_ms = tuple(getattr(self, "_migration_drain_ms", ()))
+        migration_background_cleanup_ms = tuple(getattr(self, "_migration_background_cleanup_ms", ()))
         snapshot.update(
             {
                 "migration_supported": bool(self._nccl_ranks),
@@ -1095,9 +1218,35 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                 },
                 "session_runtime_metrics": dict(self._session_runtime_metrics),
                 "migration_calibration": {
-                    "average_total_ms": sum(self._migration_total_ms) / len(self._migration_total_ms)
-                    if self._migration_total_ms
-                    else 0.0
+                    # ``average_total_ms`` is retained for diagnostics only;
+                    # placement uses first-layer readiness below and never
+                    # learns the publisher/source-drain tail as blocking cost.
+                    "average_total_ms": sum(migration_total_ms) / len(migration_total_ms)
+                    if migration_total_ms
+                    else 0.0,
+                    "average_first_layer_ready_ms": (
+                        sum(migration_first_layer_ms) / len(migration_first_layer_ms)
+                        if migration_first_layer_ms
+                        else 0.0
+                    ),
+                    "average_transfer_complete_ms": (
+                        sum(migration_transfer_complete_ms) / len(migration_transfer_complete_ms)
+                        if migration_transfer_complete_ms
+                        else 0.0
+                    ),
+                    "average_blocking_drain_ms": (
+                        sum(migration_drain_ms) / len(migration_drain_ms)
+                        if migration_drain_ms
+                        else 0.0
+                    ),
+                    "average_background_cleanup_ms": (
+                        sum(migration_background_cleanup_ms) / len(migration_background_cleanup_ms)
+                        if migration_background_cleanup_ms
+                        else 0.0
+                    ),
+                    "deferred_publisher_frames": int(
+                        getattr(self, "_migration_deferred_publisher_frames", 0)
+                    ),
                 },
                 "migration_diagnostics": (
                     self._migration_diagnostics.snapshot()
@@ -1247,6 +1396,25 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         trace.append(record)
 
     def _dispatch_event(self, event: dict[str, Any]) -> None:
+        event_type = event.get("type")
+        if event_type in {"model_session_ready", "model_session_failed"}:
+            session_id = str(event.get("session_id", ""))
+            ready = self._model_session_ready.get(session_id)
+            expected_worker = self._session_workers.get(session_id)
+            reported_worker = str(event.get("worker_id", ""))
+            if ready is not None and not ready.done():
+                if expected_worker != reported_worker:
+                    ready.set_exception(
+                        RuntimeError(
+                            f"Model session {session_id!r} readiness reported by unexpected worker "
+                            f"{reported_worker!r}; expected {expected_worker!r}"
+                        )
+                    )
+                elif event_type == "model_session_ready":
+                    ready.set_result(session_id)
+                else:
+                    ready.set_exception(RuntimeError(str(event.get("error", "model session creation failed"))))
+            return
         if event.get("type") == "nccl_first_layer_ready":
             waiter = self._migration_ready_waiters.get(str(event.get("transfer_id", "")))
             if waiter is not None and not waiter.done():
@@ -1258,11 +1426,15 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
             staged = provisional_events.get(session_id) if isinstance(provisional_events, dict) else None
             if staged is not None:
                 # The target may finish speculative/progressive compute before
-                # the residual copy transaction commits.  Retain the raw event
-                # (and therefore its child output credit) until source cleanup
-                # and ownership publication are both durable.
-                staged.append(dict(event))
-                return
+                # the residual copy transaction commits. Retain only target
+                # events until source cleanup and ownership publication are
+                # durable. A source event can still be delivered after the
+                # route flips because publisher draining is intentionally
+                # asynchronous; enqueue it on the existing parent queue.
+                target_worker = self._pipeline_routes.get(session_id)
+                if target_worker is None or str(event.get("worker_id")) == str(target_worker):
+                    staged.append(dict(event))
+                    return
         if event.get("type") == "worker_start_failed":
             # Startup failures arrive before the base monitor can invoke the
             # unexpected-exit hook. Capture the child traceback/error here;
@@ -1293,11 +1465,26 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         if event.get("type") == "model_dispatch_trace":
             self._record_dispatch_trace(event)
             return
+        if event.get("type") == "model_batch_failed":
+            callback = getattr(self._event_sink, "on_motivation_dispatch_failed", None)
+            if callable(callback):
+                callback(
+                    job_ids=tuple(str(value) for value in event.get("job_ids", ())),
+                    session_ids=tuple(str(value) for value in event.get("session_ids", ())),
+                    error=str(event.get("error", "physical batch dispatch failed")),
+                )
+            return
         if event.get("type") == "model_output_eos":
             # ``close_model_session`` installs the parent queue sentinel and
             # asks the child to release retained state. It is deliberately
             # idempotent because the transport finally block also calls back.
-            self.close_model_session(str(event["session_id"]))
+            session_id = str(event["session_id"])
+            current_worker = self._pipeline_routes.get(session_id)
+            if current_worker is not None and str(event.get("worker_id")) != str(current_worker):
+                # A source EOS can arrive after progressive routing has moved
+                # the session. It must not tear down the target model route.
+                return
+            self.close_model_session(session_id)
             return
         if event.get("type") == "model_output":
             metrics = event.get("runtime_metrics")
@@ -1635,7 +1822,18 @@ async def _run_nccl_model_worker(
             request_id, kind = command.get("request_id"), command["type"]
             try:
                 if kind == "model_create":
-                    session_id = adapter.create_session(command["config"])
+                    try:
+                        session_id = adapter.create_session(command["config"])
+                    except Exception as exc:
+                        events.put(
+                            {
+                                "type": "model_session_failed",
+                                "worker_id": spec.worker_id,
+                                "session_id": str(command.get("session_id", "")),
+                                "error": repr(exc),
+                            }
+                        )
+                        raise
                     try:
                         publisher_tracking_enabled = bool(adapter.enable_publisher_frame_tracking(session_id))
                     except Exception:
@@ -1648,6 +1846,16 @@ async def _run_nccl_model_worker(
                             "enabled": publisher_tracking_enabled,
                         }
                     )
+                    # ACK the model-owned session before starting its output
+                    # pump. The parent can now publish ``pipeline_session`` and
+                    # register Motivation state before the first payload event.
+                    events.put(
+                        {
+                            "type": "model_session_ready",
+                            "worker_id": spec.worker_id,
+                            "session_id": session_id,
+                        }
+                    )
                     start_pump(
                         session_id,
                         credit_window=int(command.get("model_output_credit_window", _MODEL_OUTPUT_PARENT_QUEUE_SIZE)),
@@ -1655,9 +1863,24 @@ async def _run_nccl_model_worker(
                 elif kind == "model_push":
                     adapter.push_chunk(command["session_id"], command["chunk"])
                 elif kind == "model_push_batch":
-                    adapter.push_batch(
-                        [(str(session_id), dict(chunk)) for session_id, chunk in command["items"]]
-                    )
+                    try:
+                        adapter.push_batch(
+                            [(str(session_id), dict(chunk)) for session_id, chunk in command["items"]]
+                        )
+                    except Exception as exc:
+                        if command.get("motivation_job_ids"):
+                            events.put(
+                                {
+                                    "type": "model_batch_failed",
+                                    "worker_id": spec.worker_id,
+                                    "job_ids": [str(value) for value in command.get("motivation_job_ids", ())],
+                                    "session_ids": [
+                                        str(value) for value in command.get("motivation_session_ids", ())
+                                    ],
+                                    "error": repr(exc),
+                                }
+                            )
+                        raise
                 elif kind == "model_publisher_frame_progress":
                     adapter.report_publisher_frame_progress(
                         command["session_id"],
@@ -1714,6 +1937,7 @@ async def _run_nccl_model_worker(
                 elif kind == "nccl_export":
                     metadata = await asyncio.to_thread(service.prepare_migration_nccl_metadata, command["session_id"])
                     tensor_leaves = metadata.pop("_nccl_tensor_leaves")
+                    _validate_nccl_source_leaves(tensor_leaves)
                     outgoing[command["transfer_id"]] = (
                         tensor_leaves,
                         build_layer_transfer_groups(metadata["tensor_manifest"]),

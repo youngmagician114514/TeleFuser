@@ -158,7 +158,7 @@ class ActionTraceSession(wave.LiveKitWaveSession):
         self.trace_actions_published = 0
         self.trace_actions_deferred = 0
         self.trace_actions_dropped = 0
-        self._deferred_controls: tuple[str, ...] | None = None
+        self._deferred_controls: tuple[tuple[str, ...], dict[str, Any]] | None = None
 
     def _start_control_task(self) -> None:
         """Disable the synthetic random-control task from the parent runner."""
@@ -167,9 +167,9 @@ class ActionTraceSession(wave.LiveKitWaveSession):
     async def _connect_room(self, livekit_url: str, token: str) -> None:
         await super()._connect_room(livekit_url, token)
         if self._deferred_controls is not None and not self.stop_requested:
-            controls = self._deferred_controls
+            controls, metadata = self._deferred_controls
             self._deferred_controls = None
-            await self._publish_trace_controls(controls, source="deferred_latest")
+            await self._publish_trace_controls(controls, source="deferred_latest", metadata=metadata)
 
     def apply_trace_input_transition(self, enabled: bool, *, reason: str) -> None:
         """Mirror harness input transitions without synthesizing a control."""
@@ -210,14 +210,25 @@ class ActionTraceSession(wave.LiveKitWaveSession):
         if self.stop_requested:
             self.trace_actions_dropped += 1
             return
+        metadata: dict[str, Any] = {}
+        if isinstance(data.get("heartbeat"), bool):
+            metadata["heartbeat"] = bool(data["heartbeat"])
+        if isinstance(data.get("reason"), str):
+            metadata["reason"] = str(data["reason"])
         if not self.connected or self._room is None:
-            self._deferred_controls = controls
+            self._deferred_controls = (controls, metadata)
             self.trace_actions_deferred += 1
             return
-        await self._publish_trace_controls(controls, source="trace")
+        await self._publish_trace_controls(controls, source="trace", metadata=metadata)
 
-    async def _publish_trace_controls(self, controls: tuple[str, ...], *, source: str) -> None:
-        await self._publish_control_state(controls)
+    async def _publish_trace_controls(
+        self,
+        controls: tuple[str, ...],
+        *,
+        source: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        await self._publish_control_state(controls, metadata=metadata)
         self.trace_actions_published += 1
         self.record_event(
             "trace_action_published",

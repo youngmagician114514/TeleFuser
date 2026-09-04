@@ -102,7 +102,7 @@ def run_stream_server(
             # policy does not treat a remote GPU as free while an asynchronous
             # state transfer is still in flight.
             migration_estimator=LocalMigrationEstimator(
-                migration_cost_seconds=config.turboserve_migration_eta,
+                first_layer_ready_seconds=config.turboserve_migration_eta,
             ),
             migration_policy=MigrationCooldownPolicy(
                 cooldown_seconds=config.motivation_migration_cooldown_seconds,

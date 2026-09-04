@@ -71,7 +71,14 @@ class LiveKitServeConfig(BaseSettings):
         description="Relative penalty applied to estimated model-session migration time",
     )
     turboserve_scale_in_hold_seconds: float = Field(default=5.0, ge=0)
-    turboserve_migration_eta: float = Field(default=0.35, ge=0)
+    turboserve_migration_eta: float = Field(
+        default=0.01,
+        ge=0,
+        description=(
+            "Blocking migration ETA until the target first layer is usable; "
+            "transfer drain overlaps in background"
+        ),
+    )
     turboserve_min_migration_gain_ms: float = Field(default=40.0, ge=0)
     turboserve_rebalance_iteration_limit: int = Field(default=3, ge=1, le=64)
     motivation_migration_cooldown_seconds: float = Field(

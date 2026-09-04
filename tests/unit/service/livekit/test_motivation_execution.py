@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from telefuser.service.livekit.motivation_controller import MotivationRuntimeController
@@ -21,14 +23,17 @@ def _controller() -> MotivationRuntimeController:
     return MotivationRuntimeController(scheduler, dispatch=lambda lease: None, clock=lambda: 0.0)
 
 
-def _batch_controller(now: list[float]) -> MotivationRuntimeController:
+def _batch_controller(
+    now: list[float], *, include_idle_jobs: bool = True
+) -> MotivationRuntimeController:
     scheduler = MotivationScheduler(
         StaticMotivationProfileTable(
             (
                 MotivationProfile(1, "b1_s4_w18_rho0_bf16", 0.4102, 0.68, 28.13),
                 MotivationProfile(2, "b2_s4_w18_rho0_bf16", 0.7386, 0.68, 37.12),
             )
-        )
+        ),
+        config=MotivationSchedulerConfig(include_idle_jobs=include_idle_jobs),
     )
     scheduler.add_gpu(GpuSchedulingState("gpu-0", memory_free_gb=80.0))
     return MotivationRuntimeController(scheduler, dispatch=lambda lease: None, clock=lambda: now[0])
@@ -78,9 +83,72 @@ def test_bridge_releases_action_and_commits_on_model_output() -> None:
     assert controller.scheduler.session("session-1").in_flight is not None
 
     bridge.on_model_output("worker-0", "pipeline-1", {"type": "chunk"})
-    assert controller.scheduler.session("session-1").in_flight is None
+    followup = controller.scheduler.session("session-1").in_flight
+    assert followup is not None and followup.kind == "idle"
     assert controller.scheduler.session("session-1").slack_seconds > 1.0
     assert lease.candidate.batch_size == 1
+
+
+def test_bridge_ignores_model_output_from_previous_migration_owner() -> None:
+    controller = _controller()
+    dispatched = []
+    bridge = MotivationExecutionBridge(
+        controller,
+        dispatch=lambda lease, payloads: dispatched.append((lease, payloads)),
+        clock=lambda: 0.0,
+    )
+    bridge.register_session("session-1", owner_gpu="gpu-0", now=0.0)
+    bridge.register_pipeline_session("session-1", "pipeline-1")
+    bridge.on_control_message("worker-0", "session-1", {"type": "control_state", "controls": ["W"]})
+    assert dispatched
+    bridge.on_model_output("worker-1", "pipeline-1", {"type": "chunk"})
+    assert controller.scheduler.session("session-1").in_flight is not None
+    bridge.on_model_output("worker-0", "pipeline-1", {"type": "chunk"})
+    followup = controller.scheduler.session("session-1").in_flight
+    assert followup is not None and followup.kind == "idle"
+
+
+def test_bridge_does_not_commit_a_newer_lease_from_a_delayed_job_output() -> None:
+    controller = _controller()
+    dispatched = []
+    bridge = MotivationExecutionBridge(
+        controller,
+        dispatch=lambda lease, payloads: dispatched.append((lease, payloads)),
+        clock=lambda: 0.0,
+    )
+    bridge.register_session("session-1", owner_gpu="gpu-0", now=0.0)
+    bridge.register_pipeline_session("session-1", "pipeline-1")
+    bridge.on_control_message(
+        "worker-0", "session-1", {"type": "control_state", "controls": ["W"]}
+    )
+    first_job_id = dispatched[-1][0].jobs[0].job_id
+    bridge.on_control_message(
+        "worker-0", "session-1", {"type": "control_state", "controls": ["D"]}
+    )
+
+    bridge.on_model_output(
+        "worker-0",
+        "pipeline-1",
+        {"type": "chunk", "scheduler": {"motivation_job_id": first_job_id}},
+    )
+    second_job = controller.scheduler.session("session-1").in_flight
+    assert second_job is not None and second_job.job_id != first_job_id
+
+    bridge.on_model_output(
+        "worker-0",
+        "pipeline-1",
+        {"type": "chunk", "scheduler": {"motivation_job_id": first_job_id}},
+    )
+    assert controller.scheduler.session("session-1").in_flight == second_job
+
+    bridge.on_model_output(
+        "worker-0",
+        "pipeline-1",
+        {"type": "chunk", "scheduler": {"motivation_job_id": second_job.job_id}},
+    )
+    followup = controller.scheduler.session("session-1").in_flight
+    assert followup is None or followup.kind == "idle"
+    assert second_job.job_id not in bridge._job_to_lease
 
 
 def test_bridge_dispatch_exception_clears_lease_bookkeeping_and_retries() -> None:
@@ -173,6 +241,47 @@ def test_bridge_applies_one_second_gate_to_default_control_states() -> None:
     assert controller.scheduler.session("session-1").pending_action is not None
 
 
+def test_bridge_trusts_trace_heartbeat_cadence_without_local_regating() -> None:
+    now = [0.0]
+    controller = _controller()
+    dispatched = []
+    bridge = MotivationExecutionBridge(
+        controller,
+        dispatch=lambda lease, payloads: dispatched.append((lease, payloads)),
+        clock=lambda: now[0],
+    )
+    bridge.register_session("session-1", owner_gpu="gpu-0", now=0.0)
+
+    assert bridge.on_control_message(
+        "worker-0",
+        "session-1",
+        {
+            "type": "control_state",
+            "controls": ["W"],
+            "heartbeat": False,
+            "reason": "first_nonempty_input",
+        },
+    )
+    assert len(dispatched) == 1
+
+    # The producer heartbeat phase starts before one second from the first
+    # input. It must still release a pending job because the trace already
+    # encodes the authoritative cadence.
+    now[0] = 0.75
+    assert bridge.on_control_message(
+        "worker-0",
+        "session-1",
+        {
+            "type": "control_state",
+            "controls": ["D"],
+            "heartbeat": True,
+            "reason": "heartbeat",
+        },
+    )
+    assert controller.scheduler.session("session-1").pending_action is not None
+    assert bridge.snapshot()["next_release_at"] == {}
+
+
 def test_bridge_keeps_intermediate_updates_in_the_latest_state_only() -> None:
     controller = _controller()
     dispatched = []
@@ -214,7 +323,9 @@ def test_bridge_forwards_empty_state_to_stop_model_admission() -> None:
         "session-1",
         {"type": "control_state", "controls": []},
     ) is False
-    assert dispatched == []
+    assert len(dispatched) == 1
+    assert dispatched[0][0][1]["controls"] == []
+    assert dispatched[0][0][1]["motivation"]["kind"] == "idle"
     assert controller.scheduler.session("session-1").pending_action is None
 
 
@@ -351,7 +462,7 @@ def test_bridge_checks_unselected_session_slack_before_waiting(monkeypatch) -> N
     _FakeTimer.instances.clear()
     monkeypatch.setattr("telefuser.service.livekit.motivation_execution.threading.Timer", _FakeTimer)
     now = [0.0]
-    controller = _batch_controller(now)
+    controller = _batch_controller(now, include_idle_jobs=False)
     controller.on_session_registered("urgent", owner_gpu="gpu-0", now=0.0, slack_seconds=0.05)
     controller.on_session_registered("normal", owner_gpu="gpu-0", now=0.0, slack_seconds=1.0)
     dispatched = []
@@ -467,4 +578,66 @@ def test_model_output_event_drains_other_free_gpus() -> None:
 
     assert len(dispatched) == 3
     assert {lease.candidate.gpu_id for lease, _ in dispatched[1:]} == {"gpu-0", "gpu-1"}
+    bridge.close()
+
+
+def test_bridge_rolls_back_asynchronous_physical_batch_failure() -> None:
+    controller = _controller()
+    dispatched = []
+    bridge = MotivationExecutionBridge(
+        controller,
+        dispatch=lambda lease, payloads: dispatched.append((lease, payloads)),
+        clock=lambda: 0.0,
+    )
+    bridge.register_session("session-1", owner_gpu="gpu-0", now=0.0)
+
+    bridge.on_control_message(
+        "worker-0", "session-1", {"type": "control_state", "controls": ["W"]}
+    )
+    assert dispatched
+    lease = dispatched[0][0]
+    assert controller.scheduler.session("session-1").in_flight is not None
+
+    bridge.on_dispatch_failed(
+        job_ids=tuple(job.job_id for job in lease.jobs),
+        session_ids=("session-1",),
+        error="child batch rejected",
+    )
+
+    state = controller.scheduler.session("session-1")
+    assert state.in_flight is None
+    assert state.pending_action is not None
+    assert bridge._leases == {}
+    assert bridge._job_to_lease == {}
+
+
+@pytest.mark.parametrize(
+    "error",
+    (
+        "session departed before physical completion",
+        "RuntimeError('session departed before physical completion')",
+        'RuntimeError("session departed before physical completion")',
+    ),
+)
+def test_bridge_downgrades_expected_departure_race_logs(caplog, error: str) -> None:
+    controller = _controller()
+    dispatched = []
+    bridge = MotivationExecutionBridge(
+        controller,
+        dispatch=lambda lease, payloads: dispatched.append((lease, payloads)),
+        clock=lambda: 0.0,
+    )
+    bridge.register_session("session-1", owner_gpu="gpu-0", now=0.0)
+    bridge.on_control_message("worker-0", "session-1", {"type": "control_state", "controls": ["W"]})
+    lease = dispatched[0][0]
+
+    with caplog.at_level(logging.INFO, logger="telefuser.service.livekit.motivation_execution"):
+        bridge.on_dispatch_failed(
+            job_ids=tuple(job.job_id for job in lease.jobs),
+            session_ids=("session-1",),
+            error=error,
+        )
+
+    assert any("physical batch retired after session departure" in record.message for record in caplog.records)
+    assert not any("physical batch failed" in record.message for record in caplog.records)
     bridge.close()

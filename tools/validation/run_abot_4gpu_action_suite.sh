@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Replay the five ABot action-only workloads on four physical GPUs.
+# Replay the five ABot action-only workloads on a configurable GPU set.
 #
 # The default prefix8 mode is a short stability preflight. Full mode replays
 # the original 24-session action_world_v2 suite and raises per-worker retained
@@ -43,7 +43,7 @@ TeleFuser processes and independent artifacts for each workload.
 Options:
   --mode prefix8|full             Trace suite to replay (default: prefix8).
   --workload NAME                 Run one workload; may be repeated.
-  --gpu-ids A,B,C,D               Four physical GPU IDs (default: 0,1,2,3).
+  --gpu-ids A,B,...                Physical GPU IDs (default: 0,1,2,3).
   --run-root PATH                 Artifact root; must not already exist.
   --trace-root PATH               Override the selected mode's trace root.
   --max-sessions-per-worker N     Override 4 (prefix8) or 6 (full).
@@ -186,10 +186,12 @@ RUN_ROOT="$(repo_absolute_path "${RUN_ROOT}")"
 [[ -d "${TRACE_ROOT}" ]] || die "Trace root not found: ${TRACE_ROOT}"
 
 IFS=',' read -r -a GPUS <<<"${GPU_IDS}"
-[[ "${#GPUS[@]}" -eq 4 ]] || die "--gpu-ids must contain exactly four comma-separated IDs"
+[[ "${#GPUS[@]}" -ge 1 ]] || die "--gpu-ids must contain at least one comma-separated ID"
 for gpu in "${GPUS[@]}"; do
   [[ "${gpu}" =~ ^[0-9]+$ ]] || die "invalid GPU ID: ${gpu}"
 done
+NUM_WORKERS="${#GPUS[@]}"
+WORKER_GPU_MAP="$(IFS=';'; echo "${GPUS[*]}")"
 
 declare -A ALLOWED_WORKLOADS=()
 for workload in "${ALL_WORKLOADS[@]}"; do
@@ -216,6 +218,7 @@ echo "  mode: ${MODE}"
 echo "  trace root: ${TRACE_ROOT}"
 echo "  workloads: ${WORKLOADS[*]}"
 echo "  GPU IDs: ${GPU_IDS}"
+echo "  workers: ${NUM_WORKERS}"
 echo "  max sessions/worker: ${MAX_SESSIONS_PER_WORKER}"
 echo "  run root: ${RUN_ROOT}"
 
@@ -267,6 +270,7 @@ printf '%s\n' \
   "MODE=${MODE}" \
   "TRACE_ROOT=${TRACE_ROOT}" \
   "GPU_IDS=${GPU_IDS}" \
+  "NUM_WORKERS=${NUM_WORKERS}" \
   "MAX_SESSIONS_PER_WORKER=${MAX_SESSIONS_PER_WORKER}" \
   "STARTUP_TIMEOUT_SECONDS=${STARTUP_TIMEOUT_SECONDS}" \
   "PROFILE_PATH=${PROFILE_PATH}" \
@@ -493,8 +497,8 @@ for workload in "${WORKLOADS[@]}"; do
     --livekit-url ws://127.0.0.1:7880 \
     --livekit-api-key devkey \
     --livekit-api-secret secret \
-    --num-workers 4 \
-    --worker-gpu-map '0;1;2;3' \
+    --num-workers "${NUM_WORKERS}" \
+    --worker-gpu-map "${WORKER_GPU_MAP}" \
     --worker-mode process-nccl \
     --max-sessions-per-worker "${MAX_SESSIONS_PER_WORKER}" \
     --queue-size 0 \

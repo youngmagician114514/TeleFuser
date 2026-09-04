@@ -143,6 +143,25 @@ class _ABotWorldLiveKitSession:
 
 
 @dataclass(frozen=True)
+class _PolicyBatchMember:
+    """Immutable Motivation metadata captured when a lease enters the queue."""
+
+    job_id: str | None
+    kind: str | None
+    fidelity: str | None
+    ready_at: float | None
+
+
+@dataclass(frozen=True)
+class _PolicyBatch:
+    """One globally selected Motivation lease awaiting physical execution."""
+
+    states: tuple[_ABotWorldLiveKitSession, ...]
+    controls: tuple[dict[str, bool], ...]
+    members: tuple[_PolicyBatchMember, ...]
+
+
+@dataclass(frozen=True)
 class ABotWorldMigrationBundle:
     """Quiescent service and pipeline state transferred to another ABot worker."""
 
@@ -280,6 +299,10 @@ class ABotWorldLiveKitService:
         self._scheduler_condition = threading.Condition(self._sessions_lock)
         self._scheduler_thread: threading.Thread | None = None
         self._scheduler_stopping = False
+        # Motivation dispatches enter this queue with their exact selected
+        # members. The local EDF/batching selector never gets a chance to
+        # split or replace an externally reserved lease.
+        self._policy_batches: deque[_PolicyBatch] = deque()
         self._capacity_profile: dict[str, object] | None = None
         self._scheduler_paused = False
         self._batch_count = 0
@@ -316,6 +339,16 @@ class ABotWorldLiveKitService:
         """
         with self._scheduler_condition:
             self._scheduler_stopping = True
+            # A policy batch may have been accepted by the execution boundary
+            # but not yet popped by the scheduler thread. Release its local
+            # in-flight marks so shutdown cannot wait for work that will never
+            # execute; an external Motivation lease is rolled back by its
+            # departure/dispatch-failure callback.
+            while self._policy_batches:
+                pending = self._policy_batches.popleft()
+                for state in pending.states:
+                    with state.lock:
+                        state.in_flight = False
             self._scheduler_condition.notify_all()
         scheduler = self._scheduler_thread
         if scheduler is not None and scheduler.is_alive() and scheduler is not threading.current_thread():
@@ -574,16 +607,102 @@ class ABotWorldLiveKitService:
             self._scheduler_condition.notify_all()
 
     def push_batch(self, items: Sequence[tuple[str, dict]]) -> None:
-        """Apply a policy-selected control batch atomically at the service boundary.
+        """Queue one policy-selected batch for one physical model invocation.
 
-        ``push_chunk`` retains the public single-session API. This method is
-        used by an external global scheduler so the internal ABot condition
-        cannot observe only the first member of a selected batch and dispatch
-        it before the remaining controls arrive.
+        The service validates every member before mutating any state. Once
+        accepted, all members are marked in-flight together and the scheduler
+        thread executes exactly this tuple; it does not run ``_select_batch``
+        again. This is the execution-side half of an atomic Motivation lease.
         """
+        entries = [(str(session_id), dict(chunk)) for session_id, chunk in items]
+        if not entries:
+            raise ValueError("policy batch must contain at least one session")
+        if len(entries) > self.max_batch_size:
+            raise RuntimeError(
+                f"policy batch size {len(entries)} exceeds service max_batch_size={self.max_batch_size}"
+            )
         with self._scheduler_condition:
-            for session_id, chunk in items:
-                self.push_chunk(session_id, chunk)
+            if self._scheduler_stopping:
+                raise RuntimeError("ABot scheduler is stopping")
+            session_ids = [session_id for session_id, _ in entries]
+            if len(session_ids) != len(set(session_ids)):
+                raise RuntimeError("policy batch contains duplicate sessions")
+            now = time.monotonic()
+            states: list[_ABotWorldLiveKitSession] = []
+            controls: list[dict[str, bool]] = []
+            members: list[_PolicyBatchMember] = []
+            prospective_keys: list[tuple[object, ...]] = []
+            for session_id, chunk in entries:
+                state = self._sessions.get(session_id)
+                if state is None:
+                    raise RuntimeError(f"Unknown ABot policy session {session_id!r}")
+                with state.lock:
+                    if not state.active:
+                        raise RuntimeError(f"ABot policy session {session_id!r} is inactive")
+                    if state.in_flight:
+                        raise RuntimeError(f"ABot policy session {session_id!r} is already in flight")
+                    if state.migrating:
+                        raise RuntimeError(f"ABot policy session {session_id!r} is migrating")
+                    if str(chunk.get("type", "")) != "control_state":
+                        raise ValueError("policy batches require control_state messages")
+                    raw_controls = chunk.get("controls", [])
+                    if not isinstance(raw_controls, list):
+                        raise ValueError("control_state controls must be a list")
+                    canonical = self._canonical_controls(raw_controls)
+                    motivation = chunk.get("motivation")
+                    if not isinstance(motivation, Mapping) or not bool(motivation.get("one_shot")):
+                        raise ValueError("policy batches require a one_shot motivation marker")
+                    declared_size = motivation.get("batch_size")
+                    if declared_size is not None and int(declared_size) != len(entries):
+                        raise RuntimeError(
+                            f"policy batch declares batch_size={declared_size}, got {len(entries)}"
+                        )
+                    kind = str(motivation.get("kind", "action"))
+                    if kind == "idle" and canonical:
+                        raise ValueError("idle policy jobs must carry empty controls")
+                    if kind != "idle" and not canonical:
+                        raise ValueError("action policy jobs must carry non-empty controls")
+                    fidelity = motivation.get("fidelity")
+                    if not isinstance(fidelity, str) or not fidelity:
+                        raise ValueError("policy batch is missing fidelity")
+                    states.append(state)
+                    controls.append({key: True for key in canonical})
+                    members.append(
+                        _PolicyBatchMember(
+                            job_id=(str(motivation.get("job_id")) if motivation.get("job_id") else None),
+                            kind=kind,
+                            fidelity=fidelity,
+                            ready_at=state.ready_since,
+                        )
+                    )
+                    prospective_keys.append(self._batch_key_for_fidelity(state, fidelity))
+            if len(set(prospective_keys)) != 1:
+                raise RuntimeError("policy batch contains incompatible model sessions")
+            # The service scheduler is the single physical invocation lane. A
+            # validated policy batch may arrive while an earlier invocation is
+            # running; keep it in the FIFO policy queue and let that lane
+            # execute it after the earlier batch clears. Rejecting here makes
+            # an otherwise valid lease look like a physical dispatch failure.
+            for state, (_, chunk), applied_controls in zip(states, entries, controls, strict=True):
+                motivation = chunk["motivation"]
+                with state.lock:
+                    state.controls = set(applied_controls)
+                    state.motivation_one_shot = True
+                    state.motivation_kind = str(motivation.get("kind", "action"))
+                    state.motivation_job_id = str(motivation.get("job_id")) if motivation.get("job_id") else None
+                    state.motivation_fidelity = str(motivation["fidelity"])
+                    state.last_control_at = now
+                    idle_one_shot = state.motivation_kind == "idle"
+                    state.ready_since = now if state.controls or idle_one_shot else None
+                    state.pacing_ready_at = now
+                    state.control_event.set()
+                    state.in_flight = True
+                    if state.controls:
+                        self._workload_detector.record_active(state.session_id, now)
+                    else:
+                        self._workload_detector.record_idle(state.session_id, now)
+            self._policy_batches.append(_PolicyBatch(tuple(states), tuple(controls), tuple(members)))
+            self._scheduler_condition.notify_all()
 
     async def pull_chunks(self, session_id: str) -> AsyncGenerator[dict, None]:
         """Yield preview and generated frames in per-session sequence order."""
@@ -657,9 +776,20 @@ class ABotWorldLiveKitService:
             )
 
     def prepare_migration_nccl_metadata(self, session_id: str, timeout: float | None = None) -> dict[str, Any]:
-        """Quiesce a session and describe its resident tensors for direct NCCL transfer."""
-        state = self._quiesce_migration(session_id, timeout)
+        """Quiesce model state for direct NCCL transfer while publisher frames drain."""
+        # NCCL SST can import the target session as soon as model-owned output
+        # is quiescent. Publisher-owned frames stay on the existing transport
+        # route and therefore must not extend the scheduler's blocking drain.
+        state = self._quiesce_migration(session_id, timeout, wait_for_publisher=False)
         session = state.pipeline_session
+        # Idle suspension moves every retained tensor, including the decoder
+        # tail, to CPU.  A direct NCCL export must never expose a mixed tree:
+        # one CPU leaf would make the source fail part-way through the ordered
+        # P2P groups while the target waits forever for the corresponding
+        # receive.  ``migrating`` remains set while this restore runs and the
+        # scheduler's suspension predicate below observes that marker.
+        if not getattr(session, "is_resident", True):
+            self.pipeline.restore_interactive_session(session)
         if session.taew_decode_state is None:
             raise RuntimeError("ABot session is missing its TAeW2.2 decode state")
         payload = {
@@ -673,6 +803,20 @@ class ABotWorldLiveKitService:
             ),
         }
         skeleton, manifest, leaves = flatten_tensor_tree(payload)
+        # Minimal CPU pipeline doubles are also used by the snapshot unit
+        # tests.  The child NCCL command path performs the unconditional
+        # device preflight; keep this service-side check active whenever the
+        # concrete pipeline advertises a CUDA execution device.
+        pipeline_device = getattr(self.pipeline, "device", None)
+        if pipeline_device is not None and torch.device(pipeline_device).type == "cuda":
+            non_cuda_paths = [path for path, tensor in leaves.items() if tensor.device.type != "cuda"]
+            if non_cuda_paths:
+                preview = ", ".join(repr(path) for path in non_cuda_paths[:4])
+                suffix = "..." if len(non_cuda_paths) > 4 else ""
+                raise RuntimeError(
+                    "NCCL migration source tensors must reside on CUDA; "
+                    f"found CPU leaves at {preview}{suffix}"
+                )
         return {
             "session_id": session_id,
             "tensor_skeleton": skeleton,
@@ -761,7 +905,13 @@ class ABotWorldLiveKitService:
             self._scheduler_condition.notify_all()
         return state.session_id
 
-    def _quiesce_migration(self, session_id: str, timeout: float | None) -> _ABotWorldLiveKitSession:
+    def _quiesce_migration(
+        self,
+        session_id: str,
+        timeout: float | None,
+        *,
+        wait_for_publisher: bool = True,
+    ) -> _ABotWorldLiveKitSession:
         effective_timeout = self.close_timeout if timeout is None else timeout
         deadline = time.monotonic() + effective_timeout
         with self._scheduler_condition:
@@ -773,7 +923,11 @@ class ABotWorldLiveKitService:
             while (
                 state.in_flight
                 or not state.output_queue.empty()
-                or (state.publisher_frame_tracking_enabled and state.publisher_unsubmitted_frames > 0)
+                or (
+                    wait_for_publisher
+                    and state.publisher_frame_tracking_enabled
+                    and state.publisher_unsubmitted_frames > 0
+                )
             ):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -980,11 +1134,21 @@ class ABotWorldLiveKitService:
         controls: Mapping[str, bool],
         *,
         selected_at: float,
+        member: _PolicyBatchMember | None = None,
     ) -> dict[str, Any]:
         """Capture one session's position before a model invocation mutates it."""
         with state.lock:
             session = state.pipeline_session
-            ready_at = state.ready_since or selected_at
+            if member is None:
+                ready_at = state.ready_since
+                motivation_kind = state.motivation_kind
+                motivation_job_id = state.motivation_job_id
+            else:
+                ready_at = member.ready_at
+                motivation_kind = member.kind
+                motivation_job_id = member.job_id
+            if ready_at is None:
+                ready_at = selected_at
             queued_video_frames = self._queued_video_frames(state)
             frame_credit_frames = queued_video_frames + state.publisher_unsubmitted_frames
             frame_credit_deadline = self._session_deadline(state, selected_at)
@@ -997,8 +1161,8 @@ class ABotWorldLiveKitService:
                 "emitted_frames_after": None,
                 "frames": None,
                 "controls": sorted(str(key) for key, enabled in controls.items() if enabled),
-                "motivation_kind": state.motivation_kind,
-                "motivation_job_id": state.motivation_job_id,
+                "motivation_kind": motivation_kind,
+                "motivation_job_id": motivation_job_id,
                 "queue_wait_seconds": max(0.0, selected_at - ready_at),
                 "frame_credit_enabled": int(self._uses_publisher_frame_credit(state)),
                 "queued_video_frames": queued_video_frames,
@@ -1121,37 +1285,60 @@ class ABotWorldLiveKitService:
                             not state.controls
                             and not state.motivation_one_shot
                             and not state.in_flight
+                            and not state.migrating
                             and state.pipeline_session.is_resident
                             and now - state.last_control_at >= self.idle_suspension_seconds
                         ):
                             suspend_candidate = state
                             break
-                ready = self._ready_sessions(now)
-                if not ready and suspend_candidate is None:
-                    self._scheduler_condition.wait(timeout=self._next_scheduler_wake_seconds(now))
-                    continue
-                if self.scheduler_mode == "batched" and ready and len(ready) < self.max_batch_size:
-                    wait_seconds = self._batch_formation_wait_seconds(ready, now)
-                    deadline_wait_active = any(state.deadline_batch_wait_until is not None for state in ready)
-                    if wait_seconds > 0:
-                        self._scheduler_condition.wait(timeout=wait_seconds)
-                        if deadline_wait_active:
-                            # A new control or peer readiness wakes this
-                            # condition. Re-evaluate from the EDF head instead
-                            # of dispatching the old singleton and losing its
-                            # persistent dynamic-batching hold.
-                            continue
-                    now = time.monotonic()
-                    ready = self._ready_sessions(now)
-                batch = self._select_batch(ready, now=now)
-                controls: list[dict[str, bool]] = []
-                if batch:
+                policy_batch = self._policy_batches.popleft() if self._policy_batches else None
+                if policy_batch is not None:
+                    batch = list(policy_batch.states)
+                    controls = list(policy_batch.controls)
+                    members = list(policy_batch.members)
+                    # A session can depart while its reserved lease is still
+                    # queued. Do not execute stale controls against an inactive
+                    # service state; clear the local marks and let the bridge
+                    # roll back the policy reservation.
+                    stale_policy_batch = False
                     for state in batch:
                         with state.lock:
-                            self._clear_deadline_batch_wait(state)
-                            state.deadline_batch_force_singleton = False
-                            state.in_flight = True
-                            controls.append({key: True for key in state.controls})
+                            stale_policy_batch = stale_policy_batch or not state.active
+                    if stale_policy_batch:
+                        for state in batch:
+                            with state.lock:
+                                state.in_flight = False
+                        batch = []
+                        controls = []
+                        members = []
+                else:
+                    ready = self._ready_sessions(now)
+                    if not ready and suspend_candidate is None:
+                        self._scheduler_condition.wait(timeout=self._next_scheduler_wake_seconds(now))
+                        continue
+                    if self.scheduler_mode == "batched" and ready and len(ready) < self.max_batch_size:
+                        wait_seconds = self._batch_formation_wait_seconds(ready, now)
+                        deadline_wait_active = any(state.deadline_batch_wait_until is not None for state in ready)
+                        if wait_seconds > 0:
+                            self._scheduler_condition.wait(timeout=wait_seconds)
+                            if deadline_wait_active:
+                                # A new control or peer readiness wakes this
+                                # condition. Re-evaluate from the EDF head instead
+                                # of dispatching the old singleton and losing its
+                                # persistent dynamic-batching hold.
+                                continue
+                        now = time.monotonic()
+                        ready = self._ready_sessions(now)
+                    batch = self._select_batch(ready, now=now)
+                    controls: list[dict[str, bool]] = []
+                    members: list[_PolicyBatchMember] | None = None
+                    if batch:
+                        for state in batch:
+                            with state.lock:
+                                self._clear_deadline_batch_wait(state)
+                                state.deadline_batch_force_singleton = False
+                                state.in_flight = True
+                                controls.append({key: True for key in state.controls})
 
             if not batch:
                 if suspend_candidate is not None:
@@ -1160,7 +1347,7 @@ class ABotWorldLiveKitService:
                     except Exception:
                         logger.exception("Failed to suspend ABot session %s", suspend_candidate.session_id)
                 continue
-            self._execute_batch(batch, controls)
+            self._execute_batch(batch, controls, members=members)
 
     def _ready_sessions(self, now: float) -> list[_ABotWorldLiveKitSession]:
         ready: list[_ABotWorldLiveKitSession] = []
@@ -1222,6 +1409,7 @@ class ABotWorldLiveKitService:
                         next_wake_at = pacing_wake if next_wake_at is None else min(next_wake_at, pacing_wake)
                 elif (
                     not state.in_flight
+                    and not state.migrating
                     and state.pipeline_session.is_resident
                     and not state.controls
                     and not idle_one_shot
@@ -1569,18 +1757,27 @@ class ABotWorldLiveKitService:
         self._round_robin_order = deque(value for value in self._round_robin_order if value != session_id)
 
     def _uses_relative_rope(self) -> bool:
-        """Return the DiT RoPE mode, failing closed for unknown pipeline adapters.
+        """Return the DiT RoPE mode, failing closed for unknown adapters.
 
-        ``generate_next_blocks`` accepts sessions with different global frame
-        cursors only for Relative-RoPE. A third-party pipeline adapter that
-        does not expose this capability is therefore treated as Absolute-RoPE
-        rather than risking an invalid mixed-position batch.
+        Process-NCCL keeps the concrete ABot pipeline in a child process, so
+        its parent-side transport adapter cannot expose ``denoise_stage``.
+        Such adapters publish the same read-only capability directly via
+        ``uses_relative_rope``; local adapters continue to use the concrete
+        DiT field below.
         """
+        capability = getattr(self.pipeline, "uses_relative_rope", None)
+        if capability is not None:
+            return bool(capability)
         denoise_stage = getattr(self.pipeline, "denoise_stage", None)
         dit = getattr(denoise_stage, "dit", None)
         return bool(getattr(dit, "use_relative_rope", False))
 
     def _batch_key(self, state: _ABotWorldLiveKitSession) -> tuple[object, ...]:
+        return self._batch_key_for_fidelity(state, state.motivation_fidelity or "")
+
+    def _batch_key_for_fidelity(
+        self, state: _ABotWorldLiveKitSession, fidelity: str
+    ) -> tuple[object, ...]:
         session = state.pipeline_session
         local_end = 0
         if session.self_cache:
@@ -1601,7 +1798,7 @@ class ABotWorldLiveKitService:
             position_key,
             local_end,
             tuple(session.first_frame_latent.shape),
-            state.motivation_fidelity or "",
+            fidelity,
             session.lifecycle == ABotWorldSessionLifecycle.SUSPENDED,
         )
 
@@ -1609,6 +1806,8 @@ class ABotWorldLiveKitService:
         self,
         batch: Sequence[_ABotWorldLiveKitSession],
         controls: Sequence[dict[str, bool]],
+        *,
+        members: Sequence[_PolicyBatchMember] | None = None,
     ) -> None:
         # ``selected_*`` measures the scheduler boundary. The model interval is
         # intentionally narrower: it begins immediately before the real
@@ -1620,10 +1819,24 @@ class ABotWorldLiveKitService:
         model_started_wall_time: float | None = None
         control_latent_frames: int | None = None
         fidelity: ABotWorldFidelity | None = None
-        executed_motivation_job_ids = [state.motivation_job_id for state in batch]
+        if members is None:
+            execution_members = tuple(
+                _PolicyBatchMember(
+                    job_id=state.motivation_job_id,
+                    kind=state.motivation_kind,
+                    fidelity=state.motivation_fidelity,
+                    ready_at=state.ready_since,
+                )
+                for state in batch
+            )
+        else:
+            execution_members = tuple(members)
+            if len(execution_members) != len(batch):
+                raise RuntimeError("ABot policy batch metadata does not match its session count")
+        executed_motivation_job_ids = [member.job_id for member in execution_members]
         session_traces = [
-            self._new_dispatch_session_trace(state, applied_controls, selected_at=selected_at)
-            for state, applied_controls in zip(batch, controls)
+            self._new_dispatch_session_trace(state, applied_controls, selected_at=selected_at, member=member)
+            for state, applied_controls, member in zip(batch, controls, execution_members, strict=True)
         ]
         try:
             for state in batch:
@@ -1633,7 +1846,7 @@ class ABotWorldLiveKitService:
             if len(frame_counts) != 1:
                 raise RuntimeError("ABot scheduler selected an incompatible latent-frame batch")
             control_latent_frames = next(iter(frame_counts))
-            fidelity_names = {state.motivation_fidelity for state in batch}
+            fidelity_names = {member.fidelity for member in execution_members}
             if len(fidelity_names) > 1:
                 raise RuntimeError("ABot scheduler selected an incompatible fidelity batch")
             fidelity_name = next(iter(fidelity_names))
@@ -1704,11 +1917,12 @@ class ABotWorldLiveKitService:
             self._batch_count += 1
             self._batch_item_count += len(batch)
             self._maximum_batch_size = max(self._maximum_batch_size, len(batch))
+            pending_outputs: list[tuple[_ABotWorldLiveKitSession, dict[str, Any]]] = []
             for trace, state, frames, applied_controls, executed_job_id in zip(
-                session_traces, batch, results, controls, executed_motivation_job_ids
+                session_traces, batch, results, controls, executed_motivation_job_ids, strict=True
             ):
                 with state.lock:
-                    queue_wait = max(0.0, selected_at - (state.ready_since or selected_at))
+                    queue_wait = float(trace.get("queue_wait_seconds", 0.0))
                     state.total_queue_wait_seconds += queue_wait
                     state.total_compute_seconds += completed_at - selected_at
                     state.scheduled_chunks += 1
@@ -1723,6 +1937,14 @@ class ABotWorldLiveKitService:
                         "scheduler": {
                             "batch_size": len(batch),
                             "fidelity": fidelity.name if fidelity is not None else None,
+                            # The parent Motivation bridge must commit the
+                            # exact lease that produced this output.  Session
+                            # identity alone is insufficient after rollback,
+                            # migration, or delayed IPC delivery because a
+                            # newer lease for the same retained session may
+                            # already exist by the time an old event arrives.
+                            "motivation_job_id": executed_job_id,
+                            "motivation_kind": trace.get("motivation_kind"),
                             "queue_wait_seconds": round(queue_wait, 6),
                             "compute_seconds": round(completed_at - selected_at, 6),
                             **self._last_stage_metrics,
@@ -1760,13 +1982,28 @@ class ABotWorldLiveKitService:
                 # service-local held controls before exposing output to the
                 # bridge, so a next heartbeat cannot be accidentally erased.
                 with state.lock:
-                    if state.motivation_one_shot and state.motivation_job_id == executed_job_id:
+                    if (
+                        executed_job_id is not None
+                        and state.motivation_one_shot
+                        and state.motivation_job_id == executed_job_id
+                    ):
                         state.controls.clear()
                         state.ready_since = None
                         state.motivation_one_shot = False
                         state.motivation_job_id = None
                         state.motivation_kind = None
                         state.motivation_fidelity = None
+                pending_outputs.append((state, payload))
+            # The model invocation is complete for every member at this point.
+            # Clear the whole physical batch before exposing any output to the
+            # parent bridge; otherwise its completion callback can reserve the
+            # next lease while a sibling still appears locally in flight.
+            with self._scheduler_condition:
+                for state in batch:
+                    with state.lock:
+                        state.in_flight = False
+                self._scheduler_condition.notify_all()
+            for state, payload in pending_outputs:
                 self._put_output(state, payload)
             self._emit_dispatch_trace(
                 selected_at=selected_at,

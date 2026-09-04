@@ -199,6 +199,11 @@ class LiveKitServeRuntime:
                 motivation_controller,
                 dispatch=self._dispatch_motivation_batch,
                 release_policy=motivation_release_policy or release_on_control_state,
+                # Worker callbacks and the HTTP app share the LiveKit event
+                # loop.  Keep the potentially expensive global policy search
+                # on the bridge's serialized background thread so a burst of
+                # session POSTs cannot be starved by candidate enumeration.
+                defer_scheduling=True,
             )
         self.worker_pool = worker_pool or self._create_worker_pool()
         self._started = False
@@ -444,6 +449,18 @@ class LiveKitServeRuntime:
         bridge = self._motivation_bridge
         if bridge is not None:
             bridge.on_chunk_published(worker_id, session_id, frames, first_frame_at)
+
+    def on_motivation_dispatch_failed(
+        self,
+        *,
+        job_ids: tuple[str, ...] = (),
+        session_ids: tuple[str, ...] = (),
+        error: str = "physical batch dispatch failed",
+    ) -> None:
+        """Rollback a Motivation reservation rejected by a child worker."""
+        bridge = self._motivation_bridge
+        if bridge is not None:
+            bridge.on_dispatch_failed(job_ids=job_ids, session_ids=session_ids, error=error)
 
     def on_model_output(
         self,
@@ -813,6 +830,10 @@ class LiveKitServeRuntime:
                 capacity_per_worker=max(1, capacity),
                 runtime_calibration=TurboServeRuntimeCalibration(
                     average_migration_total_ms=float(calibration.get("average_total_ms", 0.0)),
+                    average_first_layer_ready_ms=float(calibration.get("average_first_layer_ready_ms", 0.0)),
+                    average_transfer_complete_ms=float(calibration.get("average_transfer_complete_ms", 0.0)),
+                    average_blocking_drain_ms=float(calibration.get("average_blocking_drain_ms", 0.0)),
+                    average_background_cleanup_ms=float(calibration.get("average_background_cleanup_ms", 0.0)),
                     base_chunk_latency_ms=base_latency_ms,
                 ),
             )

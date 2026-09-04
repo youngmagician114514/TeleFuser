@@ -213,7 +213,60 @@ def test_nccl_migration_metadata_includes_taew_decoder_state() -> None:
     )
     service = object.__new__(ABotWorldLiveKitService)
     service.pipeline = SimpleNamespace(taew_decode_stage=stage)
-    service._quiesce_migration = lambda session_id, timeout: SimpleNamespace(
+    quiesce_calls: list[bool] = []
+
+    def fake_quiesce(session_id, timeout, *, wait_for_publisher=True):
+        del session_id, timeout
+        quiesce_calls.append(wait_for_publisher)
+        return SimpleNamespace(
+            pipeline_session=session,
+            config={"fps": 12},
+            controls={"W"},
+            control_idle_timeout=10.0,
+            last_control_at=1.0,
+            next_chunk_index=1,
+            next_playout_deadline=2.0,
+        )
+
+    service._quiesce_migration = fake_quiesce
+    metadata = service.prepare_migration_nccl_metadata("migrating", timeout=1)
+    assert quiesce_calls == [False]
+    payload = rebuild_tensor_tree(metadata["tensor_skeleton"], metadata["_nccl_tensor_leaves"])
+
+    assert metadata["state_bytes"] > 0
+    assert "taew_decode_state" in payload
+    restored = stage.restore_decode_state(payload["taew_decode_state"], direct_device_tensors=True)
+    _assert_taew_state(restored)
+
+
+def test_nccl_migration_metadata_restores_suspended_source_before_export() -> None:
+    stage = _taew_stage()
+    session = SimpleNamespace(
+        prompt_emb=torch.tensor([1.0]),
+        first_frame_latent=torch.tensor([2.0]),
+        self_cache=[],
+        cross_cache=[],
+        vae_decode_state=Wan22VideoVAEStreamingDecodeState(),
+        taew_decode_state=_taew_state(stage),
+        generator=torch.Generator(device="cpu").manual_seed(7),
+        next_latent_frame=3,
+        emitted_frames=12,
+        ownership_epoch=2,
+        is_resident=False,
+    )
+    restored: list[object] = []
+
+    def restore_interactive_session(value: object) -> None:
+        restored.append(value)
+        setattr(value, "is_resident", True)
+
+    service = object.__new__(ABotWorldLiveKitService)
+    service.pipeline = SimpleNamespace(
+        device=torch.device("cpu"),
+        taew_decode_stage=stage,
+        restore_interactive_session=restore_interactive_session,
+    )
+    state = SimpleNamespace(
         pipeline_session=session,
         config={"fps": 12},
         controls={"W"},
@@ -222,14 +275,12 @@ def test_nccl_migration_metadata_includes_taew_decoder_state() -> None:
         next_chunk_index=1,
         next_playout_deadline=2.0,
     )
+    service._quiesce_migration = lambda session_id, timeout, **kwargs: state
 
     metadata = service.prepare_migration_nccl_metadata("migrating", timeout=1)
-    payload = rebuild_tensor_tree(metadata["tensor_skeleton"], metadata["_nccl_tensor_leaves"])
 
+    assert restored == [session]
     assert metadata["state_bytes"] > 0
-    assert "taew_decode_state" in payload
-    restored = stage.restore_decode_state(payload["taew_decode_state"], direct_device_tensors=True)
-    _assert_taew_state(restored)
 
 
 def test_import_migration_nccl_restores_taew_state_without_cpu_copy() -> None:

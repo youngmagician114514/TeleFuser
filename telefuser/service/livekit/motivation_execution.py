@@ -9,6 +9,7 @@ objects; workers and pipeline adapters remain the ownership boundary.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import math
 import threading
@@ -25,6 +26,7 @@ ReleasePolicy = Callable[[dict[str, Any]], bool]
 
 logger = logging.getLogger(__name__)
 _EPSILON = 1e-9
+_SESSION_DEPARTED_ERROR = "session departed before physical completion"
 
 
 @dataclass
@@ -33,6 +35,26 @@ class _LeaseProgress:
 
     lease: DispatchLease
     pending_session_ids: set[str] = field(default_factory=set)
+
+
+def _is_expected_departure_error(error: str) -> bool:
+    """Return whether a child reports the expected session-retirement race.
+
+    Process workers serialize exceptions with ``repr`` before sending them to
+    the parent, so the same expected error can arrive either as the plain
+    message or as ``RuntimeError('...')``.  Keep the matching deliberately
+    exact so model, cache, and transport failures are not hidden as teardown.
+    """
+
+    normalized = str(error).strip()
+    if normalized == _SESSION_DEPARTED_ERROR:
+        return True
+    return normalized in {
+        f"RuntimeError({_SESSION_DEPARTED_ERROR!r})",
+        f'RuntimeError("{_SESSION_DEPARTED_ERROR}")',
+        f"ValueError({_SESSION_DEPARTED_ERROR!r})",
+        f'ValueError("{_SESSION_DEPARTED_ERROR}")',
+    }
 
 
 def release_on_control_state(chunk: dict[str, Any]) -> bool:
@@ -45,7 +67,20 @@ def release_on_control_state(chunk: dict[str, Any]) -> bool:
     """
 
     if chunk.get("type") == "control_state":
-        return bool(chunk.get("controls"))
+        controls = bool(chunk.get("controls"))
+        if not controls:
+            return False
+        # Action-only trace replay carries the producer's release decision so
+        # immediate state changes can update the latest controls without
+        # creating a job. Ordinary browser messages do not carry these
+        # optional fields and retain the historical heartbeat-window behavior.
+        if "heartbeat" in chunk or "reason" in chunk:
+            reason = str(chunk.get("reason", ""))
+            return bool(chunk.get("heartbeat")) or reason in {
+                "first_nonempty_input",
+                "resume_first_nonempty_input",
+            }
+        return controls
     return chunk.get("type") == "control"
 
 
@@ -74,6 +109,7 @@ class MotivationExecutionBridge:
         clock: Callable[[], float] = time.monotonic,
         batch_gate: MotivationBatchGate | None = None,
         enable_batch_gate: bool = True,
+        defer_scheduling: bool = False,
     ) -> None:
         self.controller = controller
         self.dispatch = dispatch
@@ -84,6 +120,9 @@ class MotivationExecutionBridge:
         self._clock = clock
         if not isinstance(enable_batch_gate, bool):
             raise TypeError("enable_batch_gate must be a bool")
+        if not isinstance(defer_scheduling, bool):
+            raise TypeError("defer_scheduling must be a bool")
+        self._defer_scheduling = defer_scheduling
         self._batch_gate = (
             (
                 batch_gate
@@ -113,6 +152,15 @@ class MotivationExecutionBridge:
         self._drain_rounds_total = 0
         self._drain_limit_hits = 0
         self._drain_reentrant_events = 0
+        # Production LiveKit callbacks can run on the same event-loop thread
+        # that accepts session POSTs.  A 20+ session Cartesian search is
+        # intentionally serialized, but it must not occupy that loop.  The
+        # executor is created lazily so unit/in-process users retain the old
+        # synchronous behavior unless ``defer_scheduling`` is requested.
+        self._schedule_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        self._schedule_task_pending = False
+        self._schedule_thread_ident: int | None = None
+        self._schedule_closed = False
         self._drain_last_rounds = 0
         self._lock = threading.RLock()
         self._controls: dict[str, set[str]] = {}
@@ -161,7 +209,15 @@ class MotivationExecutionBridge:
         controls = self._next_controls(session_id, chunk)
         release = bool(self.release_policy(chunk))
         if self.release_policy is release_on_control_state:
-            release = release and self._heartbeat_window_allows(session_id, observed_at)
+            # Action-trace replay carries the producer heartbeat/reason metadata
+            # and already applies the simulator release cadence. Do not anchor
+            # a second local window to the first control: traces commonly start
+            # heartbeats at a fractional phase, which would otherwise drop
+            # every other heartbeat and halve the achievable FPS. Browser
+            # messages omit these fields and retain the local safety gate.
+            trace_release_metadata = "heartbeat" in chunk or "reason" in chunk
+            if not trace_release_metadata:
+                release = release and self._heartbeat_window_allows(session_id, observed_at)
         self.controller.on_action(
             session_id,
             controls,
@@ -174,6 +230,11 @@ class MotivationExecutionBridge:
             with self._lock:
                 self._next_release_at.pop(session_id, None)
         if not controls:
+            # Empty transitions do not create action jobs, but they can make
+            # an idle sentinel the session's new head. Wake the policy just as
+            # the simulator handles every trace event instead of waiting for an
+            # unrelated completion/publication callback.
+            self._schedule()
             return False
         if release:
             self._schedule()
@@ -188,22 +249,43 @@ class MotivationExecutionBridge:
     ) -> None:
         """Commit a lease after each selected session reaches model output."""
 
-        del worker_id
+        observed_worker_id = str(worker_id)
         if payload.get("type") != "chunk":
+            if payload.get("type") == "error":
+                with self._lock:
+                    session_id = self._pipeline_to_session.get(pipeline_session_id)
+                    lease_id = self._lease_id_for_session_locked(session_id) if session_id is not None else None
+                    lease_progress = self._leases.get(lease_id) if lease_id is not None else None
+                    owner_matches = self._lease_owner_matches(lease_progress, observed_worker_id)
+                if session_id is not None and owner_matches:
+                    self._fail_lease_for_session(session_id, str(payload.get("error", "model output failed")))
             return
         with self._lock:
             session_id = self._pipeline_to_session.get(pipeline_session_id)
-            lease_id = next(
-                (
-                    candidate_id
-                    for candidate_id, progress in self._leases.items()
-                    if session_id in progress.pending_session_ids
-                ),
-                None,
+            scheduler_payload = payload.get("scheduler")
+            observed_job_id = (
+                str(scheduler_payload.get("motivation_job_id"))
+                if isinstance(scheduler_payload, dict)
+                and scheduler_payload.get("motivation_job_id")
+                else None
             )
-            if lease_id is None or session_id is None:
+            if observed_job_id is not None:
+                # A stale output must never commit a newer lease for the same
+                # session. Production ABot outputs carry the exact job ID;
+                # the session scan remains only for adapters/tests that have
+                # not adopted the correlation field yet.
+                lease_id = self._job_to_lease.get(observed_job_id)
+            else:
+                lease_id = self._lease_id_for_session_locked(session_id) if session_id is not None else None
+            progress = self._leases.get(lease_id) if lease_id is not None else None
+            if lease_id is None or session_id is None or not self._lease_owner_matches(progress, observed_worker_id):
                 return
-            progress = self._leases[lease_id]
+            if observed_job_id is not None and not any(
+                job.job_id == observed_job_id and job.session_id == session_id
+                for job in progress.lease.jobs
+            ):
+                return
+            assert progress is not None
             progress.pending_session_ids.discard(session_id)
             lease = progress.lease
             completed = not progress.pending_session_ids
@@ -223,6 +305,99 @@ class MotivationExecutionBridge:
             return
         self.controller.on_completion(lease, completed_at=self._clock())
         self._schedule()
+
+    def _lease_id_for_session_locked(self, session_id: str) -> str | None:
+        """Find a pending lease for a session while holding ``self._lock``."""
+        return next(
+            (
+                candidate_id
+                for candidate_id, progress in self._leases.items()
+                if session_id in progress.pending_session_ids
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _lease_owner_matches(progress: _LeaseProgress | None, worker_id: str) -> bool:
+        """Ignore delayed source output after a progressive route handoff."""
+        if progress is None:
+            return False
+        owner = progress.lease.candidate.gpu_id
+        if owner is None:
+            return True
+        owner_name = str(owner)
+        if owner_name == worker_id:
+            return True
+        # Unit/in-process integrations historically used ``gpu-N`` while the
+        # process transport reports its logical owner as ``worker-N``. Treat
+        # those stable aliases as one route, but reject every other mismatch.
+        owner_suffix = owner_name.removeprefix("gpu-").removeprefix("worker-")
+        worker_suffix = worker_id.removeprefix("gpu-").removeprefix("worker-")
+        return owner_suffix == worker_suffix
+
+    def on_dispatch_failed(
+        self,
+        *,
+        job_ids: Sequence[str] = (),
+        session_ids: Sequence[str] = (),
+        error: str = "physical batch dispatch failed",
+    ) -> None:
+        """Rollback a lease rejected asynchronously by an isolated worker."""
+        with self._lock:
+            lease_id = next(
+                (self._job_to_lease[job_id] for job_id in job_ids if job_id in self._job_to_lease),
+                None,
+            )
+            if lease_id is None:
+                lease_id = next(
+                    (
+                        candidate_id
+                        for candidate_id, progress in self._leases.items()
+                        if any(session_id in progress.pending_session_ids for session_id in session_ids)
+                    ),
+                    None,
+                )
+        if lease_id is not None:
+            self._fail_lease(lease_id, error)
+
+    def _fail_lease_for_session(self, session_id: str, error: str) -> None:
+        with self._lock:
+            lease_id = next(
+                (
+                    candidate_id
+                    for candidate_id, progress in self._leases.items()
+                    if session_id in progress.pending_session_ids
+                ),
+                None,
+            )
+        if lease_id is not None:
+            self._fail_lease(lease_id, error)
+
+    def _fail_lease(self, lease_id: str, error: str) -> None:
+        with self._lock:
+            progress = self._leases.pop(lease_id, None)
+            if progress is None:
+                return
+            for job in progress.lease.jobs:
+                if self._job_to_lease.get(job.job_id) == lease_id:
+                    self._job_to_lease.pop(job.job_id, None)
+        try:
+            self.controller.scheduler.rollback_reservation(progress.lease.candidate, now=self._clock())
+        except Exception:
+            # A departure may have already released the policy state. Do not
+            # turn a late child failure into another serving exception.
+            logger.warning("Could not rollback failed Motivation lease %s", lease_id, exc_info=True)
+        # A trace can depart while its already-materialized output is still
+        # draining through LiveKit. That is an expected retirement race, not a
+        # serving failure; keep genuine model/transport errors at warning level.
+        if _is_expected_departure_error(error):
+            logger.info("Motivation physical batch retired after session departure: lease=%s", lease_id)
+        else:
+            logger.warning("Motivation physical batch failed: lease=%s error=%s", lease_id, error)
+        # Leave the job pending for the next external control/timer event. An
+        # immediate reschedule here would select the same failing candidate
+        # again in a tight loop and could hide the rollback in a replacement
+        # lease before callers observe the failure.
 
     def on_chunk_published(
         self,
@@ -261,6 +436,10 @@ class MotivationExecutionBridge:
         """Stop future policy work while allowing an in-flight lease to drain."""
 
         self.controller.on_session_departed(session_id, now=self._observed(now))
+        # A queued/physical lease cannot complete after its transport session
+        # has departed. Roll it back immediately so GPU memory and in-flight
+        # jobs are not stranded until a later scheduler event.
+        self._fail_lease_for_session(session_id, _SESSION_DEPARTED_ERROR)
         self._cancel_batch_gate()
         with self._lock:
             timer = self._idle_wakeup_timers.pop(session_id, None)
@@ -275,7 +454,7 @@ class MotivationExecutionBridge:
         self._schedule()
 
     def close(self) -> None:
-        """Close the controller's optional async-search executor."""
+        """Close timers, deferred scheduling, and controller resources."""
 
         self._cancel_batch_gate()
         with self._lock:
@@ -283,6 +462,17 @@ class MotivationExecutionBridge:
             self._idle_wakeup_timers.clear()
         for timer in timers:
             timer.cancel()
+        with self._schedule_guard:
+            self._schedule_closed = True
+            schedule_executor = self._schedule_executor
+            self._schedule_executor = None
+        if schedule_executor is not None:
+            # ``close`` normally runs on the LiveKit/event-loop thread.  Be
+            # defensive for a dispatch callback that closes the bridge from
+            # inside the scheduling worker itself, where waiting would
+            # deadlock the executor.
+            wait = threading.get_ident() != self._schedule_thread_ident
+            schedule_executor.shutdown(wait=wait, cancel_futures=True)
         self.controller.close()
 
     def _dispatch_lease(self, lease: DispatchLease) -> None:
@@ -339,6 +529,68 @@ class MotivationExecutionBridge:
         self._schedule()
 
     def _schedule(self, *, force_batch_gate: bool = False) -> None:
+        """Request a scheduling drain, optionally outside the event loop."""
+        if self._defer_scheduling:
+            with self._schedule_guard:
+                if self._schedule_closed:
+                    return
+                self._schedule_requested = True
+                self._schedule_force_requested |= force_batch_gate
+                if self._schedule_task_pending:
+                    return
+                if self._schedule_executor is None:
+                    self._schedule_executor = concurrent.futures.ThreadPoolExecutor(
+                        max_workers=1,
+                        thread_name_prefix="telefuser-motivation-dispatch",
+                    )
+                executor = self._schedule_executor
+                self._schedule_task_pending = True
+            try:
+                executor.submit(self._run_deferred_schedule)
+            except RuntimeError:
+                # A concurrent close can shut down the executor between the
+                # guarded submit and the call.  Leave the bridge closed and
+                # let runtime teardown finish without surfacing a callback
+                # error to LiveKit.
+                with self._schedule_guard:
+                    self._schedule_task_pending = False
+                return
+            return
+        self._drain_schedule(force_batch_gate=force_batch_gate)
+
+    def _run_deferred_schedule(self) -> None:
+        """Drain coalesced requests on the bridge's single worker thread."""
+        with self._schedule_guard:
+            self._schedule_thread_ident = threading.get_ident()
+        try:
+            while True:
+                with self._schedule_guard:
+                    if self._schedule_closed:
+                        self._schedule_task_pending = False
+                        return
+                    force = self._schedule_force_requested
+                    self._schedule_requested = False
+                    self._schedule_force_requested = False
+                try:
+                    self._drain_schedule(force_batch_gate=force)
+                except Exception:
+                    # Scheduling callbacks are best effort; the next worker
+                    # event can retry after a transient transport/state race.
+                    logger.exception("Deferred Motivation scheduling callback failed")
+                with self._schedule_guard:
+                    if self._schedule_closed:
+                        self._schedule_task_pending = False
+                        return
+                    if self._schedule_requested or self._schedule_force_requested:
+                        continue
+                    self._schedule_task_pending = False
+                    return
+        finally:
+            with self._schedule_guard:
+                if self._schedule_thread_ident == threading.get_ident():
+                    self._schedule_thread_ident = None
+
+    def _drain_schedule(self, *, force_batch_gate: bool = False) -> None:
         """Drain immediately runnable leases without allowing reentrant storms.
 
         A controller call reserves at most one GPU slot.  On a worker/action
@@ -433,11 +685,20 @@ class MotivationExecutionBridge:
         if gate is None:
             return False
         scheduler = self.controller.scheduler
-        has_action = any(
-            not state.departed and state.pending_action is not None
+        pending_actions = tuple(
+            state
             for state in scheduler.sessions()
+            if not state.departed and state.pending_action is not None and state.in_flight is None
         )
-        if not has_action:
+        if not pending_actions:
+            self._cancel_batch_gate()
+            return False
+        # The gate only has value for a true singleton action.  In the common
+        # full-trace startup burst many actions are ready together; checking
+        # that cardinality before the exhaustive candidate search avoids a
+        # redundant search that would be discarded by
+        # ``_has_other_pending_actions`` below anyway.
+        if len(pending_actions) > 1:
             self._cancel_batch_gate()
             return False
         try:
@@ -493,10 +754,9 @@ class MotivationExecutionBridge:
     def _has_other_pending_actions(self, selected_session_ids: Sequence[str]) -> bool:
         """Return whether another session can provide action work now.
 
-        The scheduler intentionally gives action jobs global priority over idle
-        sentinels. Mirror that narrow rule here rather than probing a second
-        candidate (which would duplicate policy scoring): an existing action
-        on another session is enough reason to dispatch and drain immediately.
+        An existing runnable action on another session is enough reason to
+        dispatch and drain immediately rather than holding a global singleton
+        gate. Idle batch fillers do not cancel the gate by themselves.
         """
         selected = set(selected_session_ids)
         return any(
