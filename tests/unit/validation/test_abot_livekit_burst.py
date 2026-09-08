@@ -200,6 +200,23 @@ def test_requested_user_fps_counts_unserved_request_as_zero_after_grace(tmp_path
     assert runner._session_requested_delivery_fps(session, now=15.0, interval=2.0, delta=24) == 12.0
 
 
+def test_cpr_proxy_excludes_startup_and_counts_rebuffer_time(tmp_path: Path) -> None:
+    scenario = _load_scenario(tmp_path)
+    session = _session(0, scenario)
+
+    # The first frame starts playback but does not charge connection/startup.
+    session._record_generated_frame_for_cpr(0.0)
+    session._advance_cpr_playback(1.0 / 24.0)
+    assert session.cpr_stall_seconds == 0.0
+
+    # A long gap exhausts the one-frame buffer and becomes a rebuffer interval.
+    session._advance_cpr_playback(1.0)
+    snapshot = session._cpr_snapshot()
+    assert snapshot["stall_seconds"] > 0.9
+    assert snapshot["stall_events"] == 1
+    assert 0.0 < snapshot["cpr_proxy"] < 1.0
+
+
 def test_peak16_trace_requires_all_active_users() -> None:
     scenario_path = (
         wave._REPO_ROOT / "tools/validation/workloads/abot_livekit_4gpu_lf3_12fps_all_active_peak16_wave.json"

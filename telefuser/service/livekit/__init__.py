@@ -25,6 +25,13 @@ from .motivation_diagnostics import (
     NullMotivationDiagnostics,
 )
 from .motivation_execution import MotivationExecutionBridge, release_on_control_state
+from .motivation_policies import (
+    FIFOPolicy,
+    MotivationPolicy,
+    SchedulingPolicy,
+    SchedulingSearchRequest,
+    create_scheduling_policy,
+)
 from .motivation_scheduler import (
     ActionJob,
     DispatchCandidate,
@@ -84,6 +91,11 @@ __all__ = [
     "NullMotivationDiagnostics",
     "MotivationExecutionBridge",
     "release_on_control_state",
+    "FIFOPolicy",
+    "MotivationPolicy",
+    "SchedulingPolicy",
+    "SchedulingSearchRequest",
+    "create_scheduling_policy",
     "MotivationScheduler",
     "MotivationSchedulerConfig",
     "RouterMigrationBackend",

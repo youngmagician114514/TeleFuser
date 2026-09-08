@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from queue import SimpleQueue
+from queue import Empty, SimpleQueue
 
 from telefuser.pipelines.abot_world.service import ABotWorldLiveKitService
 from telefuser.service.livekit.config import LiveKitServeConfig
@@ -14,6 +14,22 @@ from telefuser.service.livekit.process_worker_pool import (
 from telefuser.service.livekit.process_worker_pool import (
     _DispatchTraceWriter as ProcessDispatchTraceWriter,
 )
+
+
+class _MotivationFailureSink:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def on_motivation_dispatch_failed(self, **kwargs: object) -> None:
+        self.calls.append(dict(kwargs))
+
+
+class _MotivationCompleteSink:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def on_motivation_compute_complete(self, **kwargs: object) -> None:
+        self.calls.append(dict(kwargs))
 
 
 def test_service_dispatch_trace_has_stage_vae_and_session_audit_fields() -> None:
@@ -176,3 +192,104 @@ def test_process_mode_trace_forwards_to_parent_and_preserves_physical_gpu(monkey
     assert records[1]["gpu"] == event["gpu"]
     assert records[1]["parent_sequence"] == 1
     assert snapshot["written_events"] == 1
+
+
+def test_process_mode_without_audit_trace_only_forwards_motivation_records() -> None:
+    config = LiveKitServeConfig(worker_mode="process")
+    service = _TraceCallbackService()
+    events = SimpleQueue()
+    spec = ProcessWorkerSpec("worker-0", ["0"])
+
+    assert _install_process_dispatch_trace_callback(
+        service=service,
+        config=config,
+        spec=spec,
+        events=events,
+        logical_cuda_device=0,
+    )
+    assert callable(service.callback)
+    service.callback({"sessions": [{"session_id": "ordinary"}]})
+    try:
+        events.get_nowait()
+    except Empty:
+        pass
+    else:
+        raise AssertionError("ordinary dispatch should not cross the parent IPC boundary")
+    service.callback({"sessions": [{"session_id": "motivated", "motivation_job_id": "job-1"}]})
+    event = events.get_nowait()
+    assert event["type"] == "model_dispatch_trace"
+
+
+def test_model_error_trace_rolls_back_motivation_lease() -> None:
+    sink = _MotivationFailureSink()
+    pool = object.__new__(ProcessLiveKitWorkerPool)
+    pool._event_sink = sink
+    pool._dispatch_trace = None
+
+    ProcessLiveKitWorkerPool._dispatch_event(
+        pool,
+        {
+            "type": "model_dispatch_trace",
+            "worker_id": "worker-0",
+            "trace": {
+                "schema_version": 1,
+                "event_type": "model_dispatch",
+                "outcome": "error",
+                "error": "RuntimeError: invalid KV cursor",
+                "sessions": [
+                    {
+                        "session_id": "pipeline-1",
+                        "motivation_job_id": "job-7",
+                    }
+                ],
+            },
+        },
+    )
+
+    assert sink.calls == [
+        {
+            "job_ids": ("job-7",),
+            "session_ids": ("pipeline-1",),
+            "error": "RuntimeError: invalid KV cursor",
+        }
+    ]
+
+
+def test_model_success_trace_releases_motivation_at_compute_boundary() -> None:
+    sink = _MotivationCompleteSink()
+    pool = object.__new__(ProcessLiveKitWorkerPool)
+    pool._event_sink = sink
+    pool._dispatch_trace = None
+
+    ProcessLiveKitWorkerPool._dispatch_event(
+        pool,
+        {
+            "type": "model_dispatch_trace",
+            "worker_id": "worker-0",
+            "trace": {
+                "schema_version": 1,
+                "event_type": "model_dispatch",
+                "outcome": "ok",
+                "sessions": [
+                    {
+                        "session_id": "pipeline-1",
+                        "motivation_job_id": "job-7",
+                        "batch_compatibility_key": "key-a",
+                    },
+                    {
+                        "session_id": "pipeline-1",
+                        "motivation_job_id": "job-7",
+                        "batch_compatibility_key": "key-a",
+                    },
+                ],
+            },
+        },
+    )
+
+    assert sink.calls == [
+        {
+            "job_ids": ("job-7",),
+            "session_ids": ("pipeline-1",),
+            "compatibility_keys": {"pipeline-1": "key-a"},
+        }
+    ]

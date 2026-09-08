@@ -53,6 +53,8 @@ def run_stream_server(
     motivation_profile: str | None = None,
     motivation_memory_free_gb: float = 80.0,
     motivation_max_batch_size: int = 4,
+    motivation_migration: bool = True,
+    motivation_policy: str = "motivation",
 ) -> None:
     """Run the LiveKit-backed streaming HTTP API."""
     config_kwargs: dict[str, Any] = _drop_none(
@@ -97,7 +99,11 @@ def run_stream_server(
             motivation_profile,
             gpu_states=gpu_states,
             dispatch=lambda _lease: None,
-            scheduler_config=MotivationSchedulerConfig(max_batch_size=motivation_max_batch_size),
+            scheduler_config=MotivationSchedulerConfig(
+                max_batch_size=motivation_max_batch_size,
+                migration_enabled=motivation_migration,
+                policy_name=motivation_policy,
+            ),
             # Reuse the already documented runtime migration estimate so the
             # policy does not treat a remote GPU as free while an asynchronous
             # state transfer is still in flight.

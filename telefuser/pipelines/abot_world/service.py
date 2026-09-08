@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import gc
 import io
 import math
@@ -677,7 +678,13 @@ class ABotWorldLiveKitService:
                     )
                     prospective_keys.append(self._batch_key_for_fidelity(state, fidelity))
             if len(set(prospective_keys)) != 1:
-                raise RuntimeError("policy batch contains incompatible model sessions")
+                raise RuntimeError(
+                    "policy batch contains incompatible model sessions: "
+                    + "; ".join(
+                        f"{state.session_id}={key!r}"
+                        for state, key in zip(states, prospective_keys, strict=True)
+                    )
+                )
             # The service scheduler is the single physical invocation lane. A
             # validated policy batch may arrive while an earlier invocation is
             # running; keep it in the FIFO policy queue and let that lane
@@ -780,29 +787,71 @@ class ABotWorldLiveKitService:
         # NCCL SST can import the target session as soon as model-owned output
         # is quiescent. Publisher-owned frames stay on the existing transport
         # route and therefore must not extend the scheduler's blocking drain.
-        state = self._quiesce_migration(session_id, timeout, wait_for_publisher=False)
+        # A payload still sitting in the child output queue is already backed
+        # by a completed model state transition; waiting for a real-time
+        # consumer to dequeue it would couple migration (and thus model
+        # throughput) to LiveKit backpressure. The NCCL worker pauses the
+        # output pump immediately after this boundary and may discard such a
+        # stale latest-mode payload on a successful handoff.
+        state = self._quiesce_migration(
+            session_id,
+            timeout,
+            wait_for_output_queue=False,
+            wait_for_publisher=False,
+        )
         session = state.pipeline_session
-        # Idle suspension moves every retained tensor, including the decoder
-        # tail, to CPU.  A direct NCCL export must never expose a mixed tree:
-        # one CPU leaf would make the source fail part-way through the ordered
-        # P2P groups while the target waits forever for the corresponding
-        # receive.  ``migrating`` remains set while this restore runs and the
-        # scheduler's suspension predicate below observes that marker.
-        if not getattr(session, "is_resident", True):
-            self.pipeline.restore_interactive_session(session)
-        if session.taew_decode_state is None:
-            raise RuntimeError("ABot session is missing its TAeW2.2 decode state")
-        payload = {
-            "prompt_emb": session.prompt_emb,
-            "first_frame_latent": session.first_frame_latent,
-            "self_cache": session.self_cache,
-            "cross_cache": session.cross_cache,
-            "vae_feat_cache": session.vae_decode_state.feat_cache,
-            "taew_decode_state": self.pipeline.taew_decode_stage.export_decode_state_for_nccl(
-                session.taew_decode_state
-            ),
-        }
-        skeleton, manifest, leaves = flatten_tensor_tree(payload)
+        # Idle suspension and NCCL export are both allowed to run from worker
+        # threads.  Serialize them with the pipeline execution lock and mark
+        # the session MIGRATING before releasing it.  If suspension acquired
+        # the lock first, it completes and we restore the tensors here; if the
+        # migration acquired it first, suspend_interactive_session observes
+        # MIGRATING and leaves the source buffers untouched.  Without this
+        # handshake a full trace could export a mixed (or entirely CPU) tree.
+        execution_lock = getattr(self.pipeline, "_execution_lock", None)
+        lock_context = execution_lock if execution_lock is not None else contextlib.nullcontext()
+        session_lock = getattr(session, "lock", None)
+        session_lock_context = session_lock if session_lock is not None else contextlib.nullcontext()
+        with lock_context, session_lock_context:
+            if (
+                getattr(session, "lifecycle", None) == ABotWorldSessionLifecycle.SUSPENDED
+                or getattr(session, "is_resident", True) is False
+            ):
+                self.pipeline.restore_interactive_session(session)
+            # Keep this marker until commit_migration/abort_migration.  The
+            # scheduler's idle transition also preserves it, and the pipeline
+            # suspension method refuses to move a marked session to CPU.
+            session.lifecycle = ABotWorldSessionLifecycle.MIGRATING
+            if session.taew_decode_state is None:
+                raise RuntimeError("ABot session is missing its TAeW2.2 decode state")
+            # The two KV cursors are control metadata, not model payload.
+            # Serialize them in the control message and recreate device
+            # tensors on import, avoiding NCCL's tiny mixed-dtype P2P path.
+            def serialize_cache(cache: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+                serialized: list[dict[str, Any]] = []
+                for layer in cache:
+                    copied = dict(layer)
+                    for key in ("global_end_index", "local_end_index"):
+                        value = copied.get(key)
+                        if isinstance(value, torch.Tensor):
+                            if value.numel() != 1:
+                                raise ValueError(f"ABot migration cursor {key!r} must be scalar")
+                            copied[key] = int(value.item())
+                        elif value is not None:
+                            copied[key] = int(value)
+                    serialized.append(copied)
+                return serialized
+
+            payload = {
+                "prompt_emb": session.prompt_emb,
+                "first_frame_latent": session.first_frame_latent,
+                "self_cache": serialize_cache(session.self_cache),
+                "cross_cache": serialize_cache(session.cross_cache),
+                "vae_feat_cache": session.vae_decode_state.feat_cache,
+                "taew_decode_state": self.pipeline.taew_decode_stage.export_decode_state_for_nccl(
+                    session.taew_decode_state
+                ),
+            }
+            skeleton, manifest, leaves = flatten_tensor_tree(payload)
         # Minimal CPU pipeline doubles are also used by the snapshot unit
         # tests.  The child NCCL command path performs the unconditional
         # device preflight; keep this service-side check active whenever the
@@ -847,6 +896,27 @@ class ABotWorldLiveKitService:
     ) -> str:
         """Install target-GPU tensors received by NCCL without a CPU snapshot copy."""
         payload = rebuild_tensor_tree(metadata["tensor_skeleton"], dict(tensor_leaves))
+        # ``prepare_migration_nccl_metadata`` carries KV cursors as ordinary
+        # control values.  Normalize them back to device tensors so the
+        # regular eager and CUDA-graph paths can use their existing cursor
+        # accessors without a special case.  Accept tensor values as well for
+        # compatibility with metadata produced by an older child.
+        expected_device = torch.device(getattr(self.pipeline, "device", "cpu"))
+        for cache_name in ("self_cache", "cross_cache"):
+            for layer in payload.get(cache_name, ()):
+                if not isinstance(layer, dict):
+                    continue
+                for key in ("global_end_index", "local_end_index"):
+                    if key not in layer:
+                        continue
+                    value = layer[key]
+                    if isinstance(value, torch.Tensor):
+                        if value.numel() != 1:
+                            raise ValueError(f"ABot migration cursor {key!r} must be scalar")
+                        if value.device != expected_device:
+                            layer[key] = value.to(device=expected_device)
+                    else:
+                        layer[key] = torch.tensor([int(value)], dtype=torch.long, device=expected_device)
         snapshot = ABotWorldSessionSnapshot(
             session_id=str(metadata["session_id"]),
             prompt_emb=payload["prompt_emb"],
@@ -910,6 +980,7 @@ class ABotWorldLiveKitService:
         session_id: str,
         timeout: float | None,
         *,
+        wait_for_output_queue: bool = True,
         wait_for_publisher: bool = True,
     ) -> _ABotWorldLiveKitSession:
         effective_timeout = self.close_timeout if timeout is None else timeout
@@ -919,10 +990,16 @@ class ABotWorldLiveKitService:
             if state is None:
                 raise KeyError(f"Unknown ABot session {session_id!r}")
             state.migrating = True
+            # Latest-mode payloads are replaceable transport artifacts.  A
+            # lossless session, however, must retain every queued payload even
+            # when the caller requested the NCCL fast path.
+            effective_wait_for_output_queue = bool(
+                wait_for_output_queue or state.config.get("delivery_mode", "latest") == "lossless"
+            )
             self._scheduler_condition.notify_all()
             while (
                 state.in_flight
-                or not state.output_queue.empty()
+                or (effective_wait_for_output_queue and not state.output_queue.empty())
                 or (
                     wait_for_publisher
                     and state.publisher_frame_tracking_enabled
@@ -935,6 +1012,39 @@ class ABotWorldLiveKitService:
                     raise TimeoutError("Timed out waiting for ABot migration chunk boundary and output drain")
                 self._scheduler_condition.wait(remaining)
             return state
+
+    def discard_pending_migration_outputs(self, session_id: str) -> int:
+        """Drop queued child payloads after a successful latest-mode handoff.
+
+        Model state is advanced before a payload is put on ``output_queue``.
+        During NCCL migration the source route remains authoritative until the
+        target is committed, so any payload that has not yet left this
+        child-local queue is a stale transport artifact rather than model
+        state.  Dropping it prevents a slow LiveKit consumer from blocking
+        the migration transaction.  Lossless sessions are left untouched and
+        report zero; callers may choose to retain the old strict barrier for
+        those sessions.
+        """
+        state = self._session(session_id)
+        if state is None:
+            return 0
+        with self._scheduler_condition, state.lock:
+            if state.config.get("delivery_mode", "latest") == "lossless":
+                return 0
+            dropped = 0
+            while True:
+                try:
+                    payload = state.output_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if self._payload_frame_count(payload) > 0:
+                    state.dropped_video_payloads += 1
+                else:
+                    state.dropped_status_payloads += 1
+                dropped += 1
+            state.output_available_event.clear()
+            self._scheduler_condition.notify_all()
+            return dropped
 
     def import_migration(
         self,
@@ -1075,7 +1185,12 @@ class ABotWorldLiveKitService:
                 # first/continuation, KV-layout and lifecycle constraints that
                 # its native batch path enforces.
                 batch_key = self._batch_key(state)
-                structural_key = batch_key[:5] + batch_key[6:]
+                # Fidelity is a policy choice, not a physical layout key.
+                # Residency/lifecycle is likewise not part of the model batch
+                # contract: ``_execute_batch`` restores suspended sessions
+                # before generation.  Keep only the shape/phase/KV-layout
+                # fields that the native collate path actually requires.
+                structural_key = batch_key[:-1]
                 queued_video_frames = self._queued_video_frames(state)
                 frame_credit_frames = queued_video_frames + state.publisher_unsubmitted_frames
                 return {
@@ -1155,6 +1270,14 @@ class ABotWorldLiveKitService:
             return {
                 "session_id": str(state.session_id),
                 "chunk_index": int(state.next_chunk_index),
+                # Retain the policy-selected fidelity in the audit trace so
+                # post-run quality metrics can be aligned with generated
+                # frames without changing the model or scheduler path.
+                "fidelity": (
+                    str(member.fidelity)
+                    if member is not None and member.fidelity is not None
+                    else (str(state.motivation_fidelity) if state.motivation_fidelity is not None else None)
+                ),
                 "next_latent_frame_before": self._trace_number(getattr(session, "next_latent_frame", None)),
                 "next_latent_frame_after": None,
                 "emitted_frames_before": self._trace_number(getattr(session, "emitted_frames", None)),
@@ -1187,6 +1310,12 @@ class ABotWorldLiveKitService:
                 "frames": int(len(frames)),
             }
         )
+        # Publish the post-compute KV/layout contract with the same trace as
+        # the model-completion boundary.  Waiting for the later parent output
+        # event lets a newly scheduled batch observe stale cursors after the
+        # compute-side lease has already been committed.
+        batch_key = self._batch_key(state)
+        trace["batch_compatibility_key"] = repr(batch_key[:-1])
 
     def _emit_dispatch_trace(
         self,
@@ -1280,7 +1409,8 @@ class ABotWorldLiveKitService:
                             state.ready_since = None
                             self._clear_deadline_batch_wait(state)
                             state.deadline_batch_force_singleton = False
-                            state.pipeline_session.lifecycle = ABotWorldSessionLifecycle.IDLE
+                            if not state.migrating:
+                                state.pipeline_session.lifecycle = ABotWorldSessionLifecycle.IDLE
                         if (
                             not state.controls
                             and not state.motivation_one_shot
@@ -1704,13 +1834,14 @@ class ABotWorldLiveKitService:
             with state.lock:
                 if state.deadline_batch_force_singleton:
                     return [state]
-        if ready[0].pipeline_session.migration_transfer_in_progress:
+        if getattr(ready[0].pipeline_session, "migration_transfer_in_progress", False):
             return [ready[0]]
         pivot_key = self._batch_key(ready[0])
         batch = [
             state
             for state in ready
-            if not state.pipeline_session.migration_transfer_in_progress and self._batch_key(state) == pivot_key
+            if not getattr(state.pipeline_session, "migration_transfer_in_progress", False)
+            and self._batch_key(state) == pivot_key
         ][: self.max_batch_size]
         if len(batch) <= 1:
             return batch
@@ -1799,7 +1930,6 @@ class ABotWorldLiveKitService:
             local_end,
             tuple(session.first_frame_latent.shape),
             fidelity,
-            session.lifecycle == ABotWorldSessionLifecycle.SUSPENDED,
         )
 
     def _execute_batch(
@@ -1874,6 +2004,16 @@ class ABotWorldLiveKitService:
                     list(controls),
                     **generate_kwargs,
                 )
+            # Cache writes can be queued on auxiliary CUDA streams by the
+            # attention/model backend.  The migration path snapshots those
+            # tensors immediately after this call; fence the whole device so
+            # the exported KV cursors and data are stable before we publish
+            # the compute-complete boundary to the scheduler.
+            model_device = getattr(self.pipeline, "device", None)
+            if model_device is not None:
+                model_device = torch.device(model_device)
+                if model_device.type == "cuda" and torch.cuda.is_available():
+                    torch.cuda.synchronize(model_device)
         except Exception as exc:
             completed_at = time.monotonic()
             completed_wall_time = time.time()
@@ -2003,8 +2143,10 @@ class ABotWorldLiveKitService:
                     with state.lock:
                         state.in_flight = False
                 self._scheduler_condition.notify_all()
-            for state, payload in pending_outputs:
-                self._put_output(state, payload)
+            # Publish the compute boundary before putting payloads on the
+            # output queues.  The parent policy can then release the physical
+            # GPU reservation while LiveKit/publisher transport drains, while
+            # the session lease remains in flight until its output commits.
             self._emit_dispatch_trace(
                 selected_at=selected_at,
                 selected_wall_time=selected_wall_time,
@@ -2017,6 +2159,8 @@ class ABotWorldLiveKitService:
                 stage_metrics=self._last_stage_metrics,
                 outcome="ok",
             )
+            for state, payload in pending_outputs:
+                self._put_output(state, payload)
         finally:
             with self._scheduler_condition:
                 for state in batch:
@@ -2220,6 +2364,7 @@ class ABotWorldLiveKitService:
             return {
                 "in_flight": bool(state.in_flight),
                 "output_queue_empty": state.output_queue.empty(),
+                "output_queue_discardable": state.config.get("delivery_mode", "latest") != "lossless",
                 "publisher_unsubmitted_frames": int(state.publisher_unsubmitted_frames),
             }
 

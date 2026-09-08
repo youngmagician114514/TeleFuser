@@ -89,6 +89,42 @@ def test_bridge_releases_action_and_commits_on_model_output() -> None:
     assert lease.candidate.batch_size == 1
 
 
+def test_bridge_commits_at_compute_trace_without_double_counting_output() -> None:
+    controller = _controller()
+    dispatched = []
+    bridge = MotivationExecutionBridge(
+        controller,
+        dispatch=lambda lease, payloads: dispatched.append((lease, payloads)),
+        clock=lambda: 0.0,
+    )
+    bridge.register_session("session-1", owner_gpu="gpu-0", now=0.0)
+    bridge.register_pipeline_session("session-1", "pipeline-1")
+    bridge.on_control_message(
+        "worker-0",
+        "session-1",
+        {"type": "control_state", "controls": ["W"]},
+    )
+    action_lease = dispatched[0][0]
+    job_id = action_lease.jobs[0].job_id
+    initial_slack = controller.scheduler.session("session-1").slack_seconds
+
+    assert bridge.on_compute_complete(job_ids=(job_id,)) is True
+    state = controller.scheduler.session("session-1")
+    assert state.slack_seconds > initial_slack
+    assert state.in_flight is None or state.in_flight.job_id != job_id
+    committed_slack = state.slack_seconds
+
+    # Duplicate traces and the later transport output cannot credit the same
+    # generated block twice.
+    assert bridge.on_compute_complete(job_ids=(job_id,)) is False
+    bridge.on_model_output(
+        "worker-0",
+        "pipeline-1",
+        {"type": "chunk", "scheduler": {"motivation_job_id": job_id}},
+    )
+    assert controller.scheduler.session("session-1").slack_seconds == committed_slack
+
+
 def test_bridge_ignores_model_output_from_previous_migration_owner() -> None:
     controller = _controller()
     dispatched = []
@@ -617,6 +653,7 @@ def test_bridge_rolls_back_asynchronous_physical_batch_failure() -> None:
         "session departed before physical completion",
         "RuntimeError('session departed before physical completion')",
         'RuntimeError("session departed before physical completion")',
+        "RuntimeError(\"ABot policy session 'session-1' is inactive\")",
     ),
 )
 def test_bridge_downgrades_expected_departure_race_logs(caplog, error: str) -> None:

@@ -4,22 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import multiprocessing
 import os
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from multiprocessing.context import BaseContext
 from multiprocessing.process import BaseProcess
-from pathlib import Path
 from typing import Any
 
 from telefuser.service.security.security_validator import SecurityLevel
 from telefuser.utils.logging import logger
 
 from .config import LiveKitServeConfig
+from .dispatch_trace import DispatchTraceWriter
 from .session_registry import SessionRecord
 from .worker import WorkerEventSink
 
@@ -45,86 +43,8 @@ class _ProcessHandle:
     process: BaseProcess
 
 
-class _DispatchTraceWriter:
-    """Bounded, parent-owned JSONL writer for experiment audit records.
-
-    Both isolated-worker modes forward model-dispatch callbacks over their
-    existing child-to-parent event queue. Keeping the file descriptor in the
-    parent makes the single-GPU ``process`` schema identical to
-    ``process-nccl``.
-    """
-
-    def __init__(self, path: str, *, max_events: int, workers: dict[str, list[str]]) -> None:
-        self.path = Path(path).expanduser().resolve()
-        self.max_events = int(max_events)
-        self.received_events = 0
-        self.written_events = 0
-        self.dropped_events = 0
-        self.write_errors = 0
-        self._write_error_logged = False
-        self._handle: Any | None = None
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if self.path.exists():
-            raise FileExistsError(f"dispatch trace path already exists; choose a fresh run-scoped path: {self.path}")
-        self._handle = self.path.open("x", encoding="utf-8")
-        self._write_line(
-            {
-                "schema_version": 1,
-                "event_type": "trace_metadata",
-                "trace_started_monotonic_seconds": time.monotonic(),
-                "trace_started_unix_seconds": time.time(),
-                "trace_started_utc": datetime.now(timezone.utc).isoformat(),
-                "max_dispatch_events": self.max_events,
-                "configured_workers": workers,
-            }
-        )
-
-    def _write_line(self, record: dict[str, Any]) -> bool:
-        handle = self._handle
-        if handle is None:
-            return False
-        try:
-            handle.write(json.dumps(record, allow_nan=False, separators=(",", ":"), sort_keys=True) + "\n")
-            handle.flush()
-            return True
-        except (OSError, TypeError, ValueError) as exc:
-            self.write_errors += 1
-            if not self._write_error_logged:
-                self._write_error_logged = True
-                logger.warning("Failed to write ABot dispatch trace %s: %s", self.path, exc)
-            return False
-
-    def append(self, record: dict[str, Any]) -> None:
-        self.received_events += 1
-        if self.received_events > self.max_events:
-            self.dropped_events += 1
-            return
-        enriched = dict(record)
-        enriched["parent_sequence"] = self.received_events
-        enriched["parent_received_monotonic_seconds"] = time.monotonic()
-        enriched["parent_received_unix_seconds"] = time.time()
-        if self._write_line(enriched):
-            self.written_events += 1
-        else:
-            self.dropped_events += 1
-
-    def snapshot(self) -> dict[str, object]:
-        return {
-            "enabled": True,
-            "path": str(self.path),
-            "max_events": self.max_events,
-            "received_events": self.received_events,
-            "written_events": self.written_events,
-            "dropped_events": self.dropped_events,
-            "write_errors": self.write_errors,
-        }
-
-    def close(self) -> None:
-        handle = self._handle
-        self._handle = None
-        if handle is not None:
-            with contextlib.suppress(OSError):
-                handle.close()
+# Preserve the private name used by existing local tests and experiment code.
+_DispatchTraceWriter = DispatchTraceWriter
 
 
 class ProcessLiveKitWorkerPool:
@@ -172,7 +92,7 @@ class ProcessLiveKitWorkerPool:
         trace_path_value = getattr(self._config, "dispatch_trace_path", None)
         trace_path = trace_path_value.strip() if isinstance(trace_path_value, str) else ""
         self._dispatch_trace = (
-            _DispatchTraceWriter(
+            DispatchTraceWriter(
                 trace_path,
                 max_events=int(getattr(self._config, "dispatch_trace_max_events", 10_000)),
                 workers={worker_id: list(spec.gpu_ids) for worker_id, spec in self._specs.items()},
@@ -429,10 +349,86 @@ class ProcessLiveKitWorkerPool:
         record["gpu"] = dict(gpu) if isinstance(gpu, dict) else {}
         trace.append(record)
 
+    @staticmethod
+    def _trace_motivation_context(
+        event: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, tuple[str, ...], tuple[str, ...], dict[str, str]]:
+        """Extract stable job/session identifiers from one child trace event."""
+        raw = event.get("trace")
+        if not isinstance(raw, dict):
+            return None, (), (), {}
+        raw_sessions = raw.get("sessions", ())
+        if not isinstance(raw_sessions, (list, tuple)):
+            return raw, (), (), {}
+        job_ids: list[str] = []
+        session_ids: list[str] = []
+        compatibility_keys: dict[str, str] = {}
+        for item in raw_sessions:
+            if not isinstance(item, dict):
+                continue
+            job_id = item.get("motivation_job_id")
+            session_id = item.get("session_id")
+            if job_id is not None and str(job_id) and str(job_id) not in job_ids:
+                job_ids.append(str(job_id))
+            if session_id is not None and str(session_id) and str(session_id) not in session_ids:
+                session_ids.append(str(session_id))
+            compatibility_key = item.get("batch_compatibility_key")
+            if session_id is not None and isinstance(compatibility_key, str):
+                compatibility_keys[str(session_id)] = compatibility_key
+        return raw, tuple(job_ids), tuple(session_ids), compatibility_keys
+
+    def _notify_model_compute_complete(self, event: dict[str, Any]) -> None:
+        """Notify the Motivation bridge before model output transport drains.
+
+        A dispatch trace is emitted by the child immediately after model
+        compute.  Output messages can remain queued behind LiveKit/publisher
+        work, so using ``model_output`` as the GPU-release boundary would
+        serialize policy capacity on consumer latency.
+        """
+        raw, job_ids, session_ids, compatibility_keys = self._trace_motivation_context(event)
+        if not isinstance(raw, dict) or raw.get("outcome") != "ok" or raw.get("error"):
+            return
+        if not job_ids and not session_ids:
+            return
+        callback = getattr(getattr(self, "_event_sink", None), "on_motivation_compute_complete", None)
+        if callable(callback):
+            callback(
+                job_ids=tuple(job_ids),
+                session_ids=tuple(session_ids),
+                compatibility_keys=compatibility_keys,
+            )
+
+    def _notify_model_dispatch_failed(self, event: dict[str, Any]) -> None:
+        """Roll back a Motivation lease when child model execution fails.
+
+        Child services emit the same dispatch trace for successful and failed
+        model invocations.  The success path is the compute boundary handled
+        above; an error trace must instead release the reservation so one
+        failed generation cannot strand a scheduler lease indefinitely.
+        """
+        raw, job_ids, session_ids, _ = self._trace_motivation_context(event)
+        if not isinstance(raw, dict) or raw.get("outcome") == "ok":
+            return
+        if not job_ids and not session_ids:
+            return
+        callback = getattr(getattr(self, "_event_sink", None), "on_motivation_dispatch_failed", None)
+        if callable(callback):
+            callback(
+                job_ids=tuple(job_ids),
+                session_ids=tuple(session_ids),
+                error=str(raw.get("error") or "model execution failed"),
+            )
+
+    def _handle_model_dispatch_trace(self, event: dict[str, Any]) -> None:
+        """Apply the common child-compute trace contract for every transport."""
+        self._record_dispatch_trace(event)
+        self._notify_model_compute_complete(event)
+        self._notify_model_dispatch_failed(event)
+
     def _dispatch_event(self, event: dict[str, Any]) -> None:
         event_type = event.get("type")
         if event_type == "model_dispatch_trace":
-            self._record_dispatch_trace(event)
+            self._handle_model_dispatch_trace(event)
             return
         if event_type == "motivation_dispatch_failed":
             callback = getattr(self._event_sink, "on_motivation_dispatch_failed", None)
@@ -690,15 +686,31 @@ def _install_process_dispatch_trace_callback(
     events: Any,
     logical_cuda_device: int | None,
 ) -> bool:
-    """Forward child service records to the parent's bounded JSONL writer."""
+    """Forward audit records and Motivation compute boundaries to the parent.
 
-    trace_path_value = config.dispatch_trace_path
+    Motivation needs the callback even when JSONL auditing is disabled.  In a
+    non-Motivation deployment, however, forwarding every ordinary batch over
+    the process queue would add an avoidable IPC event per model invocation.
+    Keep the callback installed (so the child setup is identical) but filter
+    those records in the closure; policy-tagged records still cross the
+    boundary, and an explicitly configured trace continues to receive every
+    dispatch.
+    """
+
     set_callback = getattr(service, "set_dispatch_trace_callback", None)
-    if not isinstance(trace_path_value, str) or not trace_path_value.strip() or not callable(set_callback):
+    if not callable(set_callback):
         return False
+    trace_path_value = getattr(config, "dispatch_trace_path", None)
+    trace_enabled = isinstance(trace_path_value, str) and bool(trace_path_value.strip())
     gpu = _process_dispatch_trace_gpu_metadata(spec, logical_cuda_device=logical_cuda_device)
 
     def forward_dispatch_trace(record: dict[str, Any]) -> None:
+        if not trace_enabled:
+            sessions = record.get("sessions")
+            if not isinstance(sessions, (list, tuple)) or not any(
+                isinstance(item, dict) and item.get("motivation_job_id") is not None for item in sessions
+            ):
+                return
         events.put(
             {
                 "type": "model_dispatch_trace",

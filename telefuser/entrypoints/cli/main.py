@@ -212,6 +212,19 @@ def serve(
     show_default=True,
     help="Maximum Motivation candidate batch size",
 )
+@click.option(
+    "--motivation-migration/--no-motivation-migration",
+    default=True,
+    show_default=True,
+    help="Allow the Motivation scheduler to move sessions between workers",
+)
+@click.option(
+    "--motivation-policy",
+    default="motivation",
+    type=str,
+    show_default=True,
+    help="Global scheduling policy (motivation or fifo)",
+)
 def stream_serve(
     pipe_path: str,
     host: str,
@@ -240,6 +253,8 @@ def stream_serve(
     motivation_profile: str | None,
     motivation_memory_free_gb: float,
     motivation_max_batch_size: int,
+    motivation_migration: bool,
+    motivation_policy: str,
 ) -> None:
     """Start the LiveKit-backed TeleFuser stream server.
 
@@ -287,6 +302,8 @@ def stream_serve(
         motivation_profile=motivation_profile,
         motivation_memory_free_gb=motivation_memory_free_gb,
         motivation_max_batch_size=motivation_max_batch_size,
+        motivation_migration=motivation_migration,
+        motivation_policy=motivation_policy,
     )
 
 

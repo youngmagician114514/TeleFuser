@@ -340,6 +340,17 @@ def transfer_tensor_leaves_nccl_streamed(
                 requests = dist.batch_isend_irecv(ops)
                 for request in requests:
                     request.wait()
+            # ``Work.wait()`` guarantees that the NCCL operation has been
+            # enqueued, but on some PyTorch/NCCL combinations it does not
+            # fence device-side writes issued on a non-default stream.  The
+            # receiver publishes a per-layer readiness event immediately
+            # after this point; synchronizing the dedicated transfer stream
+            # is therefore required before a target model may read the layer
+            # (especially its scalar KV cursor tensors).  Without this fence
+            # a target can observe uninitialized ``global_end_index`` values
+            # while the copy is still in flight.
+            if stream is not None:
+                stream.synchronize()
             ready_event = None
             if stream is not None:
                 ready_event = torch.cuda.Event()

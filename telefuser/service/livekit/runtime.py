@@ -462,6 +462,22 @@ class LiveKitServeRuntime:
         if bridge is not None:
             bridge.on_dispatch_failed(job_ids=job_ids, session_ids=session_ids, error=error)
 
+    def on_motivation_compute_complete(
+        self,
+        *,
+        job_ids: tuple[str, ...] = (),
+        session_ids: tuple[str, ...] = (),
+        compatibility_keys: dict[str, str] | None = None,
+    ) -> None:
+        """Release GPU policy reservations at child model completion."""
+        bridge = self._motivation_bridge
+        if bridge is not None:
+            bridge.on_compute_complete(
+                job_ids=job_ids,
+                session_ids=session_ids,
+                compatibility_keys=compatibility_keys,
+            )
+
     def on_model_output(
         self,
         worker_id: str,

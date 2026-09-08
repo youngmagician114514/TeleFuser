@@ -433,20 +433,28 @@ def test_late_control_for_released_route_is_dropped() -> None:
     assert sent == []
 
 
-def test_migration_drain_waits_for_child_queue_but_not_publisher_frames(monkeypatch) -> None:
+def test_migration_drain_ignores_child_queue_and_publisher_backpressure(monkeypatch) -> None:
     async def run() -> None:
         pool = _pool()
         calls: list[tuple[str, object]] = []
         statuses = iter(
             [
-                # Child Fq remains: the parent cannot accept this snapshot.
-                {"in_flight": False, "output_queue_empty": False, "publisher_unsubmitted_frames": 0},
-                # Fq has crossed to the publisher, but child Fp remains.
-                {"in_flight": False, "output_queue_empty": True, "publisher_unsubmitted_frames": 12},
-                # First zero snapshot is followed by a parent-drain barrier.
-                {"in_flight": False, "output_queue_empty": True, "publisher_unsubmitted_frames": 0},
-                # Only a second zero status after that barrier is safe.
-                {"in_flight": False, "output_queue_empty": True, "publisher_unsubmitted_frames": 0},
+                # A completed compute is the model-state boundary.  The
+                # payload can remain in the child queue when LiveKit is slow.
+                {
+                    "in_flight": False,
+                    "output_queue_empty": False,
+                    "output_queue_discardable": True,
+                    "publisher_unsubmitted_frames": 0,
+                },
+                # These later values document that no second publisher/queue
+                # barrier is required once the first status is quiescent.
+                {
+                    "in_flight": False,
+                    "output_queue_empty": True,
+                    "output_queue_discardable": True,
+                    "publisher_unsubmitted_frames": 12,
+                },
             ]
         )
 
@@ -471,11 +479,12 @@ def test_migration_drain_waits_for_child_queue_but_not_publisher_frames(monkeypa
             "pipeline-1", source_worker_id="worker-0", timeout=1.0
         )
 
-        assert [kind for kind, _ in calls] == ["child_status", "child_status"]
+        assert [kind for kind, _ in calls] == ["child_status"]
         assert status == {
             "in_flight": False,
-            "output_queue_empty": True,
-            "publisher_unsubmitted_frames": 12,
+            "output_queue_empty": False,
+            "output_queue_discardable": True,
+            "publisher_unsubmitted_frames": 0,
         }
 
     asyncio.run(run())
@@ -757,7 +766,7 @@ def test_migration_cancellation_rolls_back_state(monkeypatch) -> None:
     asyncio.run(run())
 
 
-def test_progressive_migration_routes_compute_before_residual_copy_finishes(monkeypatch) -> None:
+def test_migration_publishes_compute_route_after_complete_copy(monkeypatch) -> None:
     async def run() -> None:
         pool = _pool()
         pool._active_workers = {"worker-0", "worker-1"}
@@ -811,11 +820,21 @@ def test_progressive_migration_routes_compute_before_residual_copy_finishes(monk
                 "session_id": "pipeline-1",
             }
         )
-        await asyncio.wait_for(compute_ready.wait(), timeout=1.0)
-
+        # First-layer readiness is only an internal transport signal.  The
+        # parent must keep the source route authoritative until every cache
+        # tensor (including scalar cursor state) has arrived at the target.
+        await asyncio.sleep(0)
+        assert not compute_ready.is_set()
         assert not migration.done()
-        assert pool._pipeline_routes["pipeline-1"] == "worker-1"
+        assert pool._pipeline_routes["pipeline-1"] == "worker-0"
         assert pool._ownership.owner("pipeline-1").worker_id == "worker-0"
+
+        transfer_release.set()
+        ownership = await migration
+
+        assert compute_ready.is_set()
+        assert ownership.worker_id == "worker-1"
+        assert pool._ownership.owner("pipeline-1").worker_id == "worker-1"
         pool.push_model_chunk("pipeline-1", {"type": "action", "action": ["W"]})
         assert sent[-1][0] == "worker-1"
         pool._dispatch_event(
@@ -826,13 +845,6 @@ def test_progressive_migration_routes_compute_before_residual_copy_finishes(monk
                 "payload": {"type": "chunk", "frames": [1]},
             }
         )
-        assert pool._model_outputs["pipeline-1"].empty()
-
-        transfer_release.set()
-        ownership = await migration
-
-        assert ownership.worker_id == "worker-1"
-        assert pool._ownership.owner("pipeline-1").worker_id == "worker-1"
         queued = pool._model_outputs["pipeline-1"].get_nowait()
         assert queued.payload["frames"] == [1]
         assert "pipeline-1" not in pool._provisional_migration_controls
@@ -841,7 +853,7 @@ def test_progressive_migration_routes_compute_before_residual_copy_finishes(monk
     asyncio.run(run())
 
 
-def test_progressive_migration_failure_replays_controls_and_discards_output(monkeypatch) -> None:
+def test_complete_copy_failure_replays_controls_without_exposing_target(monkeypatch) -> None:
     async def run() -> None:
         pool = _pool()
         pool._active_workers = {"worker-0", "worker-1"}
@@ -897,17 +909,12 @@ def test_progressive_migration_failure_replays_controls_and_discards_output(monk
                 "session_id": "pipeline-1",
             }
         )
-        await asyncio.wait_for(compute_ready.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+        assert not compute_ready.is_set()
+        assert pool._pipeline_routes["pipeline-1"] == "worker-0"
+        assert pool._ownership.owner("pipeline-1").worker_id == "worker-0"
         control = {"type": "action", "action": ["D"]}
         pool.push_model_chunk("pipeline-1", control)
-        pool._dispatch_event(
-            {
-                "type": "model_output",
-                "worker_id": "worker-1",
-                "session_id": "pipeline-1",
-                "payload": {"type": "chunk", "frames": [2]},
-            }
-        )
 
         transfer_release.set()
         with pytest.raises(RuntimeError, match="late NCCL failure"):

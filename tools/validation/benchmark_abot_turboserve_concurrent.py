@@ -22,12 +22,10 @@ from examples.abot_world._loader import DEFAULT_PROMPT, get_pipeline
 from telefuser.pipelines.abot_world.interactive import ABotWorldInteractivePipeline
 from telefuser.pipelines.abot_world.service import ABotWorldLiveKitService
 
-
-def _percentile(values: list[float], quantile: float) -> float:
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    return ordered[max(0, min(len(ordered) - 1, int(len(ordered) * quantile + 0.999999) - 1))]
+if __package__:
+    from tools.validation.abot_benchmark_metrics import percentile as _percentile
+else:  # Allow ``python tools/validation/benchmark_abot_turboserve_concurrent.py`` without PYTHONPATH.
+    from abot_benchmark_metrics import percentile as _percentile
 
 
 async def _client(

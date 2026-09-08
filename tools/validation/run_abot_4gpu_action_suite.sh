@@ -23,6 +23,24 @@ TRACE_ROOT=""
 MAX_SESSIONS_PER_WORKER=""
 DRY_RUN=0
 STARTUP_TIMEOUT_SECONDS=900
+# The end-to-end replay historically enabled publisher credit unconditionally.
+# Keep that default for compatibility, but allow a model-production control
+# run to disable the LiveKit handoff gate without editing the launch script.
+FRAME_CREDIT_ENABLED="${ABOT_ACTION_SUITE_FRAME_CREDIT_ENABLED:-1}"
+# The service already exposes these publisher-credit controls for controlled
+# runs.  Do not overwrite them here: the runner's fixed 36-frame value made it
+# impossible to separate a producer-capacity measurement from a deliberately
+# small real-time handoff window.
+FRAME_CREDIT_TARGET_SECONDS="${TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_TARGET_SECONDS:-3.0}"
+FRAME_CREDIT_TARGET_FRAMES="${TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_TARGET_FRAMES:-36}"
+FRAME_CREDIT_RESERVE_FRAMES="${TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_RESERVE_FRAMES:-4}"
+FRAME_CREDIT_GUARD_MS="${TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_GUARD_MS:-50}"
+# Migration is useful for heterogeneous/elastic placement, but it can add
+# avoidable per-session gaps when all four workers have ample capacity.  Keep
+# the production-compatible default enabled and make the controlled ablation
+# explicit through an environment variable.
+MOTIVATION_MIGRATION_ENABLED="${ABOT_ACTION_SUITE_MOTIVATION_MIGRATION_ENABLED:-1}"
+MOTIVATION_POLICY="${ABOT_ACTION_SUITE_MOTIVATION_POLICY:-motivation}"
 REQUESTED_WORKLOADS=()
 
 readonly -a ALL_WORKLOADS=(
@@ -51,7 +69,16 @@ Options:
   --livekit-bin PATH              LiveKit server binary.
   --profile PATH                  Evaluated motivation profile CSV.
   --scenario PATH                 Base LiveKit replay scenario.
+  --motivation-policy NAME        Global policy: motivation or fifo (default: motivation).
   --startup-timeout-seconds N     Wait up to N seconds for TeleFuser startup (default: 900).
+  ABOT_ACTION_SUITE_FRAME_CREDIT_ENABLED=0
+                                  Disable publisher handoff credit for a compute-side run.
+  TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_TARGET_FRAMES=N
+                                  Set the publisher-credit high watermark (default: 36).
+  TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_TARGET_SECONDS=S
+                                  Set the time-based credit target (default: 3.0).
+  ABOT_ACTION_SUITE_MOTIVATION_MIGRATION_ENABLED=0
+                                  Disable Motivation session migration for a placement control run.
   --dry-run                       Validate all selected traces without starting services.
   -h, --help                      Show this help.
 
@@ -130,6 +157,11 @@ while [[ $# -gt 0 ]]; do
       STARTUP_TIMEOUT_SECONDS="$2"
       shift 2
       ;;
+    --motivation-policy)
+      need_value "$1" "${2:-}"
+      MOTIVATION_POLICY="$2"
+      shift 2
+      ;;
     --dry-run)
       DRY_RUN=1
       shift
@@ -180,6 +212,20 @@ RUN_ROOT="$(repo_absolute_path "${RUN_ROOT}")"
   || die "--max-sessions-per-worker must be a positive integer"
 [[ "${STARTUP_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ ]] \
   || die "--startup-timeout-seconds must be a positive integer"
+[[ "${FRAME_CREDIT_ENABLED}" == 0 || "${FRAME_CREDIT_ENABLED}" == 1 ]] \
+  || die "ABOT_ACTION_SUITE_FRAME_CREDIT_ENABLED must be 0 or 1"
+[[ "${FRAME_CREDIT_TARGET_SECONDS}" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+  || die "TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_TARGET_SECONDS must be a non-negative number"
+[[ "${FRAME_CREDIT_TARGET_FRAMES}" =~ ^[1-9][0-9]*$ ]] \
+  || die "TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_TARGET_FRAMES must be a positive integer"
+[[ "${FRAME_CREDIT_RESERVE_FRAMES}" =~ ^[0-9]+$ ]] \
+  || die "TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_RESERVE_FRAMES must be a non-negative integer"
+[[ "${FRAME_CREDIT_GUARD_MS}" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+  || die "TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_GUARD_MS must be a non-negative number"
+[[ "${MOTIVATION_MIGRATION_ENABLED}" == 0 || "${MOTIVATION_MIGRATION_ENABLED}" == 1 ]] \
+  || die "ABOT_ACTION_SUITE_MOTIVATION_MIGRATION_ENABLED must be 0 or 1"
+[[ "${MOTIVATION_POLICY}" =~ ^[[:alpha:]][[:alnum:]_-]*$ ]] \
+  || die "--motivation-policy must be a simple policy name"
 [[ -x "${PYTHON_BIN}" ]] || die "Python interpreter is not executable: ${PYTHON_BIN}"
 [[ -f "${PROFILE_PATH}" ]] || die "Motivation profile not found: ${PROFILE_PATH}"
 [[ -f "${SCENARIO_PATH}" ]] || die "Replay scenario not found: ${SCENARIO_PATH}"
@@ -191,7 +237,16 @@ for gpu in "${GPUS[@]}"; do
   [[ "${gpu}" =~ ^[0-9]+$ ]] || die "invalid GPU ID: ${gpu}"
 done
 NUM_WORKERS="${#GPUS[@]}"
-WORKER_GPU_MAP="$(IFS=';'; echo "${GPUS[*]}")"
+# CUDA_VISIBLE_DEVICES remaps the selected physical cards to local ordinals.
+# Worker processes must receive those local ordinals (0..N-1); physical IDs
+# remain in GPU_IDS for NVML sampling and trace metadata translation.
+WORKER_GPU_MAP=""
+for ((worker_index = 0; worker_index < NUM_WORKERS; worker_index++)); do
+  if [[ -n "${WORKER_GPU_MAP}" ]]; then
+    WORKER_GPU_MAP+=';'
+  fi
+  WORKER_GPU_MAP+="${worker_index}"
+done
 
 declare -A ALLOWED_WORKLOADS=()
 for workload in "${ALL_WORKLOADS[@]}"; do
@@ -220,7 +275,17 @@ echo "  workloads: ${WORKLOADS[*]}"
 echo "  GPU IDs: ${GPU_IDS}"
 echo "  workers: ${NUM_WORKERS}"
 echo "  max sessions/worker: ${MAX_SESSIONS_PER_WORKER}"
+echo "  publisher frame credit: ${FRAME_CREDIT_ENABLED}"
+echo "  frame-credit target: ${FRAME_CREDIT_TARGET_FRAMES} frames (${FRAME_CREDIT_TARGET_SECONDS}s), reserve ${FRAME_CREDIT_RESERVE_FRAMES}, guard ${FRAME_CREDIT_GUARD_MS}ms"
+echo "  Motivation migration: ${MOTIVATION_MIGRATION_ENABLED}"
+echo "  Motivation policy: ${MOTIVATION_POLICY}"
 echo "  run root: ${RUN_ROOT}"
+
+if [[ "${MOTIVATION_MIGRATION_ENABLED}" -eq 1 ]]; then
+  MOTIVATION_MIGRATION_OPTION=(--motivation-migration)
+else
+  MOTIVATION_MIGRATION_OPTION=(--no-motivation-migration)
+fi
 
 if [[ "${DRY_RUN}" -eq 1 ]]; then
   for workload in "${WORKLOADS[@]}"; do
@@ -273,6 +338,12 @@ printf '%s\n' \
   "NUM_WORKERS=${NUM_WORKERS}" \
   "MAX_SESSIONS_PER_WORKER=${MAX_SESSIONS_PER_WORKER}" \
   "STARTUP_TIMEOUT_SECONDS=${STARTUP_TIMEOUT_SECONDS}" \
+  "FRAME_CREDIT_ENABLED=${FRAME_CREDIT_ENABLED}" \
+  "FRAME_CREDIT_TARGET_SECONDS=${FRAME_CREDIT_TARGET_SECONDS}" \
+  "FRAME_CREDIT_TARGET_FRAMES=${FRAME_CREDIT_TARGET_FRAMES}" \
+  "FRAME_CREDIT_RESERVE_FRAMES=${FRAME_CREDIT_RESERVE_FRAMES}" \
+  "FRAME_CREDIT_GUARD_MS=${FRAME_CREDIT_GUARD_MS}" \
+  "MOTIVATION_POLICY=${MOTIVATION_POLICY}" \
   "PROFILE_PATH=${PROFILE_PATH}" \
   "SCENARIO_PATH=${SCENARIO_PATH}" \
   "WORKLOADS=${WORKLOADS[*]}" \
@@ -481,11 +552,11 @@ for workload in "${WORKLOADS[@]}"; do
   TELEFUSER_ABOT_MAX_BATCH_SIZE=4 \
   TELEFUSER_ABOT_BATCHING_WINDOW_MS=2 \
   TELEFUSER_ABOT_MAX_DEADLINE_BATCH_WAIT_MS=1000 \
-  TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_ENABLED=1 \
-  TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_TARGET_SECONDS=3.0 \
-  TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_TARGET_FRAMES=36 \
-  TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_RESERVE_FRAMES=4 \
-  TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_GUARD_MS=50 \
+  TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_ENABLED="${FRAME_CREDIT_ENABLED}" \
+  TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_TARGET_SECONDS="${FRAME_CREDIT_TARGET_SECONDS}" \
+  TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_TARGET_FRAMES="${FRAME_CREDIT_TARGET_FRAMES}" \
+  TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_RESERVE_FRAMES="${FRAME_CREDIT_RESERVE_FRAMES}" \
+  TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_GUARD_MS="${FRAME_CREDIT_GUARD_MS}" \
   TELEFUSER_ABOT_BATCH_COMPUTE_PROFILE=h100_lf3_eager_full_pipeline_v1 \
   TELEFUSER_ABOT_BATCH_COMPUTE_SAFETY_FACTOR=1.05 \
   TELEFUSER_LIVEKIT_DISPATCH_TRACE_PATH="${RUN_DIR}/dispatch-trace.jsonl" \
@@ -504,6 +575,8 @@ for workload in "${WORKLOADS[@]}"; do
     --queue-size 0 \
     --motivation-profile "${RUN_PROFILE_PATH}" \
     --motivation-max-batch-size 4 \
+    --motivation-policy "${MOTIVATION_POLICY}" \
+    "${MOTIVATION_MIGRATION_OPTION[@]}" \
     --skip-validation \
     >"${RUN_DIR}/server.log" 2>&1 &
   SERVER_PID=$!
@@ -545,6 +618,15 @@ for workload in "${WORKLOADS[@]}"; do
 
   curl --noproxy '*' -fsS "http://127.0.0.1:8088/v1/service/metadata" \
     >"${RUN_DIR}/metadata-after.json"
+  # Join the client playout ledger with the server dispatch fidelity trace.
+  # This only augments the result artifact; it does not participate in
+  # scheduling or in the LiveKit replay.
+  PYTHONPATH="${REPO_ROOT}" "${PYTHON_BIN}" tools/validation/augment_abot_cpr_quality.py \
+    --result "${RUN_DIR}/result.json" \
+    --dispatch-trace "${RUN_DIR}/dispatch-trace.jsonl" \
+    --profile "${RUN_PROFILE_PATH}" \
+    --output "${RUN_DIR}/result.json" \
+    >"${RUN_DIR}/quality-cpr.log"
   PYTHONPATH="${REPO_ROOT}" "${PYTHON_BIN}" tools/validation/extract_motivation_diagnostics.py \
     --metadata "${RUN_DIR}/metadata-after.json" \
     --output "${RUN_DIR}/motivation-diagnostics.json"

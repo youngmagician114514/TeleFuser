@@ -98,7 +98,7 @@ pytest -m "gpu and slow" tests/integration/test_abot_world_smoke.py -v
 The multi-session benchmark exercises 30 continuously batched blocks:
 
 ```bash
-python tools/validation/benchmark_abot_turboserve.py \
+PYTHONPATH=$PWD python tools/validation/benchmark_abot_turboserve.py \
   --model-root /path/to/ABot-World-0-5B-LF --image /path/to/initial.png \
   --sessions 2 --chunks 30 --batch-size 2 --output /tmp/abot-turboserve.json
 ```

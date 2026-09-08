@@ -202,7 +202,14 @@ def test_nccl_migration_metadata_includes_taew_decoder_state() -> None:
     session = SimpleNamespace(
         prompt_emb=torch.tensor([1.0]),
         first_frame_latent=torch.tensor([2.0]),
-        self_cache=[],
+        self_cache=[
+            {
+                "k": torch.tensor([[[[3.0]]]]),
+                "v": torch.tensor([[[[4.0]]]]),
+                "global_end_index": torch.tensor([12]),
+                "local_end_index": torch.tensor([6]),
+            }
+        ],
         cross_cache=[],
         vae_decode_state=Wan22VideoVAEStreamingDecodeState(),
         taew_decode_state=_taew_state(stage),
@@ -213,11 +220,11 @@ def test_nccl_migration_metadata_includes_taew_decoder_state() -> None:
     )
     service = object.__new__(ABotWorldLiveKitService)
     service.pipeline = SimpleNamespace(taew_decode_stage=stage)
-    quiesce_calls: list[bool] = []
+    quiesce_calls: list[tuple[bool, bool]] = []
 
-    def fake_quiesce(session_id, timeout, *, wait_for_publisher=True):
+    def fake_quiesce(session_id, timeout, *, wait_for_output_queue=True, wait_for_publisher=True):
         del session_id, timeout
-        quiesce_calls.append(wait_for_publisher)
+        quiesce_calls.append((wait_for_output_queue, wait_for_publisher))
         return SimpleNamespace(
             pipeline_session=session,
             config={"fps": 12},
@@ -230,10 +237,15 @@ def test_nccl_migration_metadata_includes_taew_decoder_state() -> None:
 
     service._quiesce_migration = fake_quiesce
     metadata = service.prepare_migration_nccl_metadata("migrating", timeout=1)
-    assert quiesce_calls == [False]
+    assert quiesce_calls == [(False, False)]
     payload = rebuild_tensor_tree(metadata["tensor_skeleton"], metadata["_nccl_tensor_leaves"])
 
     assert metadata["state_bytes"] > 0
+    manifest_paths = {tuple(entry["path"]) for entry in metadata["tensor_manifest"]}
+    assert ("self_cache", 0, "global_end_index") not in manifest_paths
+    assert ("self_cache", 0, "local_end_index") not in manifest_paths
+    assert payload["self_cache"][0]["global_end_index"] == 12
+    assert payload["self_cache"][0]["local_end_index"] == 6
     assert "taew_decode_state" in payload
     restored = stage.restore_decode_state(payload["taew_decode_state"], direct_device_tensors=True)
     _assert_taew_state(restored)

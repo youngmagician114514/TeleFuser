@@ -104,7 +104,10 @@ run, add `--motivation-profile /path/to/profile_evaluated.csv`; the optional
 `--motivation-max-batch-size` and `--motivation-memory-free-gb` flags set the
 policy limits. The profile's `max_batch_size` should match
 `TELEFUSER_ABOT_MAX_BATCH_SIZE` so the worker does not split a policy-selected
-batch. The default runtime without a controller is unchanged.
+batch. Use `--motivation-policy fifo` for the simple singleton FIFO baseline;
+the default is the profile/slack-aware `motivation` policy. Both policies use
+the same migration, reservation, and execution path. The default runtime
+without a controller is unchanged.
 
 The checked-in browser demo forces TCP TURN relay. Run the following development-only stack in four terminals:
 

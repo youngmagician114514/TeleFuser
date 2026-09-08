@@ -35,6 +35,15 @@ import httpx
 
 from telefuser.service.livekit.room_client import livekit_connection_slot
 
+if __package__:
+    from tools.validation.abot_benchmark_metrics import percentile as _percentile
+    from tools.validation.abot_benchmark_metrics import summarize as _summary
+    from tools.validation.abot_benchmark_metrics import summarize_slo
+else:  # Allow ``python tools/validation/benchmark_abot_livekit_burst.py`` without PYTHONPATH.
+    from abot_benchmark_metrics import percentile as _percentile
+    from abot_benchmark_metrics import summarize as _summary
+    from abot_benchmark_metrics import summarize_slo
+
 _CONTROL_TOPIC = "tf.control"
 _METRICS_TOPIC = "tf.metrics"
 _STATUS_TOPIC = "tf.status"
@@ -152,25 +161,6 @@ class Scenario:
     diagnostic_initial_control_barrier: DiagnosticInitialControlBarrier | None
     lifecycle_trace: LifecycleTrace | None
     raw: dict[str, Any]
-
-
-def _percentile(values: Sequence[float], quantile: float) -> float:
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    index = max(0, min(len(ordered) - 1, int(len(ordered) * quantile + 0.999999) - 1))
-    return float(ordered[index])
-
-
-def _summary(values: Sequence[float]) -> dict[str, float | int]:
-    return {
-        "count": len(values),
-        "mean": round(statistics.fmean(values), 6) if values else 0.0,
-        "p50": round(_percentile(values, 0.50), 6),
-        "p95": round(_percentile(values, 0.95), 6),
-        "p99": round(_percentile(values, 0.99), 6),
-        "maximum": round(max(values), 6) if values else 0.0,
-    }
 
 
 def _require_mapping(value: object, label: str) -> dict[str, Any]:
@@ -567,6 +557,17 @@ class LiveKitWaveSession:
     input_pauses: int = field(default=0, init=False)
     input_resumes: int = field(default=0, init=False)
     input_pause_started_at: float | None = field(default=None, init=False)
+    # Client-side playout ledger.  This is intentionally a proxy: the Python
+    # LiveKit receiver observes decoded frames, not a browser's actual
+    # compositor playhead.  Startup is excluded from the ledger so TTFC and
+    # rebuffering remain separate metrics.
+    cpr_playback_started_at: float | None = field(default=None, init=False)
+    cpr_last_update_at: float | None = field(default=None, init=False)
+    cpr_buffer_seconds: float = field(default=0.0, init=False)
+    cpr_playable_seconds: float = field(default=0.0, init=False)
+    cpr_stall_seconds: float = field(default=0.0, init=False)
+    cpr_stall_events: int = field(default=0, init=False)
+    cpr_was_stalled: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         self._rng = random.Random(self.scenario.seed + self.index)
@@ -745,6 +746,60 @@ class LiveKitWaveSession:
                 )
             self._start_control_task()
 
+    def _advance_cpr_playback(self, now: float) -> None:
+        """Advance the client-side playout ledger to ``now``.
+
+        Generated frames add one frame duration to a virtual playback buffer.
+        Elapsed time consumes that buffer; any remainder is a rebuffering
+        interval.  The first generated frame starts the ledger and therefore
+        does not charge connection/model startup as a stall.
+        """
+        last = self.cpr_last_update_at
+        if last is None:
+            return
+        elapsed = max(0.0, now - last)
+        if elapsed <= 0.0:
+            return
+        playable = min(elapsed, self.cpr_buffer_seconds)
+        stall = max(0.0, elapsed - playable)
+        self.cpr_playable_seconds += playable
+        self.cpr_stall_seconds += stall
+        if stall > 1e-6 and not self.cpr_was_stalled:
+            self.cpr_stall_events += 1
+        self.cpr_was_stalled = stall > 1e-6
+        self.cpr_buffer_seconds = max(0.0, self.cpr_buffer_seconds - elapsed)
+        self.cpr_last_update_at = now
+
+    def _record_generated_frame_for_cpr(self, now: float) -> None:
+        """Add one generated frame to the virtual playback buffer."""
+        frame_duration = 1.0 / max(float(self.scenario.session.fps), 1e-9)
+        if self.cpr_playback_started_at is None:
+            self.cpr_playback_started_at = now
+            self.cpr_last_update_at = now
+        else:
+            self._advance_cpr_playback(now)
+        self.cpr_buffer_seconds += frame_duration
+        self.cpr_was_stalled = False
+
+    def _finalize_cpr_playback(self, now: float) -> None:
+        """Stop charging the playout interval at session teardown."""
+        self._advance_cpr_playback(now)
+        self.cpr_last_update_at = None
+
+    def _cpr_snapshot(self) -> dict[str, Any]:
+        """Return CPR proxy facts without including startup as rebuffering."""
+        engaged = self.cpr_playable_seconds + self.cpr_stall_seconds
+        cpr = self.cpr_playable_seconds / engaged if engaged > 0.0 else None
+        return {
+            "playback_started": self.cpr_playback_started_at is not None,
+            "engaged_seconds": round(engaged, 6),
+            "playable_seconds": round(self.cpr_playable_seconds, 6),
+            "stall_seconds": round(self.cpr_stall_seconds, 6),
+            "stall_events": self.cpr_stall_events,
+            "buffer_seconds_remaining": round(max(0.0, self.cpr_buffer_seconds), 6),
+            "cpr_proxy": round(cpr, 6) if cpr is not None else None,
+        }
+
     def _start_control_task(self) -> None:
         """Start the heartbeat once; a diagnostic gate may hold its first send."""
         if self.stop_requested or self._control_task is not None:
@@ -761,6 +816,7 @@ class LiveKitWaveSession:
                     self.record_event("first_media_frame", session=self.logical_id)
                 if self.frames_received > self.scenario.session.expected_preview_frames:
                     self.generated_frames_received += 1
+                    self._record_generated_frame_for_cpr(now)
                     if self.first_generated_frame_at is None:
                         self.first_generated_frame_at = now
                         self.record_event(
@@ -844,6 +900,7 @@ class LiveKitWaveSession:
         if self.stop_requested and self.stopped_at is not None:
             return
         self.stop_requested = True
+        self._finalize_cpr_playback(time.perf_counter())
         self.departure_scheduled = False
         self.current_controls = ()
         control_task = self._control_task
@@ -890,6 +947,7 @@ class LiveKitWaveSession:
 
     def snapshot(self, now: float) -> dict[str, Any]:
         """Return bounded client-side facts; no model-internal state is read."""
+        self._advance_cpr_playback(now)
         action_to_first = (
             self.first_generated_frame_at - self.first_active_control_at
             if self.first_generated_frame_at is not None and self.first_active_control_at is not None
@@ -960,6 +1018,7 @@ class LiveKitWaveSession:
                 round(now - self.last_generated_frame_at, 6) if self.last_generated_frame_at is not None else None
             ),
             "error": self.error,
+            "cpr": self._cpr_snapshot(),
         }
 
 
@@ -1513,13 +1572,55 @@ class LiveKitWaveRunner:
         # The all-user SLO denominator includes every requested session after
         # its grace interval, including rejected, disconnected, or stalled users
         # as zero-FPS observations.
+        slo_threshold = self.scenario.session.fps - self.scenario.slo_fps_tolerance
         slo_observations = [float(fps) for sample in samples for fps in sample["slo_session_delivery_fps"].values()]
         demand_slo_observations = [
             float(fps) for sample in samples for fps in sample["demand_slo_session_delivery_fps"].values()
         ]
-        slo_threshold = self.scenario.session.fps - self.scenario.slo_fps_tolerance
-        slo_hits = sum(value >= slo_threshold for value in slo_observations)
-        demand_slo_hits = sum(value >= slo_threshold for value in demand_slo_observations)
+        slo_summary = summarize_slo(
+            slo_observations,
+            target_fps=self.scenario.session.fps,
+            tolerance_fps=self.scenario.slo_fps_tolerance,
+        )
+        demand_slo_summary = summarize_slo(
+            demand_slo_observations,
+            target_fps=self.scenario.session.fps,
+            tolerance_fps=self.scenario.slo_fps_tolerance,
+        )
+        cpr_records = [
+            {
+                "playable_seconds": session.cpr_playable_seconds,
+                "stall_seconds": session.cpr_stall_seconds,
+                "engaged_seconds": session.cpr_playable_seconds + session.cpr_stall_seconds,
+                "stall_events": session.cpr_stall_events,
+            }
+            for session in phase_population
+            if session.cpr_playback_started_at is not None
+        ]
+        cpr_playable_seconds = sum(float(record["playable_seconds"]) for record in cpr_records)
+        cpr_stall_seconds = sum(float(record["stall_seconds"]) for record in cpr_records)
+        cpr_engaged_seconds = cpr_playable_seconds + cpr_stall_seconds
+        cpr_session_values = [
+            record["playable_seconds"] / record["engaged_seconds"]
+            for record in cpr_records
+            if record["engaged_seconds"] > 0.0
+        ]
+        cpr_summary = {
+            "definition": (
+                "Client decoded-frame playout proxy; startup before the first generated frame is excluded, "
+                "and idle intervals remain in the playback denominator while the session is connected."
+            ),
+            "session_count": len(phase_population),
+            "eligible_sessions": len(cpr_records),
+            "no_playback_sessions": len(phase_population) - len(cpr_records),
+            "time_weighted_cpr": round(cpr_playable_seconds / cpr_engaged_seconds, 6)
+            if cpr_engaged_seconds > 0.0
+            else None,
+            "mean_session_cpr": round(statistics.fmean(cpr_session_values), 6) if cpr_session_values else None,
+            "playable_seconds": round(cpr_playable_seconds, 6),
+            "stall_seconds": round(cpr_stall_seconds, 6),
+            "stall_events": sum(int(record["stall_events"]) for record in cpr_records),
+        }
         assigned_sessions = sum(session.admission_status == "assigned" for session in phase_population)
         queued_sessions = sum(session.admission_status == "queued" for session in phase_population)
         worker_ready_sessions = sum(session.worker_ready_at is not None for session in phase_population)
@@ -1570,14 +1671,13 @@ class LiveKitWaveRunner:
             "slo_tolerance_fps": self.scenario.slo_fps_tolerance,
             "slo_threshold_fps": round(slo_threshold, 6),
             "slo_first_generation_grace_seconds": self.scenario.first_generation_grace_seconds,
-            "slo_observation_samples": len(slo_observations),
-            "slo_satisfied_samples": slo_hits,
-            "slo_sample_attainment": (round(slo_hits / len(slo_observations), 6) if slo_observations else 0.0),
-            "demand_slo_observation_samples": len(demand_slo_observations),
-            "demand_slo_satisfied_samples": demand_slo_hits,
-            "demand_slo_sample_attainment": (
-                round(demand_slo_hits / len(demand_slo_observations), 6) if demand_slo_observations else 0.0
-            ),
+            "slo_observation_samples": slo_summary["observation_samples"],
+            "slo_satisfied_samples": slo_summary["satisfied_samples"],
+            "slo_sample_attainment": slo_summary["sample_attainment"],
+            "demand_slo_observation_samples": demand_slo_summary["observation_samples"],
+            "demand_slo_satisfied_samples": demand_slo_summary["satisfied_samples"],
+            "demand_slo_sample_attainment": demand_slo_summary["sample_attainment"],
+            "cpr_proxy": cpr_summary,
             "started_sessions": len(phase_sessions),
             "failed_sessions": sum(1 for session in phase_sessions if session.error is not None),
         }

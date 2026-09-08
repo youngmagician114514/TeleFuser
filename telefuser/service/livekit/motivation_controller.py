@@ -534,6 +534,7 @@ class MotivationRuntimeController:
                 migration_count=candidate.migration_count,
                 session_ids=candidate.session_ids,
                 job_ids=candidate.job_ids,
+                policy_name=candidate.policy_name,
             )
         )
 
@@ -569,6 +570,24 @@ class MotivationRuntimeController:
             lease.candidate,
             completed_at=self._observed(completed_at),
             quality=quality,
+        )
+
+    def on_compute_complete(
+        self,
+        lease: DispatchLease,
+        *,
+        completed_at: float | None = None,
+    ) -> bool:
+        """Release the physical GPU reservation at the child compute boundary.
+
+        Output delivery is intentionally a later event.  Keeping that
+        transport/publisher drain separate from the GPU reservation lets the
+        policy start another invocation while the previous session remains
+        ``in_flight`` until its exact output commits.
+        """
+        return self.scheduler.release_gpu_reservation(
+            lease.candidate,
+            completed_at=self._observed(completed_at),
         )
 
     def poll_migrations(self, *, now: float | None = None) -> tuple[SessionStateTransferRecord, ...]:

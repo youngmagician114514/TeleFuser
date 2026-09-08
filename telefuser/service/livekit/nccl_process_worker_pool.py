@@ -9,14 +9,12 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
-import json
 import socket
 import threading
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from datetime import timedelta
 from typing import Any, TypeVar
 
 import torch
@@ -26,6 +24,7 @@ from telefuser.service.core.stream_pipeline_service import STREAM_MODE_BIDIRECTI
 from telefuser.service.security.security_validator import SecurityLevel
 from telefuser.utils.logging import logger
 
+from .dispatch_trace import DispatchTraceWriter as _DispatchTraceWriter
 from .migration_diagnostics import MigrationDiagnostics, classify_migration_error
 from .nccl_transfer import (
     LayerTransferProgress,
@@ -39,7 +38,8 @@ from .process_worker_pool import (
     ProcessLiveKitWorkerPool,
     ProcessWorkerSpec,
     _close_queue,
-    _process_dispatch_trace_gpu_metadata,
+    _current_cuda_device_for_trace,
+    _install_process_dispatch_trace_callback,
 )
 from .session_registry import SessionRecord
 from .token_service import LiveKitTokenService
@@ -87,82 +87,6 @@ class _ModelOutput:
 
     worker_id: str
     payload: dict[str, Any]
-
-
-class _DispatchTraceWriter:
-    """Bounded, parent-owned JSONL writer for experiment audit records."""
-
-    def __init__(self, path: str, *, max_events: int, workers: dict[str, list[str]]) -> None:
-        self.path = Path(path).expanduser().resolve()
-        self.max_events = int(max_events)
-        self.received_events = 0
-        self.written_events = 0
-        self.dropped_events = 0
-        self.write_errors = 0
-        self._write_error_logged = False
-        self._handle: Any | None = None
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if self.path.exists():
-            raise FileExistsError(f"dispatch trace path already exists; choose a fresh run-scoped path: {self.path}")
-        self._handle = self.path.open("x", encoding="utf-8")
-        self._write_line(
-            {
-                "schema_version": 1,
-                "event_type": "trace_metadata",
-                "trace_started_monotonic_seconds": time.monotonic(),
-                "trace_started_unix_seconds": time.time(),
-                "trace_started_utc": datetime.now(timezone.utc).isoformat(),
-                "max_dispatch_events": self.max_events,
-                "configured_workers": workers,
-            }
-        )
-
-    def _write_line(self, record: dict[str, Any]) -> bool:
-        handle = self._handle
-        if handle is None:
-            return False
-        try:
-            handle.write(json.dumps(record, allow_nan=False, separators=(",", ":"), sort_keys=True) + "\n")
-            handle.flush()
-            return True
-        except (OSError, TypeError, ValueError) as exc:
-            self.write_errors += 1
-            if not self._write_error_logged:
-                self._write_error_logged = True
-                logger.warning("Failed to write ABot dispatch trace %s: %s", self.path, exc)
-            return False
-
-    def append(self, record: dict[str, Any]) -> None:
-        self.received_events += 1
-        if self.received_events > self.max_events:
-            self.dropped_events += 1
-            return
-        enriched = dict(record)
-        enriched["parent_sequence"] = self.received_events
-        enriched["parent_received_monotonic_seconds"] = time.monotonic()
-        enriched["parent_received_unix_seconds"] = time.time()
-        if self._write_line(enriched):
-            self.written_events += 1
-        else:
-            self.dropped_events += 1
-
-    def snapshot(self) -> dict[str, object]:
-        return {
-            "enabled": True,
-            "path": str(self.path),
-            "max_events": self.max_events,
-            "received_events": self.received_events,
-            "written_events": self.written_events,
-            "dropped_events": self.dropped_events,
-            "write_errors": self.write_errors,
-        }
-
-    def close(self) -> None:
-        handle = self._handle
-        self._handle = None
-        if handle is not None:
-            with contextlib.suppress(OSError):
-                handle.close()
 
 
 async def _pump_model_outputs(
@@ -797,7 +721,10 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
 
     @staticmethod
     def _source_model_output_drain_complete(
-        status: object, *, require_publisher: bool = True
+        status: object,
+        *,
+        require_output_queue: bool | None = True,
+        require_publisher: bool = True,
     ) -> bool:
         """Return whether source model state is quiescent for migration.
 
@@ -809,7 +736,13 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         """
         if not isinstance(status, dict):
             return False
-        if status.get("in_flight", True) or not status.get("output_queue_empty", False):
+        if require_output_queue is None:
+            # The child explicitly marks latest-mode output as discardable.
+            # Missing metadata is treated conservatively for older workers.
+            require_output_queue = not bool(status.get("output_queue_discardable", False))
+        if status.get("in_flight", True):
+            return False
+        if require_output_queue and not status.get("output_queue_empty", False):
             return False
         if require_publisher and int(status.get("publisher_unsubmitted_frames", 1)) != 0:
             return False
@@ -842,7 +775,11 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                 timeout=remaining,
             )
             status = status_event.get("result")
-            if self._source_model_output_drain_complete(status, require_publisher=False):
+            if self._source_model_output_drain_complete(
+                status,
+                require_output_queue=None,
+                require_publisher=False,
+            ):
                 return dict(status) if isinstance(status, dict) else {}
             await asyncio.sleep(min(0.005, max(0.001, deadline - time.monotonic())))
 
@@ -1016,7 +953,9 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                         timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
                     )
                     if not self._source_model_output_drain_complete(
-                        paused_status_event.get("result"), require_publisher=False
+                        paused_status_event.get("result"),
+                        require_output_queue=None,
+                        require_publisher=False,
                     ):
                         raise RuntimeError("Source output changed while preparing NCCL migration")
 
@@ -1090,6 +1029,32 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                     ready_waiter.set_result(None)
                 await ready_waiter
 
+                # The target session contains receive buffers for every cache
+                # layer, while the child deliberately allocates those buffers
+                # before the ordered P2P copy starts.  Publishing the route at
+                # first-layer readiness lets a batched invocation observe an
+                # as-yet-unreceived scalar cursor (Relative-RoPE permits
+                # different *valid* global cursors, so that race is otherwise
+                # indistinguishable from a legal batch).  Keep the source
+                # route authoritative until the complete receive has settled;
+                # this is a small handoff cost compared with the migration
+                # drain and makes the ownership transaction memory-safe.
+                transfer_events = await transfer_task
+                if isinstance(diagnostics, MigrationDiagnostics) and isinstance(transfer_events, list):
+                    for event in reversed(transfer_events):
+                        report = event.get("result") if isinstance(event, dict) else None
+                        if isinstance(report, dict) and isinstance(report.get("groups"), list):
+                            diagnostics.set_transport_report(token.token_id, report)
+                            progress_report = report.get("progress")
+                            if isinstance(progress_report, dict):
+                                first_layer_ms = progress_report.get("first_layer_ready_ms")
+                                transfer_complete_ms = progress_report.get("transfer_complete_ms")
+                                if isinstance(first_layer_ms, int | float) and float(first_layer_ms) >= 0:
+                                    self._migration_first_layer_ms.append(float(first_layer_ms))
+                                if isinstance(transfer_complete_ms, int | float) and float(transfer_complete_ms) >= 0:
+                                    self._migration_transfer_complete_ms.append(float(transfer_complete_ms))
+                            break
+
                 async def publish_compute_route() -> None:
                     self._pipeline_routes[pipeline_session_id] = target_worker_id
                     self._session_workers[pipeline_session_id] = target_worker_id
@@ -1109,21 +1074,6 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                     "compute_ready",
                     publish_compute_route,
                 )
-                transfer_events = await transfer_task
-                if isinstance(diagnostics, MigrationDiagnostics) and isinstance(transfer_events, list):
-                    for event in reversed(transfer_events):
-                        report = event.get("result") if isinstance(event, dict) else None
-                        if isinstance(report, dict) and isinstance(report.get("groups"), list):
-                            diagnostics.set_transport_report(token.token_id, report)
-                            progress_report = report.get("progress")
-                            if isinstance(progress_report, dict):
-                                first_layer_ms = progress_report.get("first_layer_ready_ms")
-                                transfer_complete_ms = progress_report.get("transfer_complete_ms")
-                                if isinstance(first_layer_ms, int | float) and float(first_layer_ms) >= 0:
-                                    self._migration_first_layer_ms.append(float(first_layer_ms))
-                                if isinstance(transfer_complete_ms, int | float) and float(transfer_complete_ms) >= 0:
-                                    self._migration_transfer_complete_ms.append(float(transfer_complete_ms))
-                            break
                 async def commit_route() -> TurboServeOwnership:
                     ownership = self._ownership.commit_migration(token)
                     self._pipeline_routes[pipeline_session_id] = target_worker_id
@@ -1254,11 +1204,6 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                     else {}
                 ),
                 "model_output_flow_control": self._model_output_flow_snapshot(),
-                "dispatch_trace": (
-                    self._dispatch_trace.snapshot()
-                    if getattr(self, "_dispatch_trace", None) is not None
-                    else {"enabled": False}
-                ),
             }
         )
         return snapshot
@@ -1283,21 +1228,18 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         }
 
     async def aclose(self) -> None:
-        try:
-            for session_id in tuple(self._transport_workers):
-                with contextlib.suppress(Exception):
-                    await self.stop_session(session_id)
-            if self._nccl_ranks:
-                await asyncio.gather(
-                    *(self._request(worker_id, "nccl_destroy") for worker_id in self._nccl_ranks),
-                    return_exceptions=True,
-                )
-                self._nccl_ranks.clear()
-            await super().aclose()
-        finally:
-            trace = getattr(self, "_dispatch_trace", None)
-            if trace is not None:
-                trace.close()
+        for session_id in tuple(self._transport_workers):
+            with contextlib.suppress(Exception):
+                await self.stop_session(session_id)
+        if self._nccl_ranks:
+            await asyncio.gather(
+                *(self._request(worker_id, "nccl_destroy") for worker_id in self._nccl_ranks),
+                return_exceptions=True,
+            )
+            self._nccl_ranks.clear()
+        # The base process pool owns and closes the shared parent-side trace
+        # writer for both isolated-worker transports.
+        await super().aclose()
 
     async def _init_nccl(self) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1383,18 +1325,6 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         if not task.cancelled() and task.exception() is not None:
             logger.warning("LiveKit transport failed: session=%s error=%s", session_id, task.exception())
 
-    def _record_dispatch_trace(self, event: dict[str, Any]) -> None:
-        """Persist one child-reported model invocation in the parent process."""
-        trace = getattr(self, "_dispatch_trace", None)
-        raw = event.get("trace")
-        if trace is None or not isinstance(raw, dict):
-            return
-        gpu = event.get("gpu")
-        record = dict(raw)
-        record["worker_id"] = str(event.get("worker_id", "unknown"))
-        record["gpu"] = dict(gpu) if isinstance(gpu, dict) else {}
-        trace.append(record)
-
     def _dispatch_event(self, event: dict[str, Any]) -> None:
         event_type = event.get("type")
         if event_type in {"model_session_ready", "model_session_failed"}:
@@ -1461,9 +1391,6 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
             session_id = str(event.get("session_id", ""))
             if session_id in self._publisher_frame_tracking:
                 self._publisher_frame_tracking[session_id] = bool(event.get("enabled", False))
-            return
-        if event.get("type") == "model_dispatch_trace":
-            self._record_dispatch_trace(event)
             return
         if event.get("type") == "model_batch_failed":
             callback = getattr(self._event_sink, "on_motivation_dispatch_failed", None)
@@ -1581,29 +1508,16 @@ async def _run_nccl_model_worker(
     events.put({"type": "worker_status", "worker_id": spec.worker_id, "status": "idle"})
     events.put({"type": "worker_ready", "worker_id": spec.worker_id})
     service = adapter.stream_service.service
-    set_dispatch_trace_callback = getattr(service, "set_dispatch_trace_callback", None)
-    trace_path_value = config.dispatch_trace_path
-    if isinstance(trace_path_value, str) and trace_path_value.strip() and callable(set_dispatch_trace_callback):
-        try:
-            logical_cuda_device: int | None = int(torch.cuda.current_device())
-        except Exception:
-            logical_cuda_device = None
-        trace_gpu = _process_dispatch_trace_gpu_metadata(
-            spec,
-            logical_cuda_device=logical_cuda_device,
-        )
-
-        def forward_dispatch_trace(record: dict[str, Any]) -> None:
-            events.put(
-                {
-                    "type": "model_dispatch_trace",
-                    "worker_id": spec.worker_id,
-                    "gpu": trace_gpu,
-                    "trace": record,
-                }
-            )
-
-        set_dispatch_trace_callback(forward_dispatch_trace)
+    # Use the same callback installer as the generic process transport.  The
+    # parent Motivation scheduler and the optional JSONL writer therefore see
+    # one identical compute-boundary event in both modes.
+    _install_process_dispatch_trace_callback(
+        service=service,
+        config=config,
+        spec=spec,
+        events=events,
+        logical_cuda_device=_current_cuda_device_for_trace(spec),
+    )
     outputs: dict[str, asyncio.Task[None]] = {}
     output_credits: dict[str, asyncio.BoundedSemaphore] = {}
     outgoing: dict[
@@ -1899,6 +1813,14 @@ async def _run_nccl_model_worker(
                             credits.release()
                 elif kind == "model_output_pause":
                     await stop_pump(command["session_id"])
+                    # The model state boundary is the completed compute, not
+                    # the real-time consumer.  In latest delivery mode any
+                    # payload that is still in the child-local queue is stale
+                    # once the source snapshot has been taken; clear it so a
+                    # slow LiveKit publisher cannot hold the migration open.
+                    discard_pending = getattr(service, "discard_pending_migration_outputs", None)
+                    if callable(discard_pending):
+                        await asyncio.to_thread(discard_pending, command["session_id"])
                 elif kind == "model_output_drain_status":
                     migration_drain_status = getattr(service, "migration_drain_status", None)
                     if not callable(migration_drain_status):

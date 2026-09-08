@@ -197,6 +197,40 @@ def test_candidate_uses_global_slack_and_same_compatibility_key() -> None:
     assert candidate.projected_slack["c"] < 3.0
 
 
+def test_runnable_model_work_is_not_replaced_by_a_noop_wait_when_slack_is_negative() -> None:
+    """A runnable GPU must keep making progress after the aggregate buffer drains.
+
+    The aggregate slack objective charges a model latency to every active
+    session, while the generated second is credited only to selected members.
+    If the zero-duration wait candidate is allowed to win that comparison, a
+    loaded 24-session trace can stop dispatching until sessions depart.  A wait
+    is useful for an actually unavailable search, but it must not suppress a
+    feasible model invocation.
+    """
+    profile = MotivationProfile(1, "slow", 2.0, 0.68, 20.0)
+    scheduler = MotivationScheduler(
+        StaticMotivationProfileTable([profile]),
+        config=MotivationSchedulerConfig(max_batch_size=1),
+    )
+    scheduler.add_gpu(GpuSchedulingState("gpu-0", free_at=0.0, memory_free_gb=80.0))
+    for index in range(4):
+        session_id = f"negative-{index}"
+        scheduler.register_session(
+            session_id,
+            owner_gpu="gpu-0",
+            now=0.0,
+            slack_seconds=-5.0,
+            compatibility_key=(index,),
+        )
+        scheduler.submit_action(session_id, ["W"], now=0.0, release=True)
+
+    candidate = scheduler.find_best(now=0.0, include_wait=True)
+
+    assert candidate is not None
+    assert candidate.wait is False
+    assert candidate.batch_size == 1
+
+
 def test_candidate_is_rejected_after_pending_job_version_changes() -> None:
     scheduler = _scheduler()
     scheduler.register_session("s", owner_gpu="gpu-0", now=0.0)
@@ -208,6 +242,23 @@ def test_candidate_is_rejected_after_pending_job_version_changes() -> None:
     assert scheduler.validate(candidate, now=0.1) is False
     with pytest.raises(RuntimeError, match="stale"):
         scheduler.reserve(candidate, now=0.1)
+
+
+def test_delayed_callback_timestamp_is_clamped_to_current_scheduler_time() -> None:
+    """A callback delayed by candidate search must not poison the timeline."""
+
+    scheduler = _scheduler(max_batch_size=1)
+    scheduler.register_session("s", owner_gpu="gpu-0", now=0.0)
+    scheduler.submit_action("s", ["W"], now=0.0, release=True)
+    candidate = scheduler.find_best(now=0.0, include_wait=False)
+    assert candidate is not None
+
+    # Model/output callbacks can advance the policy while the search thread
+    # is still holding a candidate captured at an earlier timestamp.  The
+    # candidate remains current; only its timestamp is stale.
+    scheduler.find_best(now=10.0, include_wait=False)
+
+    assert scheduler.validate(candidate, now=1.0) is True
 
 
 def test_busy_gpu_candidate_cannot_be_reserved_before_predicted_start() -> None:
@@ -229,6 +280,77 @@ def test_busy_gpu_candidate_cannot_be_reserved_before_predicted_start() -> None:
 
     scheduler.reserve(candidate, now=2.0)
     assert scheduler.session("s").in_flight is not None
+
+
+def test_predicted_free_time_does_not_overlap_an_uncommitted_reservation() -> None:
+    scheduler = _scheduler(max_batch_size=1)
+    scheduler.register_session("first", owner_gpu="gpu-0", now=0.0)
+    scheduler.register_session("second", owner_gpu="gpu-0", now=0.0)
+    scheduler.submit_action("first", ["W"], now=0.0)
+    first = scheduler.find_best(
+        now=0.0,
+        gpu_states=(scheduler.gpus()[0],),
+        include_wait=False,
+        allow_migrations=False,
+    )
+    assert first is not None
+    scheduler.reserve(first, now=0.0)
+    scheduler.submit_action("second", ["D"], now=0.01)
+
+    future = scheduler.find_best(
+        now=first.finish_at + 0.01,
+        gpu_states=(scheduler.gpus()[0],),
+        include_wait=False,
+        allow_migrations=False,
+    )
+
+    assert future is not None
+    assert scheduler.candidate_ready_now(future, now=first.finish_at + 0.01) is False
+    with pytest.raises(RuntimeError, match="not ready"):
+        scheduler.reserve(future, now=first.finish_at + 0.01)
+    scheduler.complete(first, completed_at=first.finish_at + 0.02)
+    ready = scheduler.find_best(
+        now=first.finish_at + 0.02,
+        gpu_states=(scheduler.gpus()[0],),
+        include_wait=False,
+        allow_migrations=False,
+    )
+    assert ready is not None
+    scheduler.reserve(ready, now=first.finish_at + 0.02)
+
+
+def test_future_slot_reclaims_peak_memory_after_inflight_batch() -> None:
+    """A serialized future slot must not inherit the prior batch's peak."""
+    scheduler = MotivationScheduler(
+        StaticMotivationProfileTable(
+            [
+                MotivationProfile(1, "lane", 1.0, 0.9, 20.0),
+                MotivationProfile(2, "lane", 0.1, 0.9, 70.0),
+            ]
+        ),
+        config=MotivationSchedulerConfig(max_batch_size=2, migration_enabled=False),
+    )
+    scheduler.add_gpu(GpuSchedulingState("gpu-0", memory_free_gb=80.0))
+    for index in range(4):
+        session_id = f"memory-{index}"
+        scheduler.register_session(
+            session_id,
+            owner_gpu="gpu-0",
+            now=0.0,
+            slack_seconds=3.0,
+            compatibility_key=("same",),
+        )
+        scheduler.submit_action(session_id, ["W"], now=0.0)
+
+    first = scheduler.find_best(now=0.0, include_wait=False, allow_migrations=False)
+    assert first is not None and first.batch_size == 2
+    scheduler.reserve(first, now=0.0)
+
+    future = scheduler.find_best(now=0.01, include_wait=False, allow_migrations=False)
+
+    assert future is not None
+    assert future.batch_size == 2
+    assert future.start_at >= first.finish_at
 
 
 def test_internal_gpu_timeline_blocks_stale_external_snapshot() -> None:

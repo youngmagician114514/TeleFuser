@@ -32,6 +32,11 @@ from typing import Any
 import torch
 from PIL import Image
 
+if __package__:
+    from tools.validation.abot_benchmark_metrics import percentile as _percentile
+else:  # Allow ``python tools/validation/benchmark_abot_cuda_graph.py`` without PYTHONPATH.
+    from abot_benchmark_metrics import percentile as _percentile
+
 _GRAPH_ENV = "TELEFUSER_ABOT_CUDA_GRAPH_ENABLED"
 _MODES = ("eager", "steady_eager", "cuda_graph")
 
@@ -74,13 +79,6 @@ def _parse_batch_sizes(value: str) -> list[int]:
     if not values or any(item < 1 for item in values):
         raise argparse.ArgumentTypeError("batch sizes must be positive integers")
     return values
-
-
-def _percentile(values: Sequence[float], quantile: float) -> float:
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    return ordered[min(len(ordered) - 1, math.ceil(len(ordered) * quantile) - 1)]
 
 
 def _summary(values: Sequence[float]) -> dict[str, float]:

@@ -54,6 +54,22 @@ latest controls.  Once frames enter the consumer queue, releasing the controls
 does not stop playback.  An explicitly paused consumer can set
 `playback_active=False`.
 
+## Pluggable policies
+
+`MotivationPolicy` and `FIFOPolicy` are parallel implementations behind the
+small `SchedulingPolicy` interface. The scheduler coordinator continues to
+own session state, profile feasibility, migration, versioned reservations,
+completion, and diagnostics; a policy only chooses which ready sessions are
+offered to that shared machinery. This keeps a baseline from duplicating the
+LiveKit execution path and leaves room for additional policies later.
+
+The default is `motivation`. A deliberately simple FIFO baseline can be
+selected with `--motivation-policy fifo`. FIFO orders released jobs by their
+global sequence number, prioritizes action jobs over idle sentinels, and
+dispatches a singleton; profile, quality, memory, and migration checks are
+still applied by the common scheduler. The selected policy is included in
+scheduler snapshots and search/dispatch diagnostics.
+
 When the LiveKit runtime reports a session as running, the execution bridge
 materializes an idle sentinel if no action state is held. The bridge forwards
 that sentinel as a one-shot `control_state` with `controls=[]` and

@@ -360,6 +360,41 @@ summary also records `max_requested_users`, all-user FPS, and immediate-assignme
 contract status, so a queue or failed admission invalidates rather than improves the
 reported serving result.
 
+### Baseline comparison boundary
+
+The workload driver and the serving implementation are deliberately separate. A
+future baseline should replay the same scenario, seed, FPS, control-latent size,
+phase timings, and client grace period, then emit the same raw sample facts. The
+small, dependency-free `tools/validation/abot_benchmark_metrics.py` module is the
+canonical arithmetic boundary for ABot serving comparisons: it owns nearest-rank
+percentiles, rounded series summaries, and FPS-SLO attainment. A baseline runner
+does not need to import the LiveKit service or scheduler to reuse those functions.
+
+Keep these dimensions distinct when comparing implementations:
+
+| Dimension | Required meaning |
+| --- | --- |
+| `aggregate_delivery_fps` | Frames received by the client across all sessions, including frames produced while a user is idle. |
+| `per_*_delivery_fps` | Session-level delivery series; retain requested, active, and all-session populations separately. |
+| `slo_*` | Every requested session after first-generation grace (the all-user denominator); idle, rejected, and no-output sessions contribute zero. |
+| `demand_slo_*` | Active-control observations after grace; idle intervals are omitted, while a continuously active stalled session contributes zero. |
+| A2F and admission | Session lifecycle facts; do not fold startup/capacity failures into compute latency. |
+| Batch, queue, compute, migration | Server-side facts from service metadata, runtime metrics, and dispatch trace; never infer them from delivery FPS. |
+| Policy-only state such as CPR/final Q | Keep as implementation-specific diagnostics. A baseline without an equivalent state reports it as unavailable, not zero. |
+
+If a baseline exposes the same public HTTP/LiveKit contract, the existing wave
+runner can be reused directly. For a different transport, add a thin client
+adapter (the AIPerf adapters under `benchmarks/telefuser_aiperf/` are the
+established pattern) and map its observations to the same metric boundary. This
+keeps baseline-specific lifecycle code out of the scheduler and prevents a
+second copy of SLO arithmetic from drifting.
+
+The shared module is intentionally an arithmetic boundary, not a claim that
+different transports have identical lifecycle semantics. An adapter must keep
+unavailable dimensions as `null`/omitted and report its own transport facts;
+it must not turn a missing client observation into a fabricated zero or infer
+server compute time from delivered FPS.
+
 ## Multi-GPU and autoscaling
 
 `process-nccl` deliberately uses a fixed one-GPU-per-worker NCCL group, so it does
@@ -406,7 +441,7 @@ The deterministic continuous-batching benchmark runs multiple sessions for
 30 blocks and writes stage/batch latency plus throughput JSON:
 
 ```bash
-python tools/validation/benchmark_abot_turboserve.py \
+PYTHONPATH=$PWD python tools/validation/benchmark_abot_turboserve.py \
   --model-root /path/to/ABot-World-0-5B-LF \
   --image /path/to/initial.png \
   --sessions 2 --chunks 30 --batch-size 2 \
@@ -422,7 +457,7 @@ For a service-level workload with bursty arrivals, independent keyboard activity
 and playback-paced consumers, run:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python tools/validation/benchmark_abot_turboserve_concurrent.py \
+PYTHONPATH=$PWD CUDA_VISIBLE_DEVICES=0 python tools/validation/benchmark_abot_turboserve_concurrent.py \
   --model-root /path/to/ABot-World-0-5B-LF --image /path/to/initial.png \
   --sessions 4 --duration-seconds 12 --arrival-window-seconds 1.5 \
   --max-batch-size 4 --output /tmp/abot-concurrent.json

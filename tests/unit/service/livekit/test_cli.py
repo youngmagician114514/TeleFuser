@@ -60,3 +60,27 @@ def test_cli_stream_serve_forwards_livekit_options(monkeypatch) -> None:
     assert captured["autoscaling_target_utilization"] == 0.7
     assert captured["autoscaling_cooldown_seconds"] == 10
     assert captured["skip_validation"] is True
+    assert captured["motivation_policy"] == "motivation"
+
+
+def test_cli_stream_serve_forwards_fifo_policy(monkeypatch) -> None:
+    captured = {}
+
+    def fake_run_stream_server(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("telefuser.service.livekit.main.run_stream_server", fake_run_stream_server)
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "stream-serve",
+            "pipeline.py",
+            "--skip-validation",
+            "--motivation-policy",
+            "fifo",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["motivation_policy"] == "fifo"

@@ -49,6 +49,7 @@ class MotivationSearchSummary:
     selected_migration_count: int
     selected_session_ids: tuple[str, ...]
     selected_job_ids: tuple[str, ...]
+    policy_name: str = "motivation"
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,7 @@ class MotivationDispatchSummary:
     migration_count: int
     session_ids: tuple[str, ...]
     job_ids: tuple[str, ...]
+    policy_name: str = "motivation"
 
 
 class MotivationDiagnosticsSink(Protocol):
@@ -121,6 +123,7 @@ class MotivationDiagnosticsCollector:
         self._dispatch_outcomes = Counter()
         self._dispatch_batch_sizes = Counter()
         self._dispatch_reasons = Counter()
+        self._policies = Counter()
         self._lock = RLock()
 
     def record_search(self, summary: MotivationSearchSummary) -> None:
@@ -137,6 +140,7 @@ class MotivationDiagnosticsCollector:
             self._add_batch_counts(self._not_selected, summary.not_selected_by_score)
             self._rejected.update(summary.rejected_by_reason)
             self._selected[str(summary.selected_batch_size)] += 1
+            self._policies[summary.policy_name] += 1
             self._recent_searches.append(summary)
 
     def record_dispatch(self, summary: MotivationDispatchSummary) -> None:
@@ -145,6 +149,7 @@ class MotivationDiagnosticsCollector:
             self._dispatch_outcomes[summary.outcome] += 1
             self._dispatch_batch_sizes[summary.batch_size] += 1
             self._dispatch_reasons[summary.reason] += 1
+            self._policies[summary.policy_name] += 1
             self._recent_dispatches.append(summary)
 
     def snapshot(self) -> dict[str, object]:
@@ -174,6 +179,7 @@ class MotivationDiagnosticsCollector:
                 "dispatch_outcomes": dict(sorted(self._dispatch_outcomes.items())),
                 "dispatch_by_batch_size": self._batch_counts(self._dispatch_batch_sizes),
                 "dispatch_reasons": dict(sorted(self._dispatch_reasons.items())),
+                "policies": dict(sorted(self._policies.items())),
                 "recent_searches": [asdict(item) for item in self._recent_searches],
                 "recent_dispatches": [asdict(item) for item in self._recent_dispatches],
             }

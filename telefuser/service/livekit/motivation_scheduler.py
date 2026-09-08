@@ -13,6 +13,7 @@ unit tests.
 
 from __future__ import annotations
 
+import bisect
 import csv
 import itertools
 import math
@@ -29,6 +30,11 @@ from .motivation_diagnostics import (
     MotivationSearchSummary,
     NullMotivationDiagnostics,
     empty_batch_counts,
+)
+from .motivation_policies import (
+    SchedulingPolicy,
+    SchedulingSearchRequest,
+    create_scheduling_policy,
 )
 
 EPSILON = 1e-9
@@ -214,6 +220,7 @@ class ActionJob:
     controls: tuple[str, ...]
     created_at: float
     state_version: int
+    sequence: int = 0
 
 
 @dataclass
@@ -294,6 +301,7 @@ class SessionSchedulingState:
         controls: Iterable[str],
         now: float,
         release: bool,
+        sequence: int = 0,
     ) -> bool:
         """Update the latest controls and optionally release an action job.
 
@@ -322,10 +330,11 @@ class SessionSchedulingState:
             controls=canonical,
             created_at=now,
             state_version=self.state_version,
+            sequence=sequence,
         )
         return not had_pending
 
-    def create_idle_job(self, *, job_id: str, now: float) -> ActionJob | None:
+    def create_idle_job(self, *, job_id: str, now: float, sequence: int = 0) -> ActionJob | None:
         """Create one idle sentinel if no action or idle output is pending."""
         self.advance_to(now)
         # Match the paper simulator's per-session head semantics: once the
@@ -347,6 +356,7 @@ class SessionSchedulingState:
             controls=(),
             created_at=now,
             state_version=self.state_version,
+            sequence=sequence,
         )
         return self.pending_idle
 
@@ -434,6 +444,13 @@ class GpuSchedulingState:
     memory_free_gb: float = math.inf
     available: bool = True
     version: int = 0
+    # ``memory_free_gb`` is the free baseline at the current timeline point.
+    # A profile's ``memory_gb`` is a peak requirement for one serialized
+    # invocation, not a permanent allocation.  Keep the in-flight peak
+    # separately so a candidate projected after ``free_at`` can reclaim it;
+    # otherwise every future B>1 candidate is incorrectly rejected while the
+    # GPU is busy even though the previous invocation has already completed.
+    reserved_memory_gb: float = 0.0
 
     def __post_init__(self) -> None:
         if not self.gpu_id:
@@ -444,6 +461,8 @@ class GpuSchedulingState:
             not math.isfinite(self.memory_free_gb) or self.memory_free_gb < 0
         ):
             raise ValueError("memory_free_gb must be non-negative and finite")
+        if not math.isfinite(self.reserved_memory_gb) or self.reserved_memory_gb < 0:
+            raise ValueError("reserved_memory_gb must be non-negative and finite")
 
 
 @dataclass(frozen=True)
@@ -578,6 +597,7 @@ class MotivationSchedulerConfig:
     initial_quality: float | None = None
     include_idle_jobs: bool = True
     migration_enabled: bool = True
+    policy_name: str = "motivation"
 
     def __post_init__(self) -> None:
         if not 1 <= self.max_batch_size <= 4:
@@ -600,6 +620,8 @@ class MotivationSchedulerConfig:
             not math.isfinite(self.initial_quality) or self.initial_quality <= 0
         ):
             raise ValueError("initial_quality must be positive and finite")
+        if not isinstance(self.policy_name, str) or not self.policy_name.strip():
+            raise ValueError("policy_name must be a non-empty string")
 
 
 @dataclass(frozen=True)
@@ -622,6 +644,7 @@ class DispatchCandidate:
     session_versions: Mapping[str, int]
     gpu_version: int | None
     wait: bool = False
+    policy_name: str = "motivation"
 
     @property
     def batch_size(self) -> int:
@@ -649,9 +672,11 @@ class MotivationScheduler:
         migration_estimator: MigrationEstimator | None = None,
         diagnostics: MotivationDiagnosticsSink | None = None,
         clock: Callable[[], float] = time.monotonic,
+        policy: SchedulingPolicy | None = None,
     ) -> None:
         self.profile_provider = profile_provider
         self.config = config or MotivationSchedulerConfig()
+        self._policy = policy or create_scheduling_policy(self.config.policy_name)
         self.migration_estimator = migration_estimator or LocalMigrationEstimator()
         self._diagnostics = diagnostics or NullMotivationDiagnostics()
         self._clock = clock
@@ -674,6 +699,11 @@ class MotivationScheduler:
         with self._lock:
             return self._now
 
+    @property
+    def policy_name(self) -> str:
+        """Return the registered policy name used for candidate selection."""
+        return self._policy.name
+
     def add_gpu(self, state: GpuSchedulingState) -> None:
         """Register or replace a scheduler-visible GPU snapshot."""
         with self._lock:
@@ -691,8 +721,25 @@ class MotivationScheduler:
                 memory_free_gb=state.memory_free_gb,
                 available=state.available,
                 version=version,
+                reserved_memory_gb=state.reserved_memory_gb,
             )
             self._epoch += 1
+
+    def _coerce_time_locked(self, observed_at: float) -> float:
+        """Return a scheduler-monotonic timestamp.
+
+        Runtime callbacks are delivered by several worker/event-loop threads.
+        A callback can capture a timestamp, block while a large candidate
+        search or an NCCL transfer runs, and only then acquire the scheduler
+        lock.  In that case its timestamp is older than ``_now`` even though
+        the event is perfectly valid.  Treat it as occurring at the current
+        policy instant rather than turning an out-of-order callback into a
+        scheduler-wide failure.  The logical timeline remains monotonic and
+        callers still get strict validation for non-finite/negative values.
+        """
+        if not math.isfinite(observed_at) or observed_at < 0:
+            raise ValueError("observed time must be finite and non-negative")
+        return max(float(observed_at), self._now)
 
     def update_gpu(
         self,
@@ -714,6 +761,7 @@ class MotivationScheduler:
                 memory_free_gb=current.memory_free_gb if memory_free_gb is None else memory_free_gb,
                 available=current.available if available is None else available,
                 version=current.version + 1,
+                reserved_memory_gb=current.reserved_memory_gb,
             )
             self._gpus[gpu_id] = state
             self._epoch += 1
@@ -733,6 +781,7 @@ class MotivationScheduler:
         """Register one retained session and its initial scheduling state."""
         observed_at = self._clock() if now is None else now
         with self._lock:
+            observed_at = self._coerce_time_locked(observed_at)
             if session_id in self._sessions:
                 raise ValueError(f"session {session_id!r} is already registered")
             if owner_gpu not in self._gpus:
@@ -778,7 +827,7 @@ class MotivationScheduler:
         """Submit an action update and report ``(job, empty_to_nonempty)``."""
         observed_at = self._clock() if now is None else now
         with self._lock:
-            self._advance_to(observed_at)
+            observed_at = self._advance_to(observed_at)
             state = self._sessions[session_id]
             self._job_sequence += 1
             job_id = f"{session_id}:action:{self._job_sequence:08d}"
@@ -788,6 +837,7 @@ class MotivationScheduler:
                 controls=controls,
                 now=observed_at,
                 release=release,
+                sequence=self._job_sequence,
             )
             job = state.pending_action if state.pending_action is not before else None
             if release and job is not None:
@@ -806,11 +856,12 @@ class MotivationScheduler:
         """Create a consumption-gated idle sentinel for one session."""
         observed_at = self._clock() if now is None else now
         with self._lock:
-            self._advance_to(observed_at)
+            observed_at = self._advance_to(observed_at)
             self._job_sequence += 1
             job = self._sessions[session_id].create_idle_job(
                 job_id=f"{session_id}:idle:{self._job_sequence:08d}",
                 now=observed_at,
+                sequence=self._job_sequence,
             )
             if job is not None:
                 self._epoch += 1
@@ -820,7 +871,7 @@ class MotivationScheduler:
         """Pause/resume slack consumption for an explicitly paused consumer."""
         observed_at = self._clock() if now is None else now
         with self._lock:
-            self._advance_to(observed_at)
+            observed_at = self._advance_to(observed_at)
             state = self._sessions[session_id]
             if state.playback_active != active:
                 state.playback_active = active
@@ -830,7 +881,7 @@ class MotivationScheduler:
         """Remove future candidates for a departed session."""
         observed_at = self._clock() if now is None else now
         with self._lock:
-            self._advance_to(observed_at)
+            observed_at = self._advance_to(observed_at)
             self._sessions[session_id].mark_departed(now=observed_at)
             self._epoch += 1
 
@@ -844,7 +895,7 @@ class MotivationScheduler:
         """Commit scheduler ownership after the migration backend switches state."""
         observed_at = self._clock() if now is None else now
         with self._lock:
-            self._advance_to(observed_at)
+            observed_at = self._advance_to(observed_at)
             if target_gpu not in self._gpus:
                 raise KeyError(f"unknown target GPU {target_gpu!r}")
             state = self._sessions[session_id]
@@ -859,7 +910,7 @@ class MotivationScheduler:
         """Clear a failed asynchronous migration and permit a fresh search."""
         observed_at = self._clock() if now is None else now
         with self._lock:
-            self._advance_to(observed_at)
+            observed_at = self._advance_to(observed_at)
             state = self._sessions[session_id]
             if state.migration_target_gpu is None and state.migration_ready_at == 0.0:
                 return
@@ -880,7 +931,7 @@ class MotivationScheduler:
         if target_gpu not in self._gpus:
             raise KeyError(f"unknown target GPU {target_gpu!r}")
         with self._lock:
-            self._advance_to(observed_at)
+            observed_at = self._advance_to(observed_at)
             state = self._sessions[session_id]
             state.migration_target_gpu = target_gpu
             state.migration_ready_at = ready_at
@@ -902,7 +953,7 @@ class MotivationScheduler:
         """
         observed_at = self._clock() if now is None else now
         with self._lock:
-            self._advance_to(observed_at)
+            observed_at = self._advance_to(observed_at)
             state = self._sessions[session_id]
             updated = tuple(compatibility_key)
             if state.compatibility_key == updated:
@@ -910,12 +961,18 @@ class MotivationScheduler:
             state.compatibility_key = updated
             self._epoch += 1
 
-    def _advance_to(self, now: float) -> None:
-        if not math.isfinite(now) or now < self._now - EPSILON:
-            raise ValueError("scheduler time must be monotonic")
+    def _advance_to(self, now: float) -> float:
+        """Advance the logical timeline and return its effective timestamp.
+
+        ``now`` may be stale when an asynchronous callback was delayed behind
+        another event.  Coercing it under the scheduler lock keeps all state
+        updates ordered without fabricating a backwards jump.
+        """
+        effective_now = self._coerce_time_locked(now)
         for state in self._sessions.values():
-            state.advance_to(now)
-        self._now = now
+            state.advance_to(effective_now)
+        self._now = effective_now
+        return effective_now
 
     def _ready_jobs(self) -> tuple[tuple[SessionSchedulingState, ActionJob], ...]:
         ready: list[tuple[SessionSchedulingState, ActionJob]] = []
@@ -934,6 +991,26 @@ class MotivationScheduler:
         # retains ``action_count`` as the deterministic action-first tie-break.
         return tuple(ready)
 
+    def _ready_jobs_for_fifo(
+        self,
+        *,
+        now: float | None = None,
+    ) -> tuple[tuple[str, ActionJob], ...]:
+        """Return a stable ready-job view for the FIFO policy.
+
+        The view is intentionally narrow: FIFO needs only the session/job
+        identity and sequence. Candidate feasibility and all state mutation
+        remain in the shared scheduler path, where epoch validation protects
+        this read from concurrent control updates.
+        """
+        observed_at = self._clock() if now is None else now
+        with self._lock:
+            self._advance_to(observed_at)
+            return tuple(
+                (state.session_id, job)
+                for state, job in self._ready_jobs()
+            )
+
     @staticmethod
     def _utility(slack: float, cap: float) -> float:
         """The simulator's ``U(P)=min(P, cap)`` utility."""
@@ -946,6 +1023,7 @@ class MotivationScheduler:
         wait_seconds: float,
         states: Sequence[SessionSchedulingState] | None = None,
         snapshot_epoch: int | None = None,
+        policy_name: str = "motivation",
     ) -> DispatchCandidate:
         """Build a wait candidate from either live state or a search snapshot."""
         source = tuple(self._sessions.values()) if states is None else tuple(states)
@@ -973,6 +1051,7 @@ class MotivationScheduler:
             session_versions={state.session_id: state.state_version for state in active_states},
             gpu_version=None,
             wait=True,
+            policy_name=policy_name,
         )
 
     def find_best(
@@ -985,6 +1064,32 @@ class MotivationScheduler:
         allow_migrations: bool = True,
         exclude_session_ids: Iterable[str] = (),
         blocked_migration_session_ids: Iterable[str] = (),
+    ) -> DispatchCandidate | None:
+        """Select a candidate through the configured policy strategy."""
+        request = SchedulingSearchRequest(
+            now=now,
+            gpu_states=None if gpu_states is None else tuple(gpu_states),
+            wait_seconds=float(wait_seconds),
+            include_wait=bool(include_wait),
+            allow_migrations=bool(allow_migrations),
+            exclude_session_ids=tuple(str(value) for value in exclude_session_ids),
+            blocked_migration_session_ids=tuple(
+                str(value) for value in blocked_migration_session_ids
+            ),
+        )
+        return self._policy.select(self, request)
+
+    def _find_best_motivation(
+        self,
+        *,
+        now: float | None = None,
+        gpu_states: Sequence[GpuSchedulingState] | None = None,
+        wait_seconds: float = 0.0,
+        include_wait: bool = True,
+        allow_migrations: bool = True,
+        exclude_session_ids: Iterable[str] = (),
+        blocked_migration_session_ids: Iterable[str] = (),
+        policy_name: str = "motivation",
     ) -> DispatchCandidate | None:
         """Enumerate and score all feasible candidates in a global snapshot.
 
@@ -1004,7 +1109,7 @@ class MotivationScheduler:
         # ready set is being scored; ``snapshot_epoch`` makes the result fail
         # closed at reservation time if anything changed meanwhile.
         with self._lock:
-            self._advance_to(observed_at)
+            observed_at = self._advance_to(observed_at)
             live_states = tuple(self._sessions.values())
             snapshot_states = tuple(replace(state) for state in live_states)
             snapshot_by_id = {state.session_id: state for state in snapshot_states}
@@ -1072,8 +1177,13 @@ class MotivationScheduler:
             return profiles
 
         # Baseline terms are common to every profile at a given predicted
-        # duration.  Cache only the scalar utility; baseline slack values are
-        # recomputed for the (single) winning descriptor at the end.
+        # duration.  Keep a sorted prefix representation for the normal
+        # playback-active sessions.  The old hot loop scanned every active
+        # session for every (profile, member-set) pair; at 24 sessions that
+        # made the control-plane search compete with the GPU for ~100 ms per
+        # call.  ``min(slack-duration, cap)`` is piecewise linear, so a
+        # bisect/prefix lookup is exact (paused sessions remain a small
+        # constant term).
         slack_cache: dict[float, float] = {}
         utility_cap = self.config.utility_cap_seconds
         lambda_quality = self.config.lambda_quality
@@ -1082,6 +1192,29 @@ class MotivationScheduler:
         active_quality_sum = sum(state.quality_ema for state in active_states)
         active_slacks = tuple(state.slack_seconds for state in active_states)
         active_playback = tuple(state.playback_active for state in active_states)
+        playback_slacks = sorted(
+            slack for slack, playback in zip(active_slacks, active_playback, strict=True) if playback
+        )
+        playback_slack_prefix = [0.0]
+        for slack in playback_slacks:
+            playback_slack_prefix.append(playback_slack_prefix[-1] + slack)
+        paused_utility = sum(
+            slack if slack < utility_cap else utility_cap
+            for slack, playback in zip(active_slacks, active_playback, strict=True)
+            if not playback
+        )
+
+        def baseline_utility(duration: float) -> float:
+            """Return exact system utility after ``duration`` seconds."""
+            threshold = utility_cap + duration
+            split = bisect.bisect_left(playback_slacks, threshold)
+            return (
+                playback_slack_prefix[split]
+                - split * duration
+                + (len(playback_slacks) - split) * utility_cap
+                + paused_utility
+            )
+
         active_index = {state.session_id: index for index, state in enumerate(active_states)}
         ready_active_index = tuple(active_index[state.session_id] for state in ready_states)
         ready_quality = tuple(state.quality_ema for state in ready_states)
@@ -1130,10 +1263,23 @@ class MotivationScheduler:
                             reject("no_profile")
                         continue
                     profiles_evaluated[size] += len(profiles) * len(combinations)
+                    # A GPU has at most one physical invocation in flight.
+                    # When this candidate is projected after that invocation's
+                    # ``free_at`` boundary, the current peak reservation is
+                    # released before the candidate starts.  The simulator
+                    # applies the same serialized peak-memory constraint; use
+                    # the reclaimed value for future slots instead of treating
+                    # the previous batch's peak as a permanent allocation.
+                    effective_memory_free_gb = gpu.memory_free_gb
+                    if (
+                        gpu.free_at > observed_at + EPSILON
+                        and gpu.memory_free_gb != math.inf
+                    ):
+                        effective_memory_free_gb += gpu.reserved_memory_gb
                     usable_profiles = tuple(
                         profile
                         for profile in profiles
-                        if profile.memory_gb <= gpu.memory_free_gb + EPSILON
+                        if profile.memory_gb <= effective_memory_free_gb + EPSILON
                     )
                     memory_rejected = len(profiles) - len(usable_profiles)
                     if memory_rejected:
@@ -1146,10 +1292,7 @@ class MotivationScheduler:
                     earliest_start = max(observed_at, gpu.free_at)
                     for profile in usable_profiles:
                         earliest_duration = earliest_start - observed_at + profile.latency_seconds
-                        optimistic_baseline = 0.0
-                        for slack, playback in zip(active_slacks, active_playback, strict=True):
-                            value = slack - earliest_duration if playback else slack
-                            optimistic_baseline += value if value < utility_cap else utility_cap
+                        optimistic_baseline = baseline_utility(earliest_duration)
                         best_quality_sum = 0.0
                         for group in compatibility_groups:
                             if len(group) < size:
@@ -1217,10 +1360,7 @@ class MotivationScheduler:
                             duration = finish_at - observed_at
                             baseline_score = slack_cache.get(duration)
                             if baseline_score is None:
-                                baseline_score = 0.0
-                                for slack, playback in zip(active_slacks, active_playback, strict=True):
-                                    value = slack - duration if playback else slack
-                                    baseline_score += value if value < utility_cap else utility_cap
+                                baseline_score = baseline_utility(duration)
                                 slack_cache[duration] = baseline_score
                             score = baseline_score
                             quality_delta_sum = 0.0
@@ -1278,10 +1418,17 @@ class MotivationScheduler:
                                 migration_seconds,
                             )
 
-        # Compare the model winner with the deliberate wait option only after
-        # the search.  Model candidates are enumerated before the wait option,
-        # so an exact tie intentionally keeps the model candidate (matching
-        # ``max``'s stable first-winner behavior in the reference algorithm).
+        # A wait is a valid outcome only when the search found no executable
+        # model candidate.  In particular, ``wait_seconds=0`` is a no-op, not
+        # an alternative service decision.  Comparing that no-op against a
+        # model candidate is dangerous once the aggregate slack is negative:
+        # the model candidate pays its compute duration for every active
+        # session while adding output credit to only the selected members, so
+        # the objective can prefer doing nothing indefinitely even though a
+        # GPU is idle and work is ready.  The runtime has a separate singleton
+        # batch gate for intentional short waits; keeping the policy itself
+        # work-conserving prevents the 24-session trace from entering that
+        # starvation state.
         selected: DispatchCandidate | None = None
         if best_record is not None:
             (
@@ -1333,13 +1480,15 @@ class MotivationScheduler:
                     (gpu.version for gpu in gpus if gpu.gpu_id == best_gpu_id),
                     None,
                 ),
+                policy_name=policy_name,
             )
-        if include_wait:
+        if include_wait and selected is None:
             wait_candidate = self._wait_candidate(
                 now=observed_at,
                 wait_seconds=wait_seconds,
                 states=snapshot_states,
                 snapshot_epoch=snapshot_epoch,
+                policy_name=policy_name,
             )
             wait_key = (
                 wait_candidate.score,
@@ -1348,9 +1497,8 @@ class MotivationScheduler:
                 -wait_candidate.finish_at,
                 -wait_candidate.migration_count,
             )
-            if selected is None or candidates_best_key is None or wait_key > candidates_best_key:
-                selected = wait_candidate
-                candidates_best_key = wait_key
+            selected = wait_candidate
+            candidates_best_key = wait_key
 
         not_selected = dict(feasible)
         if selected is not None and not selected.wait:
@@ -1380,6 +1528,7 @@ class MotivationScheduler:
             selected_migration_count=(selected.migration_count if selected is not None else 0),
             selected_session_ids=selected.session_ids if selected is not None else (),
             selected_job_ids=selected.job_ids if selected is not None else (),
+            policy_name=policy_name,
         )
         try:
             self._diagnostics.record_search(summary)
@@ -1407,7 +1556,7 @@ class MotivationScheduler:
         """Check that an asynchronously searched candidate is still current."""
         observed_at = self._clock() if now is None else now
         with self._lock:
-            self._advance_to(observed_at)
+            observed_at = self._advance_to(observed_at)
             if candidate.wait:
                 return candidate.snapshot_epoch == self._epoch
             if candidate.gpu_id is None or candidate.profile is None:
@@ -1442,7 +1591,7 @@ class MotivationScheduler:
         """
         observed_at = self._clock() if now is None else now
         with self._lock:
-            self._advance_to(observed_at)
+            observed_at = self._advance_to(observed_at)
             if (
                 candidate.wait
                 or candidate.gpu_id is None
@@ -1451,13 +1600,24 @@ class MotivationScheduler:
             ):
                 return False
             gpu = self._gpus.get(candidate.gpu_id)
-            return gpu is not None and gpu.available and gpu.free_at <= observed_at + EPSILON
+            # ``free_at`` is a planning timestamp, not proof that the child
+            # worker has published the previous output.  A parent callback can
+            # arrive after the predicted profile duration; dispatching on the
+            # timestamp alone creates two physical leases on one GPU and
+            # double-counts peak memory.  Reservation is cleared only by
+            # ``complete``/``rollback`` after the worker boundary is observed.
+            return (
+                gpu is not None
+                and gpu.available
+                and gpu.free_at <= observed_at + EPSILON
+                and gpu.reserved_memory_gb <= EPSILON
+            )
 
     def reserve(self, candidate: DispatchCandidate, *, now: float | None = None) -> DispatchCandidate:
         """Atomically reserve a candidate and move its jobs in-flight."""
         observed_at = self._clock() if now is None else now
         with self._lock:
-            self._advance_to(observed_at)
+            observed_at = self._advance_to(observed_at)
             if candidate.wait:
                 return candidate
             if not self.validate(candidate, now=observed_at):
@@ -1486,6 +1646,7 @@ class MotivationScheduler:
                 memory_free_gb=max(0.0, gpu.memory_free_gb - candidate.profile.memory_gb),
                 available=gpu.available,
                 version=gpu.version + 1,
+                reserved_memory_gb=candidate.profile.memory_gb,
             )
             self._epoch += 1
             return candidate
@@ -1501,7 +1662,7 @@ class MotivationScheduler:
             return ()
         observed_at = self._clock() if now is None else now
         with self._lock:
-            self._advance_to(observed_at)
+            observed_at = self._advance_to(observed_at)
             jobs: list[ActionJob] = []
             for session_id, job_id in zip(candidate.session_ids, candidate.job_ids, strict=True):
                 state = self._sessions[session_id]
@@ -1512,12 +1673,14 @@ class MotivationScheduler:
                 state.migration_target_gpu = None
                 jobs.append(job)
             gpu = self._gpus[candidate.gpu_id]
+            released_memory = gpu.reserved_memory_gb
             self._gpus[candidate.gpu_id] = GpuSchedulingState(
                 gpu_id=gpu.gpu_id,
                 free_at=observed_at,
-                memory_free_gb=gpu.memory_free_gb + candidate.profile.memory_gb,
+                memory_free_gb=gpu.memory_free_gb + released_memory,
                 available=gpu.available,
                 version=gpu.version + 1,
+                reserved_memory_gb=0.0,
             )
             self._epoch += 1
             return tuple(jobs)
@@ -1534,7 +1697,7 @@ class MotivationScheduler:
             return ()
         observed_at = self._clock() if completed_at is None else completed_at
         with self._lock:
-            self._advance_to(observed_at)
+            observed_at = self._advance_to(observed_at)
             profile = candidate.profile
             jobs: list[ActionJob] = []
             for session_id in candidate.session_ids:
@@ -1549,15 +1712,55 @@ class MotivationScheduler:
                 state.migration_ready_at = observed_at
                 jobs.append(job)
             gpu = self._gpus[candidate.gpu_id]
+            # The child may have already reported physical model completion,
+            # which releases the GPU reservation before transport/publisher
+            # output reaches the parent.  Do not add the same peak twice.
+            released_memory = gpu.reserved_memory_gb
             self._gpus[candidate.gpu_id] = GpuSchedulingState(
                 gpu_id=gpu.gpu_id,
                 free_at=observed_at,
-                memory_free_gb=gpu.memory_free_gb + profile.memory_gb,
+                memory_free_gb=gpu.memory_free_gb + released_memory,
                 available=gpu.available,
                 version=gpu.version + 1,
+                reserved_memory_gb=0.0,
             )
             self._epoch += 1
             return tuple(jobs)
+
+    def release_gpu_reservation(
+        self,
+        candidate: DispatchCandidate,
+        *,
+        completed_at: float | None = None,
+    ) -> bool:
+        """Release a physical GPU slot at model completion, before output drain.
+
+        A model invocation has two independent boundaries: the child finishes
+        compute, then its chunk can spend time in the parent/output transport.
+        The scheduler must let another session use the GPU at the first
+        boundary while retaining each selected session's ``in_flight`` job
+        until :meth:`complete` commits its output credit.  Return ``True``
+        only when this call consumed an outstanding reservation; duplicate
+        trace/output notifications are therefore harmless.
+        """
+        if candidate.wait or candidate.profile is None or candidate.gpu_id is None:
+            return False
+        observed_at = self._clock() if completed_at is None else completed_at
+        with self._lock:
+            observed_at = self._advance_to(observed_at)
+            gpu = self._gpus.get(candidate.gpu_id)
+            if gpu is None or gpu.reserved_memory_gb <= EPSILON:
+                return False
+            self._gpus[candidate.gpu_id] = GpuSchedulingState(
+                gpu_id=gpu.gpu_id,
+                free_at=observed_at,
+                memory_free_gb=gpu.memory_free_gb + gpu.reserved_memory_gb,
+                available=gpu.available,
+                version=gpu.version + 1,
+                reserved_memory_gb=0.0,
+            )
+            self._epoch += 1
+            return True
 
     def session(self, session_id: str) -> SessionSchedulingState:
         """Return a live session state for runtime adapters and telemetry."""

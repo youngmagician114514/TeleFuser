@@ -13,6 +13,11 @@ from PIL import Image
 
 from telefuser.pipelines.abot_world.interactive import ABotWorldInteractivePipeline
 
+if __package__:
+    from tools.validation.abot_benchmark_metrics import percentile as _percentile
+else:  # Allow ``python tools/validation/benchmark_abot_turboserve.py`` without PYTHONPATH.
+    from abot_benchmark_metrics import percentile as _percentile
+
 
 def _loader_module():
     loader_path = Path(__file__).resolve().parents[2] / "examples/abot_world/_loader.py"
@@ -22,13 +27,6 @@ def _loader_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-
-
-def _percentile(values: list[float], quantile: float) -> float:
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    return ordered[max(0, min(len(ordered) - 1, int(len(ordered) * quantile + 0.999999) - 1))]
 
 
 def benchmark(args: argparse.Namespace) -> dict[str, object]:

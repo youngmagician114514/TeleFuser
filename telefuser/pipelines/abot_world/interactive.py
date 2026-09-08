@@ -587,7 +587,14 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
                 elif isinstance(values[0], torch.Tensor):
                     scalar_values = [int(value.item()) for value in values]
                     if key != "global_end_index" and len(set(scalar_values)) != 1:
-                        raise ValueError(f"ABot batch cache cursor {key!r} must match")
+                        details = ", ".join(
+                            f"session_{index}={value}"
+                            for index, value in enumerate(scalar_values)
+                        )
+                        raise ValueError(
+                            f"ABot batch cache cursor {key!r} must match "
+                            f"(layer={layer_index}; {details})"
+                        )
                     layer[key] = values[0].clone()
                 else:
                     if len(set(values)) != 1:
@@ -809,6 +816,12 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
         with self._execution_lock, session.lock:
             self._require_session(session)
             self._release_cuda_graph(session.session_id)
+            # A pending idle-suspension callback can race a cross-worker NCCL
+            # export.  The exporter marks the session MIGRATING while holding
+            # this same execution lock; leave its source tensors resident
+            # until the ownership transaction commits or aborts.
+            if session.lifecycle == ABotWorldSessionLifecycle.MIGRATING:
+                return
             if session.lifecycle == ABotWorldSessionLifecycle.SUSPENDED:
                 return
             session.prompt_emb = session.prompt_emb.to("cpu")

@@ -14,7 +14,7 @@ import logging
 import math
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -35,6 +35,11 @@ class _LeaseProgress:
 
     lease: DispatchLease
     pending_session_ids: set[str] = field(default_factory=set)
+    # The child dispatch trace marks the point at which model generation has
+    # completed and the child has cleared its own physical in-flight state.
+    # Scheduler credit is committed there; publisher/output events may arrive
+    # later and must not commit the same lease a second time.
+    compute_committed: bool = False
 
 
 def _is_expected_departure_error(error: str) -> bool:
@@ -48,6 +53,11 @@ def _is_expected_departure_error(error: str) -> bool:
 
     normalized = str(error).strip()
     if normalized == _SESSION_DEPARTED_ERROR:
+        return True
+    # Isolated child services can reject a queued lease after the LiveKit
+    # session has already sent its final stop.  The serialized exception names
+    # the policy session rather than using the bridge's canonical message.
+    if "policy session" in normalized and " is inactive" in normalized:
         return True
     return normalized in {
         f"RuntimeError({_SESSION_DEPARTED_ERROR!r})",
@@ -247,7 +257,12 @@ class MotivationExecutionBridge:
         payload: dict[str, Any],
         session_runtime_metrics: dict[str, Any] | None = None,
     ) -> None:
-        """Commit a lease after each selected session reaches model output."""
+        """Track output arrival after the scheduler commit boundary.
+
+        The scheduler normally commits at the child model-compute trace.  A
+        transport adapter that does not emit that trace still commits at the
+        final output event as a compatibility fallback.
+        """
 
         observed_worker_id = str(worker_id)
         if payload.get("type") != "chunk":
@@ -289,6 +304,7 @@ class MotivationExecutionBridge:
             progress.pending_session_ids.discard(session_id)
             lease = progress.lease
             completed = not progress.pending_session_ids
+            compute_committed = progress.compute_committed
             if completed:
                 self._leases.pop(lease_id, None)
                 for job in progress.lease.jobs:
@@ -303,8 +319,103 @@ class MotivationExecutionBridge:
                 )
         if not completed:
             return
-        self.controller.on_completion(lease, completed_at=self._clock())
+        if not compute_committed:
+            self.controller.on_completion(lease, completed_at=self._clock())
         self._schedule()
+
+    def on_compute_complete(
+        self,
+        *,
+        job_ids: Sequence[str] = (),
+        session_ids: Sequence[str] = (),
+        compatibility_keys: Mapping[str, str] | None = None,
+    ) -> bool:
+        """Commit scheduler work when the child model invocation finishes.
+
+        The child dispatch trace is emitted at the end of model compute,
+        before output transport/publisher delivery, and after the child has
+        cleared its own physical in-flight state.  Commit the scheduler lease
+        at that boundary so generation capacity is independent of a slow
+        LiveKit consumer.  Keep a small lease record until all output events
+        arrive solely for job correlation and teardown handling.
+        """
+        normalized_job_ids = tuple(str(value) for value in job_ids if str(value))
+        normalized_session_ids = tuple(str(value) for value in session_ids if str(value))
+        normalized_compatibility = {
+            str(session_id): str(key)
+            for session_id, key in (compatibility_keys or {}).items()
+            if str(session_id) and isinstance(key, str)
+        }
+        with self._lock:
+            lease_ids: list[str] = []
+            for job_id in normalized_job_ids:
+                lease_id = self._job_to_lease.get(job_id)
+                if lease_id is not None and lease_id not in lease_ids:
+                    lease_ids.append(lease_id)
+            if normalized_session_ids:
+                for lease_id, progress in self._leases.items():
+                    if lease_id in lease_ids:
+                        continue
+                    if any(session_id in progress.pending_session_ids for session_id in normalized_session_ids):
+                        lease_ids.append(lease_id)
+        if not lease_ids:
+            return False
+        observed_at = self._clock()
+        # Update the policy's physical batch contract before committing the
+        # lease.  The next scheduling drain must see the child's post-compute
+        # KV cursor, not the value from the previous output event.
+        for pipeline_session_id, compatibility_key in normalized_compatibility.items():
+            with self._lock:
+                scheduler_session_id = self._pipeline_to_session.get(
+                    pipeline_session_id,
+                    pipeline_session_id,
+                )
+            try:
+                self.controller.on_session_compatibility(
+                    scheduler_session_id,
+                    (compatibility_key,),
+                    now=observed_at,
+                )
+            except (KeyError, ValueError):
+                # A trace can race session teardown; the lease/error path
+                # remains authoritative for that retirement.
+                logger.debug(
+                    "Ignoring late Motivation compatibility trace for session=%s",
+                    scheduler_session_id,
+                    exc_info=True,
+                )
+        released = False
+        for lease_id in lease_ids:
+            with self._lock:
+                progress = self._leases.get(lease_id)
+                if progress is None or progress.compute_committed:
+                    continue
+                progress.compute_committed = True
+            if progress is None:
+                continue
+            try:
+                self.controller.on_completion(
+                    progress.lease,
+                    completed_at=observed_at,
+                )
+                released = True
+            except Exception:
+                with self._lock:
+                    current = self._leases.get(lease_id)
+                    if current is progress:
+                        current.compute_committed = False
+                # A late trace can race session departure/rollback.  Output
+                # delivery remains responsible for the final lease commit;
+                # never let diagnostic scheduling callbacks break the event
+                # loop.
+                logger.warning(
+                    "Could not release completed Motivation GPU reservation: lease=%s",
+                    lease_id,
+                    exc_info=True,
+                )
+        if released:
+            self._schedule()
+        return released
 
     def _lease_id_for_session_locked(self, session_id: str) -> str | None:
         """Find a pending lease for a session while holding ``self._lock``."""
@@ -381,12 +492,13 @@ class MotivationExecutionBridge:
             for job in progress.lease.jobs:
                 if self._job_to_lease.get(job.job_id) == lease_id:
                     self._job_to_lease.pop(job.job_id, None)
-        try:
-            self.controller.scheduler.rollback_reservation(progress.lease.candidate, now=self._clock())
-        except Exception:
-            # A departure may have already released the policy state. Do not
-            # turn a late child failure into another serving exception.
-            logger.warning("Could not rollback failed Motivation lease %s", lease_id, exc_info=True)
+        if not progress.compute_committed:
+            try:
+                self.controller.scheduler.rollback_reservation(progress.lease.candidate, now=self._clock())
+            except Exception:
+                # A departure may have already released the policy state. Do
+                # not turn a late child failure into another serving exception.
+                logger.warning("Could not rollback failed Motivation lease %s", lease_id, exc_info=True)
         # A trace can depart while its already-materialized output is still
         # draining through LiveKit. That is an expected retirement race, not a
         # serving failure; keep genuine model/transport errors at warning level.
@@ -877,6 +989,7 @@ class MotivationExecutionBridge:
                     "gpu_id": progress.lease.candidate.gpu_id,
                     "fidelity": progress.lease.candidate.fidelity,
                     "reserved_at": progress.lease.reserved_at,
+                    "compute_committed": progress.compute_committed,
                 }
                 for lease_id, progress in self._leases.items()
             }
@@ -919,9 +1032,22 @@ class MotivationExecutionBridge:
                 "migration_target_gpu": state.migration_target_gpu,
             }
         migration_manager = self.controller.migration_manager
+        gpu_states = [
+            {
+                "gpu_id": gpu.gpu_id,
+                "free_at": gpu.free_at,
+                "memory_free_gb": gpu.memory_free_gb,
+                "reserved_memory_gb": gpu.reserved_memory_gb,
+                "available": gpu.available,
+                "version": gpu.version,
+            }
+            for gpu in self.controller.scheduler.gpus()
+        ]
         return {
             "epoch": self.controller.scheduler.epoch,
             "current_time": self.controller.scheduler.current_time,
+            "policy_name": self.controller.scheduler.policy_name,
+            "gpus": gpu_states,
             "leases": leases,
             "sessions": sessions,
             "controls": controls,
