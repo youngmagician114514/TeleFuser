@@ -807,6 +807,15 @@ class MotivationScheduler:
         self._sessions: dict[str, SessionSchedulingState] = {}
         self._gpus: dict[str, GpuSchedulingState] = {}
         self._job_sequence = 0
+        # Action-request accounting belongs to the shared coordinator rather
+        # than an individual policy.  A newly released action can supersede a
+        # job that is still pending, but it can never cancel an in-flight job.
+        # Keeping both totals lets paper metrics exclude only genuine
+        # latest-intent supersession without hiding dispatch/runtime failures.
+        self._action_jobs_released = 0
+        self._action_jobs_superseded_pending = 0
+        self._action_jobs_completed = 0
+        self._action_jobs_dropped_on_departure = 0
         self._epoch = 0
         self._now = 0.0
         self._lock = threading.RLock()
@@ -972,6 +981,9 @@ class MotivationScheduler:
             )
             job = state.pending_action if state.pending_action is not before else None
             if release and job is not None:
+                self._action_jobs_released += 1
+                if before is not None:
+                    self._action_jobs_superseded_pending += 1
                 # Replacement changes the session version, so a candidate that
                 # captured the old job is rejected even if the global ready set
                 # did not transition from empty to non-empty.
@@ -1013,7 +1025,10 @@ class MotivationScheduler:
         observed_at = self._clock() if now is None else now
         with self._lock:
             observed_at = self._advance_to(observed_at)
-            self._sessions[session_id].mark_departed(now=observed_at)
+            state = self._sessions[session_id]
+            if state.pending_action is not None:
+                self._action_jobs_dropped_on_departure += 1
+            state.mark_departed(now=observed_at)
             self._epoch += 1
 
     def commit_migration(
@@ -1886,9 +1901,23 @@ class MotivationScheduler:
     def diagnostics_snapshot(self) -> dict[str, object]:
         """Return the injected diagnostics sink's bounded snapshot."""
         try:
-            return self._diagnostics.snapshot()
+            snapshot = dict(self._diagnostics.snapshot())
         except Exception:
-            return {}
+            snapshot = {}
+        with self._lock:
+            effective = self._action_jobs_released - self._action_jobs_superseded_pending
+            snapshot["action_lifecycle"] = {
+                "released": self._action_jobs_released,
+                "superseded_before_dispatch": self._action_jobs_superseded_pending,
+                "effective": effective,
+                "completed": self._action_jobs_completed,
+                "dropped_on_departure": self._action_jobs_dropped_on_departure,
+                "definition": (
+                    "effective = released - superseded_before_dispatch; a newer action never "
+                    "supersedes an action that is already in flight"
+                ),
+            }
+        return snapshot
 
     def validate(self, candidate: DispatchCandidate, *, now: float | None = None) -> bool:
         """Check that an asynchronously searched candidate is still current."""
@@ -2062,6 +2091,8 @@ class MotivationScheduler:
                 state.migration_target_gpu = None
                 state.migration_ready_at = observed_at
                 jobs.append(job)
+                if job.kind == "action":
+                    self._action_jobs_completed += 1
             gpu = self._gpus[candidate.gpu_id]
             # The child may have already reported physical model completion,
             # which releases the GPU reservation before transport/publisher

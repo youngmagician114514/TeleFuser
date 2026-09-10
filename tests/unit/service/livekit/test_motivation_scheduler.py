@@ -51,6 +51,17 @@ def test_action_updates_replace_pending_without_releasing_a_second_job() -> None
     assert invalidated is True
     assert replacement_invalidated is False
     assert scheduler.session("s").pending_action == second
+    assert scheduler.diagnostics_snapshot()["action_lifecycle"] == {
+        "released": 2,
+        "superseded_before_dispatch": 1,
+        "effective": 1,
+        "completed": 0,
+        "dropped_on_departure": 0,
+        "definition": (
+            "effective = released - superseded_before_dispatch; a newer action never "
+            "supersedes an action that is already in flight"
+        ),
+    }
 
 
 def test_action_arriving_while_running_waits_for_next_slot() -> None:
@@ -87,6 +98,11 @@ def test_pending_action_waits_out_in_flight_then_becomes_runnable() -> None:
 
     completed = scheduler.complete(running, completed_at=0.4)
     assert completed == (first,)
+    lifecycle = scheduler.diagnostics_snapshot()["action_lifecycle"]
+    assert lifecycle["released"] == 2
+    assert lifecycle["superseded_before_dispatch"] == 0
+    assert lifecycle["effective"] == 2
+    assert lifecycle["completed"] == 1
     resumed = scheduler.find_best(now=0.4, include_wait=False)
     assert resumed is not None
     assert resumed.session_ids == ("s",)
@@ -392,6 +408,24 @@ def test_departure_keeps_reserved_job_until_completion() -> None:
     assert completed[0].job_id == candidate.job_ids[0]
     assert state.in_flight is None
     assert scheduler.gpus()[0].memory_free_gb == pytest.approx(80.0)
+    lifecycle = scheduler.diagnostics_snapshot()["action_lifecycle"]
+    assert lifecycle["completed"] == 1
+    assert lifecycle["dropped_on_departure"] == 0
+
+
+def test_departure_counts_an_effective_pending_action_as_uncompleted() -> None:
+    scheduler = _scheduler()
+    scheduler.register_session("s", owner_gpu="gpu-0", now=0.0)
+    scheduler.submit_action("s", ["W"], now=0.0)
+
+    scheduler.mark_departed("s", now=0.1)
+
+    lifecycle = scheduler.diagnostics_snapshot()["action_lifecycle"]
+    assert lifecycle["released"] == 1
+    assert lifecycle["superseded_before_dispatch"] == 0
+    assert lifecycle["effective"] == 1
+    assert lifecycle["completed"] == 0
+    assert lifecycle["dropped_on_departure"] == 1
 
 
 def test_new_ready_session_invalidates_global_candidate() -> None:

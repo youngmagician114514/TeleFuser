@@ -286,6 +286,12 @@ sink can stream the same summaries to an experiment trace or replace the
 collector entirely for an ablation; the sink is best-effort and never changes
 policy availability.
 
+The shared scheduler snapshot also exposes `action_lifecycle`, independently
+of the selected policy: `released`, `superseded_before_dispatch`, `effective`,
+`completed`, and `dropped_on_departure`. Paper SLO uses
+`effective = released - superseded_before_dispatch`; a newer action cannot
+supersede a job that has already entered the in-flight state.
+
 Transport-level migration phases are collected independently by
 `MigrationDiagnostics` (export, transfer, route commit, worker exits, and
 bounded error classes). It has no NCCL dependency; the process-NCCL pool owns

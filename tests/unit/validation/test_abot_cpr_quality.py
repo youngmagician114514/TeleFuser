@@ -8,6 +8,7 @@ from tools.validation.augment_abot_cpr_quality import (
     collect_dispatch_quality,
     collect_producer_metrics,
     count_released_action_jobs,
+    extract_action_lifecycle,
     load_profile_quality,
 )
 
@@ -128,18 +129,22 @@ def test_producer_metrics_credit_all_action_and_idle_frames_without_transport(tm
         trace,
         load_profile_quality(profile),
         released_action_jobs=3,
+        superseded_action_jobs=1,
     )
 
-    assert metrics["schema_version"] == "abot_producer_metrics_v2"
+    assert metrics["schema_version"] == "abot_producer_metrics_v3"
     assert metrics["jobs_completed"] == 3
     assert metrics["released_action_jobs"] == 3
+    assert metrics["superseded_action_jobs"] == 1
+    assert metrics["effective_action_jobs"] == 2
+    assert metrics["action_slo_denominator_source"] == "scheduler_effective_actions"
     assert metrics["action_jobs_completed"] == 2
     assert metrics["action_jobs_on_time"] == 2
-    assert metrics["action_job_completion_ratio"] == 0.666667
+    assert metrics["action_job_completion_ratio"] == 1.0
     assert metrics["idle_jobs_completed"] == 1
     assert metrics["generated_frames"] == 36
     assert metrics["producer_cpr"] == 0.75
-    assert metrics["producer_slo_attainment"] == 0.666667
+    assert metrics["producer_slo_attainment"] == 1.0
     assert metrics["completed_job_deadline_attainment"] == 0.666667
     assert metrics["producer_fps_per_engaged_session"] == 9.0
     assert metrics["normalized_quality"] == 0.958974
@@ -161,3 +166,47 @@ def test_released_action_count_uses_trace_heartbeat_contract(tmp_path: Path) -> 
     trace.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
 
     assert count_released_action_jobs(trace) == 3
+
+
+def test_extract_action_lifecycle_uses_final_scheduler_snapshot() -> None:
+    result = {
+        "server_metadata": [
+            {
+                "label": "before_workload",
+                "metadata": {
+                    "motivation_scheduler": {
+                        "diagnostics": {
+                            "action_lifecycle": {
+                                "released": 0,
+                                "superseded_before_dispatch": 0,
+                            }
+                        }
+                    }
+                },
+            },
+            {
+                "label": "after_workload",
+                "metadata": {
+                    "motivation_scheduler": {
+                        "diagnostics": {
+                            "action_lifecycle": {
+                                "released": 10,
+                                "superseded_before_dispatch": 3,
+                                "effective": 7,
+                                "completed": 6,
+                                "dropped_on_departure": 1,
+                            }
+                        }
+                    }
+                },
+            },
+        ]
+    }
+
+    assert extract_action_lifecycle(result) == {
+        "released": 10,
+        "superseded_before_dispatch": 3,
+        "effective": 7,
+        "completed": 6,
+        "dropped_on_departure": 1,
+    }

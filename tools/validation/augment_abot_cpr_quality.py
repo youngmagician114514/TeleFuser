@@ -157,14 +157,15 @@ def _percentile(values: list[float], quantile: float) -> float | None:
 
 
 def count_released_action_jobs(action_trace: Path) -> int:
-    """Count action jobs released by the trace producer contract.
+    """Count raw action releases from the trace producer contract.
 
     Trace replays carry the release decision explicitly: a non-empty control
     state releases work on a heartbeat or on the first input after
     arrival/resume. Immediate state changes update the latest controls but do
     not demand another generated chunk. This is the same input-side contract
-    used by ``release_on_control_state`` and gives SLO an unbiased denominator
-    that includes released actions later superseded before dispatch.
+    used by ``release_on_control_state``. The count is retained for load audit;
+    it is not the SLO denominator because it includes actions later superseded
+    before dispatch.
     """
 
     released = 0
@@ -187,11 +188,49 @@ def count_released_action_jobs(action_trace: Path) -> int:
     return released
 
 
+def extract_action_lifecycle(result: Mapping[str, Any]) -> dict[str, int] | None:
+    """Read scheduler-native action accounting from the final metadata snapshot."""
+
+    snapshots = result.get("server_metadata")
+    if not isinstance(snapshots, list):
+        return None
+    for entry in reversed(snapshots):
+        if not isinstance(entry, Mapping):
+            continue
+        metadata = entry.get("metadata")
+        if not isinstance(metadata, Mapping):
+            continue
+        scheduler = metadata.get("motivation_scheduler")
+        if not isinstance(scheduler, Mapping):
+            continue
+        diagnostics = scheduler.get("diagnostics")
+        if not isinstance(diagnostics, Mapping):
+            continue
+        lifecycle = diagnostics.get("action_lifecycle")
+        if not isinstance(lifecycle, Mapping):
+            continue
+        values: dict[str, int] = {}
+        for key in (
+            "released",
+            "superseded_before_dispatch",
+            "effective",
+            "completed",
+            "dropped_on_departure",
+        ):
+            value = lifecycle.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                values[key] = value
+        if "released" in values and "superseded_before_dispatch" in values:
+            return values
+    return None
+
+
 def collect_producer_metrics(
     dispatch_trace: Path,
     profile_quality: Mapping[str, float],
     *,
     released_action_jobs: int | None = None,
+    superseded_action_jobs: int | None = None,
 ) -> dict[str, Any]:
     """Build transport-independent QoE from completed model chunks.
 
@@ -321,16 +360,35 @@ def collect_producer_metrics(
     p95_job = _percentile(job_latencies, 0.95)
     p95_first_action = _percentile(list(first_action_latency.values()), 0.95)
     completed_actions = kinds.get("action", 0)
-    action_denominator = (
+    released_actions = (
         max(0, int(released_action_jobs))
         if released_action_jobs is not None
         else completed_actions
     )
+    if superseded_action_jobs is None:
+        # Legacy traces did not record pending-action supersession.  Completed
+        # action deadline attainment is the only non-fabricated post-hoc
+        # denominator; keep the raw trace-release total as a separate audit
+        # field and make the fallback explicit in the artifact.
+        superseded_actions = None
+        action_denominator = completed_actions
+        action_denominator_source = "completed_actions_legacy_fallback"
+    else:
+        superseded_actions = int(superseded_action_jobs)
+        if not 0 <= superseded_actions <= released_actions:
+            raise ValueError(
+                "superseded action jobs must be between zero and released action jobs"
+            )
+        action_denominator = released_actions - superseded_actions
+        action_denominator_source = "scheduler_effective_actions"
     return {
-        "schema_version": "abot_producer_metrics_v2",
+        "schema_version": "abot_producer_metrics_v3",
         "measurement_boundary": "model_completed_logical_playout",
         "jobs_completed": total_jobs,
-        "released_action_jobs": action_denominator,
+        "released_action_jobs": released_actions,
+        "superseded_action_jobs": superseded_actions,
+        "effective_action_jobs": action_denominator,
+        "action_slo_denominator_source": action_denominator_source,
         "action_jobs_completed": completed_actions,
         "action_jobs_on_time": action_job_deadlines_met,
         "idle_jobs_completed": kinds.get("idle", 0),
@@ -364,8 +422,9 @@ def collect_producer_metrics(
             "Producer CPR reconstructs continuous per-session playout from model-completed chunks; "
             "action and idle chunks both contribute all generated frames, the final buffer is fully drained, "
             "and LiveKit transport is excluded. Producer SLO is on-time completed action jobs divided by "
-            "the action jobs released by the input trace; superseded or otherwise missing actions are misses. "
-            "Completed-job deadline attainment is retained as a diagnostic."
+            "effective actions (released minus actions superseded before dispatch); an in-flight action is "
+            "never superseded. Legacy artifacts without lifecycle telemetry use completed action jobs as an "
+            "explicit post-hoc fallback. Completed-job deadline attainment is retained as a diagnostic."
         ),
     }
 
@@ -513,7 +572,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--action-trace",
         type=Path,
-        help="Input lifecycle trace used to count released action requests for the SLO denominator.",
+        help="Input lifecycle trace used to audit raw action releases.",
     )
     parser.add_argument("--profile", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -531,16 +590,31 @@ def main() -> None:
     action_trace = args.action_trace
     if action_trace is None and isinstance(trace_path_value, str):
         action_trace = Path(trace_path_value)
-    released_action_jobs = (
+    trace_released_action_jobs = (
         count_released_action_jobs(action_trace)
         if action_trace is not None and action_trace.is_file()
+        else None
+    )
+    action_lifecycle = extract_action_lifecycle(result)
+    released_action_jobs = (
+        action_lifecycle["released"]
+        if action_lifecycle is not None
+        else trace_released_action_jobs
+    )
+    superseded_action_jobs = (
+        action_lifecycle["superseded_before_dispatch"]
+        if action_lifecycle is not None
         else None
     )
     producer_metrics = collect_producer_metrics(
         args.dispatch_trace,
         profile_quality,
         released_action_jobs=released_action_jobs,
+        superseded_action_jobs=superseded_action_jobs,
     )
+    producer_metrics["trace_released_action_jobs"] = trace_released_action_jobs
+    if action_lifecycle is not None:
+        producer_metrics["scheduler_action_lifecycle"] = action_lifecycle
     augmented = augment_result(
         result,
         dispatch_quality=dispatch_quality,

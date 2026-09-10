@@ -8,14 +8,19 @@
 没有 admission violation、trace action drop、model compute error 或 `already in flight`。
 五类共完成 21,750 个 action/idle job，生成 261,000 帧。
 
-严格 action-request SLO 的五类微平均为 **75.43%**，producer CPR 的五类宏平均为
+按 latest-control 语义，尚未 dispatch 就被新 action 覆盖的旧 action 不属于有效请求，不应进入
+SLO 分母。已有五类回放尚未记录精确 supersession 生命周期，因此只能使用 completed-action
+deadline attainment 作后验估计：五类微平均为 **99.76%**。Producer CPR 的五类宏平均为
 **86.67%**，归一化质量 Q 为 **0.903**，质量调整后的 `Q × CPR` 为 **0.783**。
-已经完成的 job 中有 99.80% 能在 1 秒 deadline 内完成；因此当前主要损失不是 GPU job
-执行过慢，而是约 24.4% 已发布 action 在进入 GPU 前被更新的 action 覆盖。
+
+输入 trace 一共释放 19,992 个 action heartbeat，模型完成 15,115 个 action chunk；两者的差值
+主要是 pending 阶段的 latest-action 合并，不代表用户请求失败。新版本已原生记录
+`released / superseded-before-dispatch / effective / completed`，后续回放将用
+`effective = released - superseded` 给出精确 SLO。
 
 这组结果说明系统已解决“不 batch”和 LiveKit 反向限流两个早期实现问题，但仍没有达到
-CPU 仿真的理想调度效果。当前最重要的真实实现缺口是：缺少能够保留未来 GPU slot 的
-有界 dispatch queue，加上 KV local-cache 长度带来的 batch compatibility 碎片化。
+CPU 仿真的理想调度效果。当前最重要的真实实现缺口是 KV local-cache 长度带来的 batch
+compatibility 碎片化，以及迁移 route-ready 的尾延迟；不能再把 pending 合并本身当作 SLO miss。
 
 ## 实验配置
 
@@ -37,8 +42,9 @@ CPU 仿真的理想调度效果。当前最重要的真实实现缺口是：缺�
 
 固定使用以下五项主指标：
 
-1. **Action-request SLO**：按时完成的 action job / 输入 trace 发布的 action job。一个 job
-   生成 12 帧、目标 12 FPS，因此 deadline 为 1 秒。被新 action 覆盖或未执行的请求算 miss。
+1. **Effective-action SLO**：按时完成的 action job / 有效 action job。一个 job生成 12 帧、
+   目标 12 FPS，因此 deadline 为 1 秒。有效 action 定义为 scheduler 接收的 release 减去 dispatch
+   前被更新控制意图覆盖的 pending action；已经进入 in-flight 的 action 不能被剔除。
 2. **Producer CPR**：从 model-completed event 重建每个 session 的逻辑播放缓冲；action 和
    idle job 的 12 帧都完整计入，最后一个缓冲完整排空，LiveKit/WebRTC 丢帧不影响该值。
 3. **Q**：按生成帧加权的归一化语义质量，`S4_W18=1`。
@@ -46,34 +52,37 @@ CPU 仿真的理想调度效果。当前最重要的真实实现缺口是：缺�
 5. **First-action job p95**：action job 在调度器内的 queue + model 延迟，不包含建房、
    WebRTC 建连和首轨发布冷启动。
 
-`completed-job deadline attainment` 只作为诊断：它不包含未执行的 action，不能代替论文主 SLO。
+本次旧回放没有 supersession 埋点，表中的 Effective-action SLO 暂以 completed-action deadline
+attainment 后验估计，并在 artifact 中标记为 `completed_actions_legacy_fallback`；它不是新回放将提供的
+精确生命周期口径。
 
 ## 五类主结果
 
-| Workload | Action-request SLO | Producer CPR | Q | Q × CPR | First-action p95 |
+| Workload | Effective-action SLO* | Producer CPR | Q | Q × CPR | First-action p95 |
 |---|---:|---:|---:|---:|---:|
-| steady_control | 75.73% | 89.74% | 0.904 | 0.811 | 259 ms |
-| burst_join | 73.80% | 87.12% | 0.904 | 0.787 | 455 ms |
-| rapid_action_change | 69.30% | 83.02% | 0.905 | 0.751 | 271 ms |
-| interaction_pause | 71.91% | 77.90% | 0.900 | 0.701 | 279 ms |
-| mixed_nonstationary | 86.37% | 95.55% | 0.903 | 0.863 | 564 ms |
-| 五类平均 | 75.42% | 86.67% | 0.903 | 0.783 | 366 ms |
+| steady_control | 99.64% | 89.74% | 0.904 | 0.811 | 259 ms |
+| burst_join | 99.16% | 87.12% | 0.904 | 0.787 | 455 ms |
+| rapid_action_change | 100.00% | 83.02% | 0.905 | 0.751 | 271 ms |
+| interaction_pause | 100.00% | 77.90% | 0.900 | 0.701 | 279 ms |
+| mixed_nonstationary | 100.00% | 95.55% | 0.903 | 0.863 | 564 ms |
+| 五类平均 | 99.76% | 86.67% | 0.903 | 0.783 | 366 ms |
 
-Action-request SLO 的微平均为 75.43%；表中“五类平均”是 workload 等权宏平均。
+Effective-action SLO 的微平均为 99.76%；表中“五类平均”是 workload 等权宏平均。`*` 表示旧回放
+使用 completed-action fallback；下一次回放将直接采用 scheduler lifecycle 的精确分母。
 
 ## 生产能力与 batch 诊断
 
-| Workload | Released action | Completed action | Completed-job deadline | Producer FPS/demand | Mean physical B | Mean GPU util. |
+| Workload | Trace released | Completed action | Raw completion coverage | Producer FPS/demand | Mean physical B | Mean GPU util. |
 |---|---:|---:|---:|---:|---:|---:|
-| steady_control | 3,984 | 3,028 | 99.73% | 10.77 | 1.639 | 29.65% |
-| burst_join | 3,984 | 2,965 | 99.28% | 10.45 | 1.571 | 25.48% |
-| rapid_action_change | 3,984 | 2,761 | 100.00% | 9.96 | 1.437 | 26.05% |
-| interaction_pause | 4,033 | 2,900 | 100.00% | 9.35 | 1.349 | 25.79% |
-| mixed_nonstationary | 4,007 | 3,461 | 100.00% | 11.47 | 1.676 | 23.36% |
+| steady_control | 3,984 | 3,028 | 76.00% | 10.77 | 1.639 | 29.65% |
+| burst_join | 3,984 | 2,965 | 74.42% | 10.45 | 1.571 | 25.48% |
+| rapid_action_change | 3,984 | 2,761 | 69.30% | 9.96 | 1.437 | 26.05% |
+| interaction_pause | 4,033 | 2,900 | 71.91% | 9.35 | 1.349 | 25.79% |
+| mixed_nonstationary | 4,007 | 3,461 | 86.37% | 11.47 | 1.676 | 23.36% |
 
+Raw completion coverage 只是 completed / trace release，包含合法 supersession，不能作为 SLO。
 GPU utilization 是完整 capture 的一秒采样均值，包含 session 低需求和 pause 区间；它不能单独
-解释 kernel 效率。不过，released/completed action 的差距以及低于仿真的 mean-B 共同证明，
-当前运行时确实仍有可优化的供给与组批问题。
+解释 kernel 效率。低于仿真的 mean-B 仍说明实际运行时存在可优化的供给与组批问题。
 
 ## 与 CPU 仿真的共性和差异
 
@@ -93,7 +102,8 @@ GPU utilization 是完整 capture 的一秒采样均值，包含 session 低需�
 均在 producer 指标中完整计数。主要原因如下：
 
 - CPU 仿真可以在预测的未来 GPU slot 上立即“安排”job；实际 child worker 同一时刻只接受一个
-  物理 lease。GPU 忙时，action 仍留在 pending slot，下一次 heartbeat 会用最新 action 覆盖它。
+  物理 lease。GPU 忙时，action 仍留在 pending slot，下一次 heartbeat 会把它合并为最新控制意图；
+  这是两者共有的 latest-action 语义，不能当成请求失败。
 - 实际 batch 要求 session 位于同一 GPU，并满足真实结构兼容性；当前 key 包含首 chunk 状态、
   control geometry、fidelity 和 KV `local_end_index`。不同生成进度会把 ready session 分散成多个 cohort。
 - 实际实现受每 worker 8-session cap、迁移并发/cooldown、目标显存分配和 IPC/NCCL 命令调度约束；
@@ -136,8 +146,8 @@ admission scheduler 删除，旧回调仍尝试发布 target owner。它没有�
 
 ## 当前剩余缺陷与下一步
 
-1. **严格 SLO 的主要缺口：** 增加每 GPU 的有界 future-dispatch queue，或等价的多 slot reservation，
-   让已发布 action 在 GPU 忙时获得明确 slot，而不是停留在可被覆盖的单一 pending cell。
+1. **指标闭环：** 下一次回放使用 scheduler 原生 lifecycle 埋点，报告精确的 effective-action SLO，
+   并将 superseded action 作为负载合并诊断而非 SLO miss。
 2. **Batch compatibility 碎片：** 研究按 KV local length bucketing，或在保持结果正确的前提下为不同
    `local_end_index` 做 padding/mask；该优化应放在 batch executor，不应污染 MotivationPolicy。
 3. **迁移尾延迟：** 预分配/复用 target KV pages，并降低 export/prepare 命令排队；当前传输引擎本身
