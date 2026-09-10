@@ -156,9 +156,42 @@ def _percentile(values: list[float], quantile: float) -> float | None:
     return ordered[index]
 
 
+def count_released_action_jobs(action_trace: Path) -> int:
+    """Count action jobs released by the trace producer contract.
+
+    Trace replays carry the release decision explicitly: a non-empty control
+    state releases work on a heartbeat or on the first input after
+    arrival/resume. Immediate state changes update the latest controls but do
+    not demand another generated chunk. This is the same input-side contract
+    used by ``release_on_control_state`` and gives SLO an unbiased denominator
+    that includes released actions later superseded before dispatch.
+    """
+
+    released = 0
+    with action_trace.open(encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if record.get("kind") != "action_update":
+                continue
+            data = record.get("data")
+            if not isinstance(data, Mapping) or not data.get("controls"):
+                continue
+            reason = str(data.get("reason") or "")
+            if bool(data.get("heartbeat")) or reason in {
+                "first_nonempty_input",
+                "resume_first_nonempty_input",
+            }:
+                released += 1
+    return released
+
+
 def collect_producer_metrics(
     dispatch_trace: Path,
     profile_quality: Mapping[str, float],
+    *,
+    released_action_jobs: int | None = None,
 ) -> dict[str, Any]:
     """Build transport-independent QoE from completed model chunks.
 
@@ -173,7 +206,8 @@ def collect_producer_metrics(
     job_latencies: list[float] = []
     first_action_latency: dict[str, float] = {}
     kinds: dict[str, int] = defaultdict(int)
-    slo_met = 0
+    completed_job_deadlines_met = 0
+    action_job_deadlines_met = 0
     total_jobs = 0
     total_frames = 0
     output_gate_modes: set[int] = set()
@@ -238,7 +272,9 @@ def collect_producer_metrics(
                 kinds[kind] += 1
                 job_latencies.append(latency)
                 if latency <= output_seconds:
-                    slo_met += 1
+                    completed_job_deadlines_met += 1
+                    if kind == "action":
+                        action_job_deadlines_met += 1
                 if kind == "action" and session_id not in first_action_latency:
                     first_action_latency[session_id] = latency
 
@@ -284,16 +320,34 @@ def collect_producer_metrics(
     producer_fps = total_frames / engaged_seconds if engaged_seconds > 0 else None
     p95_job = _percentile(job_latencies, 0.95)
     p95_first_action = _percentile(list(first_action_latency.values()), 0.95)
+    completed_actions = kinds.get("action", 0)
+    action_denominator = (
+        max(0, int(released_action_jobs))
+        if released_action_jobs is not None
+        else completed_actions
+    )
     return {
-        "schema_version": "abot_producer_metrics_v1",
+        "schema_version": "abot_producer_metrics_v2",
         "measurement_boundary": "model_completed_logical_playout",
         "jobs_completed": total_jobs,
-        "action_jobs_completed": kinds.get("action", 0),
+        "released_action_jobs": action_denominator,
+        "action_jobs_completed": completed_actions,
+        "action_jobs_on_time": action_job_deadlines_met,
         "idle_jobs_completed": kinds.get("idle", 0),
         "generated_frames": total_frames,
         "producer_sessions": producer_session_count,
         "producer_cpr": round(producer_cpr, 6) if producer_cpr is not None else None,
-        "producer_slo_attainment": round(slo_met / total_jobs, 6) if total_jobs else None,
+        "producer_slo_attainment": (
+            round(action_job_deadlines_met / action_denominator, 6)
+            if action_denominator
+            else None
+        ),
+        "action_job_completion_ratio": (
+            round(completed_actions / action_denominator, 6) if action_denominator else None
+        ),
+        "completed_job_deadline_attainment": (
+            round(completed_job_deadlines_met / total_jobs, 6) if total_jobs else None
+        ),
         "producer_fps_per_engaged_session": round(producer_fps, 6) if producer_fps is not None else None,
         "normalized_quality": round(normalized_quality, 6) if normalized_quality is not None else None,
         "quality_adjusted_cpr": round(quality_adjusted_cpr, 6) if quality_adjusted_cpr is not None else None,
@@ -309,8 +363,9 @@ def collect_producer_metrics(
         "definition": (
             "Producer CPR reconstructs continuous per-session playout from model-completed chunks; "
             "action and idle chunks both contribute all generated frames, the final buffer is fully drained, "
-            "and LiveKit transport is excluded. SLO is the fraction of completed jobs whose queue-plus-model "
-            "latency does not exceed frames/fps."
+            "and LiveKit transport is excluded. Producer SLO is on-time completed action jobs divided by "
+            "the action jobs released by the input trace; superseded or otherwise missing actions are misses. "
+            "Completed-job deadline attainment is retained as a diagnostic."
         ),
     }
 
@@ -455,6 +510,11 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--result", type=Path, required=True)
     parser.add_argument("--dispatch-trace", type=Path, required=True)
+    parser.add_argument(
+        "--action-trace",
+        type=Path,
+        help="Input lifecycle trace used to count released action requests for the SLO denominator.",
+    )
     parser.add_argument("--profile", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
@@ -467,7 +527,20 @@ def main() -> None:
         raise ValueError("replay result must be a JSON object")
     profile_quality = load_profile_quality(args.profile)
     dispatch_quality, diagnostics = collect_dispatch_quality(args.dispatch_trace, profile_quality)
-    producer_metrics = collect_producer_metrics(args.dispatch_trace, profile_quality)
+    trace_path_value = result.get("trace_path")
+    action_trace = args.action_trace
+    if action_trace is None and isinstance(trace_path_value, str):
+        action_trace = Path(trace_path_value)
+    released_action_jobs = (
+        count_released_action_jobs(action_trace)
+        if action_trace is not None and action_trace.is_file()
+        else None
+    )
+    producer_metrics = collect_producer_metrics(
+        args.dispatch_trace,
+        profile_quality,
+        released_action_jobs=released_action_jobs,
+    )
     augmented = augment_result(
         result,
         dispatch_quality=dispatch_quality,

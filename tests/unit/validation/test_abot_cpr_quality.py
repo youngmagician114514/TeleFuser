@@ -7,6 +7,7 @@ from tools.validation.augment_abot_cpr_quality import (
     augment_result,
     collect_dispatch_quality,
     collect_producer_metrics,
+    count_released_action_jobs,
     load_profile_quality,
 )
 
@@ -123,16 +124,40 @@ def test_producer_metrics_credit_all_action_and_idle_frames_without_transport(tm
     ]
     trace.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
 
-    metrics = collect_producer_metrics(trace, load_profile_quality(profile))
+    metrics = collect_producer_metrics(
+        trace,
+        load_profile_quality(profile),
+        released_action_jobs=3,
+    )
 
+    assert metrics["schema_version"] == "abot_producer_metrics_v2"
     assert metrics["jobs_completed"] == 3
+    assert metrics["released_action_jobs"] == 3
     assert metrics["action_jobs_completed"] == 2
+    assert metrics["action_jobs_on_time"] == 2
+    assert metrics["action_job_completion_ratio"] == 0.666667
     assert metrics["idle_jobs_completed"] == 1
     assert metrics["generated_frames"] == 36
     assert metrics["producer_cpr"] == 0.75
     assert metrics["producer_slo_attainment"] == 0.666667
+    assert metrics["completed_job_deadline_attainment"] == 0.666667
     assert metrics["producer_fps_per_engaged_session"] == 9.0
     assert metrics["normalized_quality"] == 0.958974
     assert metrics["quality_adjusted_cpr"] == 0.719231
     assert metrics["first_action_job_latency_p95_seconds"] == 0.5
     assert metrics["output_gate_enabled_values"] == [0]
+
+
+def test_released_action_count_uses_trace_heartbeat_contract(tmp_path: Path) -> None:
+    trace = tmp_path / "actions.jsonl"
+    rows = [
+        {"kind": "action_update", "data": {"controls": ["W"], "heartbeat": False, "reason": "first_nonempty_input"}},
+        {"kind": "action_update", "data": {"controls": ["W", "A"], "heartbeat": False, "reason": "state_change"}},
+        {"kind": "action_update", "data": {"controls": ["W", "A"], "heartbeat": True, "reason": "one_second_heartbeat"}},
+        {"kind": "action_update", "data": {"controls": [], "heartbeat": True, "reason": "one_second_heartbeat"}},
+        {"kind": "user_inactive", "data": {}},
+        {"kind": "action_update", "data": {"controls": ["D"], "heartbeat": False, "reason": "resume_first_nonempty_input"}},
+    ]
+    trace.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    assert count_released_action_jobs(trace) == 3

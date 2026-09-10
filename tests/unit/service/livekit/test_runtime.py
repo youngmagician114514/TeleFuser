@@ -79,9 +79,12 @@ class MigratingWorkerPool(FakeWorkerPool):
 class ProgressiveMigratingWorkerPool(MigratingWorkerPool):
     progressive_migration_supported = True
 
-    def __init__(self, *, fail_residual: bool = False) -> None:
+    def __init__(self, *, fail_residual: bool = False, delay_compute_ready: bool = False) -> None:
         super().__init__()
         self.fail_residual = fail_residual
+        self.delay_compute_ready = delay_compute_ready
+        self.migration_started = asyncio.Event()
+        self.release_compute_ready = asyncio.Event()
         self.compute_ready = asyncio.Event()
         self.release_residual = asyncio.Event()
 
@@ -93,6 +96,9 @@ class ProgressiveMigratingWorkerPool(MigratingWorkerPool):
         on_compute_ready,
     ) -> TurboServeOwnership:
         self.migrations.append((pipeline_session_id, target_worker_id))
+        self.migration_started.set()
+        if self.delay_compute_ready:
+            await self.release_compute_ready.wait()
         on_compute_ready()
         self.compute_ready.set()
         await self.release_residual.wait()
@@ -268,6 +274,43 @@ def test_runtime_publishes_progressive_compute_owner_and_rolls_back_late_failure
         assert runtime.registry.require(created.record.session_id).worker_id == "worker-0"
         workers = {worker.worker_id: worker for worker in runtime.scheduler.workers()}
         assert workers["worker-0"].session_ids == [created.record.session_id]
+        assert workers["worker-1"].session_ids == []
+
+    asyncio.run(_run())
+
+
+def test_runtime_does_not_reassign_session_that_departs_during_progressive_migration() -> None:
+    async def _run() -> None:
+        config = LiveKitServeConfig(
+            livekit_url="wss://livekit.example",
+            livekit_api_key="key",
+            livekit_api_secret="secret",
+            num_workers=2,
+            worker_gpu_map="0;1",
+            max_sessions_per_worker=2,
+        )
+        pool = ProgressiveMigratingWorkerPool(delay_compute_ready=True)
+        runtime = LiveKitServeRuntime(
+            config=config,
+            pipeline_file="pipeline.py",
+            token_service=FakeTokenService(),
+            worker_pool=pool,
+        )
+        created = runtime.create_session(SessionCreateRequest(identity="controller-1"))
+        runtime.on_pipeline_session(created.record.session_id, "pipeline-1")
+
+        migration = asyncio.create_task(runtime.migrate_session(created.record.session_id, "worker-1"))
+        await asyncio.wait_for(pool.migration_started.wait(), timeout=1.0)
+        runtime.on_session_finished("worker-0", created.record.session_id)
+        pool.release_compute_ready.set()
+        await asyncio.wait_for(pool.compute_ready.wait(), timeout=1.0)
+        pool.release_residual.set()
+        ownership = await migration
+
+        assert ownership.worker_id == "worker-1"
+        assert runtime.registry.require(created.record.session_id).status == "closed"
+        workers = {worker.worker_id: worker for worker in runtime.scheduler.workers()}
+        assert workers["worker-0"].session_ids == []
         assert workers["worker-1"].session_ids == []
 
     asyncio.run(_run())

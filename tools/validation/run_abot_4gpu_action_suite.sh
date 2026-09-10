@@ -635,6 +635,7 @@ for workload in "${WORKLOADS[@]}"; do
   PYTHONPATH="${REPO_ROOT}" "${PYTHON_BIN}" tools/validation/augment_abot_cpr_quality.py \
     --result "${RUN_DIR}/result.json" \
     --dispatch-trace "${RUN_DIR}/dispatch-trace.jsonl" \
+    --action-trace "${TRACE_PATH}" \
     --profile "${RUN_PROFILE_PATH}" \
     --output "${RUN_DIR}/result.json" \
     >"${RUN_DIR}/quality-cpr.log"

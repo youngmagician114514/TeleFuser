@@ -632,9 +632,20 @@ class LiveKitServeRuntime:
             nonlocal compute_owner_published
             if compute_owner_published:
                 return
-            self.scheduler.reassign_session(session_id, target_worker_id)
-            self.registry.assign_worker(session_id, target_worker_id)
-            compute_owner_published = True
+            # Session departure and first-layer readiness are independent
+            # asynchronous events. Serialize this publication with
+            # ``_finish_session`` so a room that has already left is not
+            # resurrected (or reported as a failed migration) merely because
+            # its in-flight transfer reached the compute boundary. The worker
+            # pool defers model close while migration is active and reclaims
+            # the committed target in its transaction ``finally`` block.
+            with self._lock:
+                current = self.registry.get(session_id)
+                if current is None or current.status in TERMINAL_SESSION_STATUSES:
+                    return
+                self.scheduler.reassign_session(session_id, target_worker_id)
+                self.registry.assign_worker(session_id, target_worker_id)
+                compute_owner_published = True
             if compute_ready_callback is not None:
                 compute_ready_callback()
 
@@ -651,8 +662,15 @@ class LiveKitServeRuntime:
                 publish_compute_owner()
         except Exception as exc:
             if compute_owner_published:
-                self.scheduler.reassign_session(session_id, source_worker_id)
-                self.registry.assign_worker(session_id, source_worker_id)
+                # A late residual-transfer failure can itself race session
+                # departure. Roll back public ownership only while the room
+                # remains live; a terminal session has already been removed
+                # from the admission scheduler and must stay terminal.
+                with self._lock:
+                    current = self.registry.get(session_id)
+                    if current is not None and current.status not in TERMINAL_SESSION_STATUSES:
+                        self.scheduler.reassign_session(session_id, source_worker_id)
+                        self.registry.assign_worker(session_id, source_worker_id)
             self._serving_metrics.record_migration(success=False, error=str(exc))
             raise
         self._serving_metrics.record_migration(
