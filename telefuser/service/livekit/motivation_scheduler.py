@@ -599,12 +599,14 @@ class MigrationEstimator(Protocol):
 
 
 class LocalMigrationEstimator:
-    """Estimate the blocking first-layer boundary, not background drain time.
+    """Estimate the route-ready critical path, not background transfer time.
 
     ``migration_cost_seconds`` remains as a compatibility alias for callers
     that only have one prior. New callers should provide the measured
-    ``first_layer_ready_seconds`` and optionally retain wire/drain telemetry.
-    Only the first-layer value affects ``ready_at`` and scheduler scoring; the
+    route-ready duration through the legacy ``first_layer_ready_seconds``
+    field and optionally retain wire/drain telemetry. The field name remains
+    stable for existing profiles, but its runtime value includes source
+    quiesce, metadata export, target preparation, and first-layer DMA. The
     residual transfer and source cleanup are deliberately non-blocking.
     """
 
@@ -671,8 +673,8 @@ class LocalMigrationEstimator:
         ready_at = max(now + first_layer_ready, session.migration_ready_at)
         return MigrationEstimate(
             ready_at=ready_at,
-            # Scheduler cost is the target's first usable layer only. Wire
-            # completion and source drain overlap with target compute.
+            # Scheduler cost ends when the target route is usable. Residual
+            # wire completion and source cleanup overlap target compute.
             cost_seconds=max(0.0, ready_at - now),
             required=True,
             first_layer_ready_seconds=first_layer_ready,

@@ -40,6 +40,7 @@ _PUBLISHER_FRAME_CREDIT_TARGET_SECONDS_ENV = "TELEFUSER_ABOT_PUBLISHER_FRAME_CRE
 _PUBLISHER_FRAME_CREDIT_TARGET_FRAMES_ENV = "TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_TARGET_FRAMES"
 _PUBLISHER_FRAME_CREDIT_RESERVE_FRAMES_ENV = "TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_RESERVE_FRAMES"
 _PUBLISHER_FRAME_CREDIT_GUARD_MS_ENV = "TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_GUARD_MS"
+_OUTPUT_GATE_ENABLED_ENV = "TELEFUSER_ABOT_OUTPUT_GATE_ENABLED"
 _DEFAULT_BATCH_COMPUTE_PROFILE = "none"
 _BATCH_COMPUTE_PROFILE_ENV = "TELEFUSER_ABOT_BATCH_COMPUTE_PROFILE"
 _DEFAULT_BATCH_COMPUTE_SAFETY_FACTOR = 1.10
@@ -157,6 +158,17 @@ def _publisher_frame_credit_from_environment() -> tuple[bool, float, int | None,
     return enabled, target_seconds, target_frames, reserve_frames, guard_ms
 
 
+def _output_gate_from_environment() -> bool:
+    """Whether downstream LiveKit readiness gates model dispatch admission."""
+
+    raw = os.getenv(_OUTPUT_GATE_ENABLED_ENV, "true").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{_OUTPUT_GATE_ENABLED_ENV} must be a boolean")
+
+
 def _batch_compute_profile_from_environment() -> tuple[str, dict[int, float]]:
     """Return an explicit, hardware-specific cold-start batch timing profile."""
     name = os.getenv(_BATCH_COMPUTE_PROFILE_ENV, _DEFAULT_BATCH_COMPUTE_PROFILE).strip().lower()
@@ -200,6 +212,7 @@ def get_service(gpu_num: int = 1, gpu_ids: list[str] | None = None) -> ABotWorld
     ) = _publisher_frame_credit_from_environment()
     batch_compute_profile_name, batch_compute_prior_seconds = _batch_compute_profile_from_environment()
     batch_compute_safety_factor = _batch_compute_safety_factor_from_environment()
+    output_gate_enabled = _output_gate_from_environment()
     pipeline = get_pipeline(device_id=device_id, pipeline_class=ABotWorldInteractivePipeline)
     return ABotWorldLiveKitService(
         pipeline,
@@ -207,6 +220,7 @@ def get_service(gpu_num: int = 1, gpu_ids: list[str] | None = None) -> ABotWorld
         # 4-GPU/16-session trace explicitly selects B=4 through
         # TELEFUSER_ABOT_MAX_BATCH_SIZE=4 on every model worker.
         default_fps=12,
+        output_gate_enabled=output_gate_enabled,
         default_session_config={
             "image_path": str(_DEFAULT_IMAGE_PATH),
             "prompt": DEFAULT_PROMPT,

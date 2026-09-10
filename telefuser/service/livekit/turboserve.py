@@ -453,8 +453,9 @@ class TurboServeRuntimeCalibration:
     """Measured values for migration-aware placement.
 
     ``average_migration_total_ms`` remains an observability fallback for old
-    backends. Split-aware backends should publish first-layer readiness; that
-    value is the only migration latency charged to a placement decision.
+    backends. Split-aware backends should publish end-to-end route readiness;
+    that value is the only migration latency charged to placement. Raw
+    first-layer DMA is retained to diagnose the transfer engine itself.
     """
 
     average_migration_total_ms: float = 0.0
@@ -464,6 +465,10 @@ class TurboServeRuntimeCalibration:
     average_transfer_complete_ms: float = 0.0
     average_blocking_drain_ms: float = 0.0
     average_background_cleanup_ms: float = 0.0
+    # New fields remain after the original positional layout.
+    average_route_ready_ms: float = 0.0
+    p50_route_ready_ms: float = 0.0
+    p95_route_ready_ms: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -512,9 +517,18 @@ class TurboServeLatencyModel:
     )
 
     def migration_cost_ms(self, session: TurboServeSessionView, calibration: TurboServeRuntimeCalibration) -> float:
-        # Publisher/source drain overlaps target computation and is not a
-        # placement-blocking cost. Prefer measured first-layer readiness; the
-        # full-E2E value is retained only for pre-split backend compatibility.
+        # Charge the complete route-ready critical path. Raw first-layer DMA
+        # alone omits drain/export/target preparation and made migration look
+        # almost free to the scheduler. The full-E2E value is retained only
+        # for pre-split backend compatibility.
+        # Use the robust typical route-ready value for optimization. Keep P95
+        # separately for tail reporting/admission safeguards; one first-time
+        # CUDA allocation must not make every subsequent move look seconds
+        # long to the placement search.
+        if calibration.p50_route_ready_ms > 0:
+            return calibration.p50_route_ready_ms
+        if calibration.average_route_ready_ms > 0:
+            return calibration.average_route_ready_ms
         if calibration.average_first_layer_ready_ms > 0:
             return calibration.average_first_layer_ready_ms
         if calibration.average_migration_total_ms > 0:

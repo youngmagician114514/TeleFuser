@@ -4,9 +4,12 @@ import pytest
 
 from telefuser.service.livekit.turboserve import (
     TurboServeAutoscalingController,
+    TurboServeLatencyModel,
     TurboServeOwnershipTable,
     TurboServePlacementController,
+    TurboServeRuntimeCalibration,
     TurboServeSessionDemand,
+    TurboServeSessionView,
     TurboServeWorkerLoad,
     TurboServeWorkloadDetector,
 )
@@ -27,6 +30,20 @@ def test_workload_detector_reports_activity_volatility_and_chunk_latency() -> No
     assert snapshot.mean_chunk_seconds == pytest.approx(0.3)
     assert snapshot.p95_chunk_seconds == pytest.approx(0.4)
     assert snapshot.activation_volatility > 0
+
+
+def test_migration_cost_prefers_end_to_end_route_ready_calibration() -> None:
+    model = TurboServeLatencyModel()
+    session = TurboServeSessionView("session-a", True, state_size_mb=1024)
+    calibration = TurboServeRuntimeCalibration(
+        average_migration_total_ms=500,
+        average_first_layer_ready_ms=1.5,
+        average_route_ready_ms=205,
+        p50_route_ready_ms=185,
+        p95_route_ready_ms=900,
+    )
+
+    assert model.migration_cost_ms(session, calibration) == pytest.approx(185)
 
 
 def test_placement_retains_owner_and_rebalance_accounts_for_migration_cost() -> None:

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from tools.validation.augment_abot_cpr_quality import (
     augment_result,
     collect_dispatch_quality,
+    collect_producer_metrics,
     load_profile_quality,
 )
 
@@ -57,3 +59,80 @@ def test_quality_join_interpolates_b3_and_adjusts_cpr(tmp_path: Path) -> None:
     )
     assert result["quality_cpr"]["q_world_frame_weighted"] == 0.6
     assert result["phase_results"][0]["summary"]["quality_cpr"]["quality_adjusted_cpr_proxy"] == 0.738462
+
+
+def test_producer_metrics_credit_all_action_and_idle_frames_without_transport(tmp_path: Path) -> None:
+    profile = tmp_path / "profile.csv"
+    trace = tmp_path / "dispatch.jsonl"
+    _write_profile(profile)
+    rows = [
+        {
+            "event_type": "model_dispatch",
+            "outcome": "ok",
+            "batch_size": 1,
+            "model_completed_monotonic_seconds": 10.0,
+            "model_duration_seconds": 0.4,
+            "sessions": [
+                {
+                    "session_id": "server-1",
+                    "motivation_kind": "action",
+                    "fidelity": "b1_s2_w6_rho0_bf16",
+                    "frames": 12,
+                    "fps": 12,
+                    "queue_wait_seconds": 0.1,
+                    "output_gate_enabled": 0,
+                }
+            ],
+        },
+        {
+            "event_type": "model_dispatch",
+            "outcome": "ok",
+            "batch_size": 2,
+            "model_completed_monotonic_seconds": 10.5,
+            "model_duration_seconds": 1.1,
+            "sessions": [
+                {
+                    "session_id": "server-1",
+                    "motivation_kind": "idle",
+                    "fidelity": "b2_s2_w6_rho0_bf16",
+                    "frames": 12,
+                    "fps": 12,
+                    "queue_wait_seconds": 0.1,
+                    "output_gate_enabled": 0,
+                }
+            ],
+        },
+        {
+            "event_type": "model_dispatch",
+            "outcome": "ok",
+            "batch_size": 4,
+            "model_completed_monotonic_seconds": 13.0,
+            "model_duration_seconds": 0.7,
+            "sessions": [
+                {
+                    "session_id": "server-1",
+                    "motivation_kind": "action",
+                    "fidelity": "b4_s2_w6_rho0_bf16",
+                    "frames": 12,
+                    "fps": 12,
+                    "queue_wait_seconds": 0.1,
+                    "output_gate_enabled": 0,
+                }
+            ],
+        },
+    ]
+    trace.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    metrics = collect_producer_metrics(trace, load_profile_quality(profile))
+
+    assert metrics["jobs_completed"] == 3
+    assert metrics["action_jobs_completed"] == 2
+    assert metrics["idle_jobs_completed"] == 1
+    assert metrics["generated_frames"] == 36
+    assert metrics["producer_cpr"] == 0.75
+    assert metrics["producer_slo_attainment"] == 0.666667
+    assert metrics["producer_fps_per_engaged_session"] == 9.0
+    assert metrics["normalized_quality"] == 0.958974
+    assert metrics["quality_adjusted_cpr"] == 0.719231
+    assert metrics["first_action_job_latency_p95_seconds"] == 0.5
+    assert metrics["output_gate_enabled_values"] == [0]

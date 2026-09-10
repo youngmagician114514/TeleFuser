@@ -88,6 +88,17 @@ def _model_output_eos(session_id: str) -> dict[str, Any]:
     }
 
 
+def _successful_dispatch_trace(session_id: str, *, worker_id: str) -> dict[str, Any]:
+    return {
+        "type": "model_dispatch_trace",
+        "worker_id": worker_id,
+        "trace": {
+            "outcome": "ok",
+            "sessions": [{"session_id": session_id, "job_id": f"{session_id}:job-1"}],
+        },
+    }
+
+
 def test_nccl_source_preflight_rejects_cpu_leaves_before_peer_receive() -> None:
     with pytest.raises(RuntimeError, match="source tensors must reside on CUDA"):
         _validate_nccl_source_leaves({("taew_decode_state", "decoder_memory"): torch.zeros(1)})
@@ -533,8 +544,9 @@ def test_migration_records_transport_phase_diagnostics(monkeypatch) -> None:
         assert diagnostics["last"]["outcome"] == "success"
         assert diagnostics["last"]["state_bytes"] == 128
         assert all(diagnostics["phase_timings"][phase]["success"] == 1 for phase in (
-            "drain", "pause", "export", "prepare_recv", "transfer", "commit_source", "route_commit"
+            "pause", "export", "prepare_recv", "transfer", "compute_ready", "commit_source", "route_commit"
         ))
+        assert diagnostics["phase_timings"]["drain"]["count"] == 0
 
     asyncio.run(run())
 
@@ -630,6 +642,7 @@ def test_source_cleanup_failure_preserves_committed_target_owner(monkeypatch) ->
         assert "nccl_abort_source" not in requests
         snapshot = pool.turboserve_snapshot()
         assert snapshot["migration_cleanup_failures"] == 1
+        assert snapshot["migration_calibration"]["average_route_ready_ms"] > 0
         assert snapshot["migration_diagnostics"]["success_total"] == 1
         assert snapshot["migration_diagnostics"]["phase_timings"]["route_commit"]["success"] == 1
         assert snapshot["migration_diagnostics"]["phase_timings"]["commit_source"]["failures"] == 1
@@ -669,6 +682,8 @@ def test_migration_pause_failure_resumes_source(monkeypatch) -> None:
                 }
             if request_type == "model_output_pause":
                 paused = True
+            if request_type == "nccl_export":
+                return {"result": {"tensor_manifest": [], "state_bytes": 128}}
             return {"result": True}
 
         monkeypatch.setattr(pool, "_wait_for_model_output_drain", fake_parent_drain)
@@ -766,7 +781,7 @@ def test_migration_cancellation_rolls_back_state(monkeypatch) -> None:
     asyncio.run(run())
 
 
-def test_migration_publishes_compute_route_after_complete_copy(monkeypatch) -> None:
+def test_migration_publishes_compute_route_at_first_layer_ready(monkeypatch) -> None:
     async def run() -> None:
         pool = _pool()
         pool._active_workers = {"worker-0", "worker-1"}
@@ -776,7 +791,9 @@ def test_migration_publishes_compute_route_after_complete_copy(monkeypatch) -> N
         pool._ownership.register("pipeline-1", "worker-0")
         pool._model_outputs["pipeline-1"] = asyncio.Queue(maxsize=1)
         sent: list[tuple[str, dict[str, object]]] = []
+        handled_traces: list[dict[str, Any]] = []
         pool._send = lambda worker_id, command: sent.append((worker_id, command))
+        monkeypatch.setattr(pool, "_handle_model_dispatch_trace", handled_traces.append)
         transfer_started = asyncio.Event()
         transfer_release = asyncio.Event()
         active_transfer_requests: set[str] = set()
@@ -820,14 +837,17 @@ def test_migration_publishes_compute_route_after_complete_copy(monkeypatch) -> N
                 "session_id": "pipeline-1",
             }
         )
-        # First-layer readiness is only an internal transport signal.  The
-        # parent must keep the source route authoritative until every cache
-        # tensor (including scalar cursor state) has arrived at the target.
-        await asyncio.sleep(0)
-        assert not compute_ready.is_set()
+        # First-layer readiness is sufficient for the provisional direct path.
+        # The ownership table remains source-authoritative until the complete
+        # transfer commits, so a late copy failure can still roll back safely.
+        await asyncio.wait_for(compute_ready.wait(), timeout=1.0)
         assert not migration.done()
-        assert pool._pipeline_routes["pipeline-1"] == "worker-0"
+        assert pool._pipeline_routes["pipeline-1"] == "worker-1"
         assert pool._ownership.owner("pipeline-1").worker_id == "worker-0"
+        pool._dispatch_event(_successful_dispatch_trace("pipeline-1", worker_id="worker-1"))
+        # Compute may finish on the provisional target, but its scheduler
+        # lease cannot commit until the residual state transfer commits.
+        assert handled_traces == []
 
         transfer_release.set()
         ownership = await migration
@@ -835,6 +855,7 @@ def test_migration_publishes_compute_route_after_complete_copy(monkeypatch) -> N
         assert compute_ready.is_set()
         assert ownership.worker_id == "worker-1"
         assert pool._ownership.owner("pipeline-1").worker_id == "worker-1"
+        assert handled_traces[0]["trace"]["outcome"] == "ok"
         pool.push_model_chunk("pipeline-1", {"type": "action", "action": ["W"]})
         assert sent[-1][0] == "worker-1"
         pool._dispatch_event(
@@ -863,7 +884,9 @@ def test_complete_copy_failure_replays_controls_without_exposing_target(monkeypa
         pool._ownership.register("pipeline-1", "worker-0")
         pool._model_outputs["pipeline-1"] = asyncio.Queue(maxsize=1)
         sent: list[tuple[str, dict[str, object]]] = []
+        handled_traces: list[dict[str, Any]] = []
         pool._send = lambda worker_id, command: sent.append((worker_id, command))
+        monkeypatch.setattr(pool, "_handle_model_dispatch_trace", handled_traces.append)
         transfer_started = asyncio.Event()
         transfer_release = asyncio.Event()
         active_transfer_requests: set[str] = set()
@@ -909,12 +932,13 @@ def test_complete_copy_failure_replays_controls_without_exposing_target(monkeypa
                 "session_id": "pipeline-1",
             }
         )
-        await asyncio.sleep(0)
-        assert not compute_ready.is_set()
-        assert pool._pipeline_routes["pipeline-1"] == "worker-0"
+        await asyncio.wait_for(compute_ready.wait(), timeout=1.0)
+        assert pool._pipeline_routes["pipeline-1"] == "worker-1"
         assert pool._ownership.owner("pipeline-1").worker_id == "worker-0"
         control = {"type": "action", "action": ["D"]}
         pool.push_model_chunk("pipeline-1", control)
+        pool._dispatch_event(_successful_dispatch_trace("pipeline-1", worker_id="worker-1"))
+        assert handled_traces == []
 
         transfer_release.set()
         with pytest.raises(RuntimeError, match="late NCCL failure"):
@@ -929,6 +953,8 @@ def test_complete_copy_failure_replays_controls_without_exposing_target(monkeypa
             if worker_id == "worker-0" and command.get("type") == "model_push"
         ]
         assert replayed[-1]["chunk"] == control
+        assert handled_traces[0]["trace"]["outcome"] == "error"
+        assert handled_traces[0]["trace"]["error"] == "provisional migration rolled back"
         assert "pipeline-1" not in pool._provisional_migration_controls
         assert "pipeline-1" not in pool._provisional_model_events
 

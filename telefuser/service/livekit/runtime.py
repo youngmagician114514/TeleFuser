@@ -853,6 +853,9 @@ class LiveKitServeRuntime:
                 runtime_calibration=TurboServeRuntimeCalibration(
                     average_migration_total_ms=float(calibration.get("average_total_ms", 0.0)),
                     average_first_layer_ready_ms=float(calibration.get("average_first_layer_ready_ms", 0.0)),
+                    average_route_ready_ms=float(calibration.get("average_route_ready_ms", 0.0)),
+                    p50_route_ready_ms=float(calibration.get("p50_route_ready_ms", 0.0)),
+                    p95_route_ready_ms=float(calibration.get("p95_route_ready_ms", 0.0)),
                     average_transfer_complete_ms=float(calibration.get("average_transfer_complete_ms", 0.0)),
                     average_blocking_drain_ms=float(calibration.get("average_blocking_drain_ms", 0.0)),
                     average_background_cleanup_ms=float(calibration.get("average_background_cleanup_ms", 0.0)),

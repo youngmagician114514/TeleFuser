@@ -423,6 +423,55 @@ def test_policy_batch_rechecks_output_credit_before_accepting_stale_lease() -> N
         service.stop()
 
 
+def test_compute_side_output_mode_accepts_policy_lease_despite_transport_backlog() -> None:
+    service, _ = _service(
+        output_queue_size=2,
+        output_gate_enabled=False,
+        publisher_frame_credit_enabled=True,
+        max_batch_size=1,
+        control_idle_timeout=30,
+    )
+    with service._scheduler_condition:
+        service._scheduler_paused = True
+    service.configure_session_capacity(1)
+    session_id = _create(service, "compute-side-output")
+    state = service._session(session_id)
+    assert state is not None
+    try:
+        assert _take_and_notify(service, state)["type"] == "preview"
+        assert service.enable_publisher_frame_tracking(session_id)
+        state.output_queue.put({"type": "chunk", "index": 0, "frames": [object()] * 12})
+        with state.lock:
+            state.publisher_unsubmitted_frames = 48
+            state.pacing_ready_at = time.monotonic() + 10.0
+
+        service.push_batch(
+            [
+                (
+                    session_id,
+                    {
+                        "type": "control_state",
+                        "controls": ["KeyW"],
+                        "motivation": {
+                            "job_id": "compute-side:action:1",
+                            "kind": "action",
+                            "batch_size": 1,
+                            "fidelity": "b1_s4_w18_rho0_bf16",
+                            "one_shot": True,
+                        },
+                    },
+                )
+            ]
+        )
+
+        assert state.in_flight is True
+        assert service.runtime_metrics()["output_gate_enabled"] == 0
+        assert service.runtime_metrics()["policy_batch_backpressure_rejections"] == 0
+        assert service._uses_publisher_frame_credit(state) is False
+    finally:
+        service.stop()
+
+
 def test_motivation_one_shot_control_emits_one_chunk() -> None:
     service, pipeline = _service(output_queue_size=4, max_batch_size=1, control_idle_timeout=30)
     service.configure_session_capacity(1)

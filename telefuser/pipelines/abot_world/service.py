@@ -192,6 +192,7 @@ class ABotWorldLiveKitService:
         default_fps: int = 12,
         default_session_config: Mapping[str, object] | None = None,
         output_queue_size: int = _DEFAULT_OUTPUT_QUEUE_SIZE,
+        output_gate_enabled: bool = True,
         control_idle_timeout: float = 10.0,
         close_timeout: float = 300.0,
         max_batch_size: int = 8,
@@ -265,6 +266,12 @@ class ABotWorldLiveKitService:
         self.default_fps = int(default_fps)
         self.default_session_config = dict(default_session_config or {})
         self.output_queue_size = int(output_queue_size)
+        # Production can make compute admission follow the downstream video
+        # publisher. Paper/producer-capacity runs disable this gate: a model
+        # completion is then the logical sink boundary and all frames in the
+        # chunk count, while the bounded LiveKit queue remains best-effort
+        # transport observability rather than scheduler feedback.
+        self.output_gate_enabled = bool(output_gate_enabled)
         self.control_idle_timeout = float(control_idle_timeout)
         # This is independent of batching_window_seconds: the latter is also
         # an early-pacing slack, while this is a bounded timeout used to wait
@@ -812,18 +819,15 @@ class ABotWorldLiveKitService:
             wait_for_publisher=False,
         )
         session = state.pipeline_session
-        # Idle suspension and NCCL export are both allowed to run from worker
-        # threads.  Serialize them with the pipeline execution lock and mark
-        # the session MIGRATING before releasing it.  If suspension acquired
-        # the lock first, it completes and we restore the tensors here; if the
-        # migration acquired it first, suspend_interactive_session observes
-        # MIGRATING and leaves the source buffers untouched.  Without this
-        # handshake a full trace could export a mixed (or entirely CPU) tree.
-        execution_lock = getattr(self.pipeline, "_execution_lock", None)
-        lock_context = execution_lock if execution_lock is not None else contextlib.nullcontext()
+        # This session is already at its own chunk boundary. Protect its
+        # lifecycle with the per-session lock instead of waiting behind an
+        # unrelated GPU-wide model invocation. Idle suspension takes the same
+        # session lock and observes MIGRATING, so it cannot move these tensors
+        # after we publish their references. A genuinely suspended session
+        # still uses the regular restore path (and its execution lock).
         session_lock = getattr(session, "lock", None)
         session_lock_context = session_lock if session_lock is not None else contextlib.nullcontext()
-        with lock_context, session_lock_context:
+        with session_lock_context:
             if (
                 getattr(session, "lifecycle", None) == ABotWorldSessionLifecycle.SUSPENDED
                 or getattr(session, "is_resident", True) is False
@@ -1171,6 +1175,7 @@ class ABotWorldLiveKitService:
                     "deadline_batch_wait_timeouts": self._deadline_batch_wait_timeouts,
                     "deadline_batch_filler_dispatches": self._deadline_batch_filler_dispatches,
                     "policy_batch_backpressure_rejections": self._policy_batch_backpressure_rejections,
+                    "output_gate_enabled": int(self.output_gate_enabled),
                     "publisher_frame_credit_enabled": int(self.publisher_frame_credit_enabled),
                     "publisher_frame_credit_target_seconds": round(self.publisher_frame_credit_target_seconds, 6),
                     "publisher_frame_credit_target_frames": (
@@ -1296,11 +1301,13 @@ class ABotWorldLiveKitService:
                 "emitted_frames_before": self._trace_number(getattr(session, "emitted_frames", None)),
                 "emitted_frames_after": None,
                 "frames": None,
+                "fps": int(state.config["fps"]),
                 "controls": sorted(str(key) for key, enabled in controls.items() if enabled),
                 "motivation_kind": motivation_kind,
                 "motivation_job_id": motivation_job_id,
                 "queue_wait_seconds": max(0.0, selected_at - ready_at),
                 "frame_credit_enabled": int(self._uses_publisher_frame_credit(state)),
+                "output_gate_enabled": int(self.output_gate_enabled),
                 "queued_video_frames": queued_video_frames,
                 "frame_credit_target_frames": self._frame_credit_target_frames(state),
                 "publisher_unsubmitted_frames": state.publisher_unsubmitted_frames,
@@ -1499,7 +1506,11 @@ class ABotWorldLiveKitService:
         pacing_buffered = 0
         for state in self._sessions.values():
             with state.lock:
-                lossless_blocked = state.config["delivery_mode"] == "lossless" and state.output_queue.full()
+                lossless_blocked = (
+                    self.output_gate_enabled
+                    and state.config["delivery_mode"] == "lossless"
+                    and state.output_queue.full()
+                )
                 idle_one_shot = state.motivation_one_shot and state.motivation_kind == "idle"
                 if (
                     state.active
@@ -1510,7 +1521,7 @@ class ABotWorldLiveKitService:
                 ):
                     if state.ready_since is None:
                         state.ready_since = now
-                    if state.config["delivery_mode"] == "latest":
+                    if self.output_gate_enabled and state.config["delivery_mode"] == "latest":
                         frame_credit_enabled = self._uses_publisher_frame_credit(state)
                         buffered_video_payloads = 0 if frame_credit_enabled else self._queued_video_payloads(state)
                         pacing_ready_at = (
@@ -1539,7 +1550,8 @@ class ABotWorldLiveKitService:
                     control_expiry = state.last_control_at + state.control_idle_timeout
                     next_wake_at = control_expiry if next_wake_at is None else min(next_wake_at, control_expiry)
                     if (
-                        state.config["delivery_mode"] == "latest"
+                        self.output_gate_enabled
+                        and state.config["delivery_mode"] == "latest"
                         and not state.in_flight
                         and not state.migrating
                         and (self._uses_publisher_frame_credit(state) or not self._queued_video_payloads(state))
@@ -1606,7 +1618,11 @@ class ABotWorldLiveKitService:
             or self.max_batch_size < 2
             or state.scheduled_chunks == 0
             or state.config["delivery_mode"] != "latest"
-            or (not self._uses_publisher_frame_credit(state) and self._queued_video_payloads(state))
+            or (
+                self.output_gate_enabled
+                and not self._uses_publisher_frame_credit(state)
+                and self._queued_video_payloads(state)
+            )
         ):
             return 0.0, False
 
@@ -1767,6 +1783,7 @@ class ABotWorldLiveKitService:
                     or self._batch_key(candidate) != pivot_key
                     # A generated chunk owned by the publisher has an external
                     # dequeue time, so it cannot be a rendezvous promise.
+                    or not self.output_gate_enabled
                     or (not self._uses_publisher_frame_credit(candidate) and self._queued_video_payloads(candidate))
                 ):
                     continue
@@ -1846,6 +1863,9 @@ class ABotWorldLiveKitService:
         credit gates used by ``_ready_sessions`` prevents a stale lease from
         producing another chunk that would be evicted immediately.
         """
+
+        if not self.output_gate_enabled:
+            return None
 
         if state.config["delivery_mode"] == "lossless" and state.output_queue.full():
             return "lossless_output_queue_full"
@@ -2337,7 +2357,8 @@ class ABotWorldLiveKitService:
         """Whether this continuation has an authoritative publisher credit."""
 
         return bool(
-            self.publisher_frame_credit_enabled
+            self.output_gate_enabled
+            and self.publisher_frame_credit_enabled
             and state.publisher_frame_tracking_enabled
             and state.config["delivery_mode"] == "latest"
             and state.scheduled_chunks > 0

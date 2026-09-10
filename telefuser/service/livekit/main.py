@@ -108,11 +108,10 @@ def run_stream_server(
                 migration_enabled=motivation_migration and normalized_policy != "fifo",
                 policy_name=normalized_policy,
             ),
-            # Reuse the already documented runtime migration estimate so the
-            # policy does not treat a remote GPU as free while an asynchronous
-            # state transfer is still in flight.
+            # Charge the complete route-ready critical path. Residual layer
+            # copy and source cleanup overlap target compute and are excluded.
             migration_estimator=LocalMigrationEstimator(
-                first_layer_ready_seconds=config.turboserve_migration_eta,
+                first_layer_ready_seconds=config.motivation_migration_route_ready_seconds,
             ),
             migration_policy=MigrationCooldownPolicy(
                 cooldown_seconds=config.motivation_migration_cooldown_seconds,

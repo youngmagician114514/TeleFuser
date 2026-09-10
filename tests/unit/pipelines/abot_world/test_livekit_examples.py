@@ -21,6 +21,7 @@ def test_livekit_service_entrypoint_builds_single_gpu_abot_service(monkeypatch: 
     monkeypatch.delenv("TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_TARGET_FRAMES", raising=False)
     monkeypatch.delenv("TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_RESERVE_FRAMES", raising=False)
     monkeypatch.delenv("TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_GUARD_MS", raising=False)
+    monkeypatch.delenv("TELEFUSER_ABOT_OUTPUT_GATE_ENABLED", raising=False)
     monkeypatch.delenv("TELEFUSER_ABOT_BATCH_COMPUTE_PROFILE", raising=False)
     monkeypatch.delenv("TELEFUSER_ABOT_BATCH_COMPUTE_SAFETY_FACTOR", raising=False)
 
@@ -40,6 +41,7 @@ def test_livekit_service_entrypoint_builds_single_gpu_abot_service(monkeypatch: 
     assert service.scheduler_mode == "batched"
     assert service.max_batch_size == 2
     assert not service.publisher_frame_credit_enabled
+    assert service.output_gate_enabled
     assert service.default_session_config["seed"] == 42
     assert service.default_session_config["prompt"] == service_example.DEFAULT_PROMPT
     assert service.batch_compute_profile_name == "none"
@@ -58,6 +60,7 @@ def test_livekit_service_entrypoint_selects_batched_four_session_schedule_from_e
     monkeypatch.setenv("TELEFUSER_ABOT_BATCHING_WINDOW_MS", "2")
     monkeypatch.setenv("TELEFUSER_ABOT_MAX_DEADLINE_BATCH_WAIT_MS", "125")
     monkeypatch.setenv("TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_ENABLED", "true")
+    monkeypatch.setenv("TELEFUSER_ABOT_OUTPUT_GATE_ENABLED", "false")
     monkeypatch.setenv("TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_TARGET_SECONDS", "1.5")
     monkeypatch.setenv("TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_TARGET_FRAMES", "36")
     monkeypatch.setenv("TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_RESERVE_FRAMES", "4")
@@ -74,6 +77,7 @@ def test_livekit_service_entrypoint_selects_batched_four_session_schedule_from_e
     assert service.max_deadline_batch_wait_seconds == pytest.approx(0.125)
 
     assert service.publisher_frame_credit_enabled
+    assert not service.output_gate_enabled
     assert service.publisher_frame_credit_target_seconds == pytest.approx(1.5)
     assert service.publisher_frame_credit_target_frames == 36
     assert service.batch_compute_safety_factor == pytest.approx(1.05)
@@ -96,6 +100,7 @@ def test_livekit_service_entrypoint_selects_batched_four_session_schedule_from_e
         ({"TELEFUSER_ABOT_BATCHING_WINDOW_MS": "nan"}, "BATCHING_WINDOW_MS"),
         ({"TELEFUSER_ABOT_MAX_DEADLINE_BATCH_WAIT_MS": "nan"}, "MAX_DEADLINE_BATCH_WAIT_MS"),
         ({"TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_TARGET_FRAMES": "0"}, "TARGET_FRAMES"),
+        ({"TELEFUSER_ABOT_OUTPUT_GATE_ENABLED": "maybe"}, "OUTPUT_GATE_ENABLED"),
         ({"TELEFUSER_ABOT_BATCH_COMPUTE_PROFILE": "not-a-profile"}, "BATCH_COMPUTE_PROFILE"),
     ],
 )

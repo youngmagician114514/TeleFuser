@@ -29,6 +29,7 @@ _MIGRATION_PHASES = (
     "export",
     "prepare_recv",
     "transfer",
+    "compute_ready",
     "commit_source",
     "route_commit",
 )

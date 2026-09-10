@@ -79,6 +79,14 @@ class LiveKitServeConfig(BaseSettings):
             "transfer drain overlaps in background"
         ),
     )
+    motivation_migration_route_ready_seconds: float = Field(
+        default=0.2,
+        ge=0,
+        description=(
+            "Cold-start estimate of the end-to-end migration critical path until the target route is usable; "
+            "online route-ready telemetry supersedes this prior"
+        ),
+    )
     turboserve_min_migration_gain_ms: float = Field(default=40.0, ge=0)
     turboserve_rebalance_iteration_limit: int = Field(default=3, ge=1, le=64)
     motivation_migration_cooldown_seconds: float = Field(

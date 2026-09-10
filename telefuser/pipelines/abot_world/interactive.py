@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 import uuid
@@ -692,8 +693,14 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
         direct_device_tensors: bool,
         migration_layer_readiness: Any | None = None,
     ) -> ABotWorldInteractiveSession:
-        with self._execution_lock:
-            self._release_cuda_graph(snapshot.session_id)
+        # Direct-NCCL restore only adopts already allocated tensor references;
+        # it neither runs the shared model nor mutates an existing session.
+        # Let it overlap unrelated target-GPU inference. CPU restore still
+        # performs device copies and therefore retains the execution lock.
+        execution_context = contextlib.nullcontext() if direct_device_tensors else self._execution_lock
+        with execution_context:
+            if not direct_device_tensors:
+                self._release_cuda_graph(snapshot.session_id)
             generator = torch.Generator(device=self.device)
             generator.set_state(snapshot.generator_state)
             if direct_device_tensors:

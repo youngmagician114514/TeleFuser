@@ -27,6 +27,10 @@ STARTUP_TIMEOUT_SECONDS=900
 # Keep that default for compatibility, but allow a model-production control
 # run to disable the LiveKit handoff gate without editing the launch script.
 FRAME_CREDIT_ENABLED="${ABOT_ACTION_SUITE_FRAME_CREDIT_ENABLED:-1}"
+# The paper suite measures scheduling/model production. Keep LiveKit as an
+# asynchronous transport sink without feeding its queue state back into model
+# admission. Set this to 1 only for a transport-coupled deployment run.
+OUTPUT_GATE_ENABLED="${ABOT_ACTION_SUITE_OUTPUT_GATE_ENABLED:-0}"
 # The service already exposes these publisher-credit controls for controlled
 # runs.  Do not overwrite them here: the runner's fixed 36-frame value made it
 # impossible to separate a producer-capacity measurement from a deliberately
@@ -73,6 +77,8 @@ Options:
   --startup-timeout-seconds N     Wait up to N seconds for TeleFuser startup (default: 900).
   ABOT_ACTION_SUITE_FRAME_CREDIT_ENABLED=0
                                   Disable publisher handoff credit for a compute-side run.
+  ABOT_ACTION_SUITE_OUTPUT_GATE_ENABLED=1
+                                  Couple model admission to LiveKit output readiness (default: 0).
   TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_TARGET_FRAMES=N
                                   Set the publisher-credit high watermark (default: 36).
   TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_TARGET_SECONDS=S
@@ -214,6 +220,8 @@ RUN_ROOT="$(repo_absolute_path "${RUN_ROOT}")"
   || die "--startup-timeout-seconds must be a positive integer"
 [[ "${FRAME_CREDIT_ENABLED}" == 0 || "${FRAME_CREDIT_ENABLED}" == 1 ]] \
   || die "ABOT_ACTION_SUITE_FRAME_CREDIT_ENABLED must be 0 or 1"
+[[ "${OUTPUT_GATE_ENABLED}" == 0 || "${OUTPUT_GATE_ENABLED}" == 1 ]] \
+  || die "ABOT_ACTION_SUITE_OUTPUT_GATE_ENABLED must be 0 or 1"
 [[ "${FRAME_CREDIT_TARGET_SECONDS}" =~ ^[0-9]+([.][0-9]+)?$ ]] \
   || die "TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_TARGET_SECONDS must be a non-negative number"
 [[ "${FRAME_CREDIT_TARGET_FRAMES}" =~ ^[1-9][0-9]*$ ]] \
@@ -275,6 +283,7 @@ echo "  workloads: ${WORKLOADS[*]}"
 echo "  GPU IDs: ${GPU_IDS}"
 echo "  workers: ${NUM_WORKERS}"
 echo "  max sessions/worker: ${MAX_SESSIONS_PER_WORKER}"
+echo "  output gate: ${OUTPUT_GATE_ENABLED} (0=model-completed paper boundary)"
 echo "  publisher frame credit: ${FRAME_CREDIT_ENABLED}"
 echo "  frame-credit target: ${FRAME_CREDIT_TARGET_FRAMES} frames (${FRAME_CREDIT_TARGET_SECONDS}s), reserve ${FRAME_CREDIT_RESERVE_FRAMES}, guard ${FRAME_CREDIT_GUARD_MS}ms"
 echo "  Motivation migration: ${MOTIVATION_MIGRATION_ENABLED}"
@@ -339,6 +348,7 @@ printf '%s\n' \
   "MAX_SESSIONS_PER_WORKER=${MAX_SESSIONS_PER_WORKER}" \
   "STARTUP_TIMEOUT_SECONDS=${STARTUP_TIMEOUT_SECONDS}" \
   "FRAME_CREDIT_ENABLED=${FRAME_CREDIT_ENABLED}" \
+  "OUTPUT_GATE_ENABLED=${OUTPUT_GATE_ENABLED}" \
   "FRAME_CREDIT_TARGET_SECONDS=${FRAME_CREDIT_TARGET_SECONDS}" \
   "FRAME_CREDIT_TARGET_FRAMES=${FRAME_CREDIT_TARGET_FRAMES}" \
   "FRAME_CREDIT_RESERVE_FRAMES=${FRAME_CREDIT_RESERVE_FRAMES}" \
@@ -552,6 +562,7 @@ for workload in "${WORKLOADS[@]}"; do
   TELEFUSER_ABOT_MAX_BATCH_SIZE=4 \
   TELEFUSER_ABOT_BATCHING_WINDOW_MS=2 \
   TELEFUSER_ABOT_MAX_DEADLINE_BATCH_WAIT_MS=1000 \
+  TELEFUSER_ABOT_OUTPUT_GATE_ENABLED="${OUTPUT_GATE_ENABLED}" \
   TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_ENABLED="${FRAME_CREDIT_ENABLED}" \
   TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_TARGET_SECONDS="${FRAME_CREDIT_TARGET_SECONDS}" \
   TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_TARGET_FRAMES="${FRAME_CREDIT_TARGET_FRAMES}" \
