@@ -14,13 +14,22 @@ import argparse
 import csv
 import json
 import math
-import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Mapping
 
+from telefuser.service.livekit.profile_quality import (
+    normalize_profile_qualities,
+    profile_batch_family,
+)
 
-_PROFILE_RE = re.compile(r"^b(?P<batch>[1-9][0-9]*)_(?P<suffix>.+)$")
+class ProfileQualityValues(dict[str, float]):
+    """Mapping of fidelity to semantic Q, with normalization audit metadata."""
+
+    reference_config: str | None
+    reference_raw: float | None
+    normalized: bool
+    batch_invariant: bool
 
 
 def _quality_from_row(row: Mapping[str, str]) -> float:
@@ -38,7 +47,13 @@ def _quality_from_row(row: Mapping[str, str]) -> float:
 
 
 def load_profile_quality(path: Path) -> dict[str, float]:
-    """Load Q_world by fidelity, including the scheduler's B3 interpolation."""
+    """Load semantic Q by fidelity, including conservative B3 interpolation.
+
+    The returned mapping uses the same B-invariant family rule as the runtime
+    scheduler.  Its attributes expose whether the explicit B1/S4/W18
+    denominator was available without changing the mapping API used by older
+    report scripts.
+    """
     by_config: dict[str, float] = {}
     by_suffix: dict[str, dict[int, float]] = defaultdict(dict)
     with path.open(newline="", encoding="utf-8") as handle:
@@ -48,17 +63,27 @@ def load_profile_quality(path: Path) -> dict[str, float]:
                 continue
             quality = _quality_from_row(row)
             by_config[config] = quality
-            match = _PROFILE_RE.fullmatch(config)
-            if match:
-                by_suffix[match.group("suffix")][int(match.group("batch"))] = quality
-    # motivation_scheduler.load_profile_table() uses the conservative lower
-    # quality of B2/B4 when a measured B3 row is absent.
-    for suffix, rows in by_suffix.items():
-        if 3 not in rows and 2 in rows and 4 in rows:
-            by_config[f"b3_{suffix}"] = min(rows[2], rows[4])
+            batch, suffix = profile_batch_family(config)
+            if batch is not None:
+                by_suffix[suffix][batch] = quality
     if not by_config:
         raise ValueError(f"profile contains no quality rows: {path}")
-    return by_config
+    normalization_probe = normalize_profile_qualities(by_config)
+    # motivation_scheduler.load_profile_table() uses the conservative lower
+    # quality of B2/B4 when a measured B3 row is absent in a legacy compact
+    # table. Production tables use the family B1 semantic value.
+    for suffix, rows in by_suffix.items():
+        if 3 not in rows and 2 in rows and 4 in rows:
+            by_config[f"b3_{suffix}"] = (
+                rows.get(1, rows[2]) if normalization_probe.normalized else min(rows[2], rows[4])
+            )
+    normalized = normalize_profile_qualities(by_config)
+    values = ProfileQualityValues(normalized.values)
+    values.reference_config = normalized.reference_config
+    values.reference_raw = normalized.reference_raw
+    values.normalized = normalized.normalized
+    values.batch_invariant = normalized.batch_invariant
+    return values
 
 
 def collect_dispatch_quality(
@@ -119,6 +144,11 @@ def collect_dispatch_quality(
 
 
 def _quality_reference(profile_quality: Mapping[str, float]) -> float:
+    # Runtime/report Q is normalized against the explicit B1/S4/W18 point.
+    # Compact legacy tables without that point retain a max-quality fallback,
+    # which is surfaced as ``normalized=False`` on ProfileQualityValues.
+    if bool(getattr(profile_quality, "normalized", False)):
+        return 1.0
     return max(float(value) for value in profile_quality.values())
 
 
@@ -142,6 +172,7 @@ def augment_result(
             missing_sessions += 1
             session["quality"] = {
                 "q_world_frame_weighted": None,
+                "q_frame_weighted": None,
                 "quality_factor_vs_profile_reference": None,
                 "frames_profiled": 0,
                 "chunks_profiled": 0,
@@ -151,6 +182,7 @@ def augment_result(
         factor = max(0.0, min(1.0, q_world / reference))
         session["quality"] = {
             **dict(quality),
+            "q_frame_weighted": round(q_world, 6),
             "quality_factor_vs_profile_reference": round(factor, 6),
         }
         total_frames += int(quality["frames_profiled"])
@@ -189,13 +221,18 @@ def augment_result(
         phase_quality = {
             "profile_path": str(profile_path),
             "q_world_frame_weighted": total_quality_frames / total_frames if total_frames else None,
+            "q_frame_weighted": total_quality_frames / total_frames if total_frames else None,
             "quality_reference_q_world": round(reference, 6),
+            "quality_reference_q": round(reference, 6),
+            "quality_reference_config": getattr(profile_quality, "reference_config", None),
+            "quality_normalized": bool(getattr(profile_quality, "normalized", False)),
             "quality_factor_mean": round(statistics_mean(q_values) / reference, 6) if q_values else None,
             "cpr_proxy_time_weighted": round(cpr, 6) if cpr is not None else None,
             "quality_adjusted_cpr_proxy": round(quality_cpr, 6) if quality_cpr is not None else None,
             "definition": (
-                "quality_adjusted_cpr_proxy = sum(playable_seconds * Q_world/Q_reference) / "
-                "sum(engaged_seconds); Q_reference is the maximum Q_world in the supplied profile."
+                "quality_adjusted_cpr_proxy = sum(playable_seconds * Q/Q_reference) / "
+                "sum(engaged_seconds); Q is batch-invariant semantic quality and Q_reference is "
+                "the explicit B1/S4/W18 point (legacy compact tables use a max-Q fallback)."
             ),
         }
         existing_cpr = summary.get("cpr_proxy")
@@ -214,7 +251,11 @@ def augment_result(
         "schema_version": "abot_quality_cpr_v1",
         "profile_path": str(profile_path),
         "quality_reference_q_world": round(reference, 6),
+        "quality_reference_q": round(reference, 6),
+        "quality_reference_config": getattr(profile_quality, "reference_config", None),
+        "quality_normalized": bool(getattr(profile_quality, "normalized", False)),
         "q_world_frame_weighted": round(total_quality_frames / total_frames, 6) if total_frames else None,
+        "q_frame_weighted": round(total_quality_frames / total_frames, 6) if total_frames else None,
         "generated_frames_profiled": total_frames,
         "sessions_without_profile_quality": missing_sessions,
         "dispatch_diagnostics": dict(dispatch_diagnostics),

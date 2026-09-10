@@ -281,13 +281,19 @@ class LiveKitServeRuntime:
         if self._motivation_bridge is not None:
             self._motivation_loop = asyncio.get_running_loop()
             controller = self._motivation_bridge.controller
-            if controller.migration_manager is None:
-                controller.migration_manager = SessionStateTransferManager()
-            if controller.migration_backend_factory is None:
-                controller.migration_backend_factory = lambda _request: _RuntimeSessionStateTransferBackend(
-                    self, self._motivation_loop
-                )
-            controller.set_migration_wakeup_callback(self._motivation_bridge.schedule_wakeup)
+            # Only Motivation owns placement and state transfer.  FIFO keeps
+            # each admitted session on its original worker, so do not even
+            # install the runtime migration backend in that mode.
+            if controller.scheduler.policy_name != "fifo":
+                if controller.migration_manager is None:
+                    controller.migration_manager = SessionStateTransferManager()
+                if controller.migration_backend_factory is None:
+                    controller.migration_backend_factory = lambda _request: _RuntimeSessionStateTransferBackend(
+                        self, self._motivation_loop
+                    )
+                controller.set_migration_wakeup_callback(self._motivation_bridge.schedule_wakeup)
+            else:
+                controller.set_migration_wakeup_callback(None)
             controller.set_dispatch_owner_resolver(self._motivation_dispatch_owner)
         await self.worker_pool.start(skip_validation=self.skip_validation)
         with self._lock:

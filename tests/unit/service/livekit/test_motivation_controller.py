@@ -84,7 +84,8 @@ def test_controller_can_build_from_offline_profile_table(tmp_path) -> None:
 
     assert job is not None
     assert invalidated is True
-    assert controller.scheduler.profile_provider.profiles_for(batch_size=1, gpu_id="gpu-0")[0].quality == pytest.approx(0.68)
+    assert controller.scheduler.profile_provider.profiles_for(batch_size=1, gpu_id="gpu-0")[0].quality == pytest.approx(1.0)
+    assert controller.scheduler.profile_provider.profiles_for(batch_size=1, gpu_id="gpu-0")[0].raw_quality == pytest.approx(0.68)
 
 
 def test_controller_registers_gpu_at_worker_start() -> None:
@@ -126,6 +127,30 @@ def test_controller_reserves_and_completes_local_dispatch() -> None:
     assert leases == [lease]
     assert lease.jobs[0].kind == "action"
     assert controller.on_completion(lease, completed_at=0.4)[0].session_id == "s"
+
+
+def test_fifo_controller_disables_idle_and_migration_inputs() -> None:
+    scheduler = MotivationScheduler(
+        StaticMotivationProfileTable(
+            [MotivationProfile(1, "fixed", 0.2, 0.2, 20.0)]
+        ),
+        config=MotivationSchedulerConfig(policy_name="fifo", fifo_fidelity="fixed"),
+    )
+    scheduler.add_gpu(GpuSchedulingState("gpu-0", memory_free_gb=80.0))
+    scheduler.register_session("s", owner_gpu="gpu-0", now=0.0)
+    controller = MotivationRuntimeController(
+        scheduler,
+        dispatch=lambda _lease: None,
+        migration_manager=object(),
+        migration_backend_factory=lambda _request: object(),
+        migration_policy=object(),
+    )
+
+    assert controller.migration_manager is None
+    assert controller.migration_backend_factory is None
+    assert controller.migration_policy is None
+    controller.schedule_once(now=0.0)
+    assert scheduler.session("s").pending_idle is None
 
 
 def test_controller_rejects_physical_owner_mismatch_before_reservation() -> None:

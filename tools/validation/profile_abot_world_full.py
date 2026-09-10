@@ -31,6 +31,7 @@ import torch
 from PIL import Image
 
 from telefuser.pipelines.abot_world.interactive import ABotWorldInteractivePipeline
+from telefuser.service.livekit.profile_quality import normalize_profile_qualities
 from telefuser.utils.video import save_video
 from tools.validation.profile_abot_world_quality import (
     DEFAULT_ACTIONS,
@@ -642,6 +643,23 @@ def _merge_quality(
 ) -> list[dict[str, Any]]:
     quality = {str(row["config"]): row for row in quality_rows}
     merged = []
+    raw_world_quality = {
+        str(row["config"]): float(row["Q_world"])
+        for row in quality_rows
+        if str(row.get("Q_world", "")).strip()
+    }
+    # Keep the raw evaluator columns for audit, but expose the scheduler's
+    # semantic Q as a separate normalized column.  If external action scores
+    # are incomplete, the helper still provides a transparent Q_visual proxy.
+    quality_source = "Q_world"
+    if len(raw_world_quality) != len(quality_rows):
+        quality_source = "Q_visual_proxy"
+        raw_world_quality = {
+            str(row["config"]): float(row["Q_visual"])
+            for row in quality_rows
+            if str(row.get("Q_visual", "")).strip()
+        }
+    normalized = normalize_profile_qualities(raw_world_quality)
     for runtime in runtime_rows:
         row = dict(runtime)
         scores = quality[str(row["config"])]
@@ -656,6 +674,8 @@ def _merge_quality(
             "CLIP_similarity",
         ):
             row[key] = scores[key]
+        row["Q"] = normalized.values.get(str(row["config"]), "")
+        row["Q_source"] = quality_source
         merged.append(row)
     return merged
 
@@ -771,7 +791,9 @@ def _svg_plot(
 
 
 def _write_curves_and_tables(output: Path, rows: Sequence[Mapping[str, Any]]) -> tuple[list[str], list[str]]:
-    quality_key = "Q_world" if all(str(row["Q_world"]).strip() for row in rows) else "Q_visual"
+    quality_key = "Q" if all(str(row.get("Q", "")).strip() for row in rows) else (
+        "Q_world" if all(str(row["Q_world"]).strip() for row in rows) else "Q_visual"
+    )
     latency_flags = _pareto_flags(rows, "latency_ms", False, quality_key)
     throughput_flags = _pareto_flags(rows, "FPS", True, quality_key)
     pareto_rows = []
@@ -809,6 +831,7 @@ def _write_curves_and_tables(output: Path, rows: Sequence[Mapping[str, Any]]) ->
                 "Q_world_delta": ""
                 if not str(row["Q_world"]).strip()
                 else float(row["Q_world"]) - float(reference["Q_world"]),
+                "Q_delta": float(row["Q"]) - float(reference["Q"]) if str(row.get("Q", "")).strip() else "",
             }
         )
     _write_csv(output / "quality_degradation.csv", degradation_rows)
@@ -996,13 +1019,17 @@ def _write_analysis(
         if bmax is not None:
             gain = (float(bmax["FPS"]) / float(b1["FPS"]) - 1.0) * 100.0
             batch_gains.append(f"S={steps}: {gain:+.1f}%")
+    # Q is intentionally batch invariant.  Retain the raw visual drift as a
+    # diagnostic, but do not feed it into the scheduler quality objective.
     batch_quality_drift = max(
         abs(float(row["Q_visual"]) - float(by_key[(1, int(row["S"]), int(row["W"]))]["Q_visual"])) for row in rows
     )
     repeat_failures = [str(row["config"]) for row in rows if not bool(row["repeat_deterministic"])]
     lane_parity_failures = [str(row["config"]) for row in rows if not bool(row["lanes_identical"])]
     parity_batches = sorted({int(row["B"]) for row in rows if not bool(row["lanes_identical"])})
-    quality_metric = "Q_world" if all(str(row["Q_world"]).strip() for row in rows) else "Q_visual proxy"
+    quality_metric = "Q (batch-invariant)" if all(str(row.get("Q", "")).strip() for row in rows) else (
+        "Q_world" if all(str(row["Q_world"]).strip() for row in rows) else "Q_visual proxy"
+    )
     lines = [
         "# ABot-World full fixed-resolution offline profile",
         "",
@@ -1032,10 +1059,9 @@ def _write_analysis(
         f"四卡 B=1 placement 得到 {placement['aggregate_FPS']:.2f} aggregate FPS，"
         f"相对单卡线性 scaling efficiency 为 {placement['scaling_efficiency'] * 100:.1f}%。",
         f"4. **batch 与 fidelity 是否耦合？** 计算收益随 S/W 改变，因此存在系统层耦合。同 seed 的 "
-        f"B-path 最大 Q_visual proxy 漂移为 {batch_quality_drift:.6f}；所有重复都稳定，但 "
+        f"B-path 原始 Q_visual proxy 最大漂移为 {batch_quality_drift:.6f}；所有重复都稳定，但 "
         f"{', '.join(lane_parity_failures) if lane_parity_failures else '没有配置'} 出现 equal-seed lane 像素不一致。"
-        "这说明 batch execution 不是严格 quality-neutral；Q_visual 是相对 baseline 的轨迹/画面相似度，"
-        "不能单独解释为感知质量下降。",
+        "该漂移仅作为测量诊断；调度采用按 S/W 家族固定的 Q，不把 batch 当作质量 knob。",
         f"5. **哪些配置适合 scheduler？** latency–{quality_metric} frontier："
         f"{', '.join(latency_frontier)}。吞吐–{quality_metric} frontier：{', '.join(throughput_frontier)}。"
         "低 S/短 W 适合 latency-critical tier；S=4/W=18 是 quality reference；B 应由队列深度、deadline 和显存决定。"
@@ -1213,6 +1239,8 @@ def main() -> None:
         "Q_temporal",
         "Q_visual",
         "Q_world",
+        "Q",
+        "Q_source",
         "config",
         "sink_frames",
         "latency_std_ms",

@@ -46,6 +46,12 @@ from .motivation_scheduler import (
     StaticMotivationProfileTable,
     load_motivation_profiles_csv,
 )
+from .profile_quality import (
+    DEFAULT_QUALITY_REFERENCE_FIDELITY,
+    QualityNormalization,
+    normalize_profile_qualities,
+    profile_batch_family,
+)
 from .pipeline_router import TurboServePipelineRouter, TurboServeWorkerPipelineView
 from .session_state_transfer import (
     SessionStateTransferBackend,
@@ -100,6 +106,10 @@ __all__ = [
     "MotivationSchedulerConfig",
     "RouterMigrationBackend",
     "load_motivation_profiles_csv",
+    "DEFAULT_QUALITY_REFERENCE_FIDELITY",
+    "QualityNormalization",
+    "normalize_profile_qualities",
+    "profile_batch_family",
     "SessionSchedulingState",
     "StaticMotivationProfileTable",
     "TurboServePipelineRouter",

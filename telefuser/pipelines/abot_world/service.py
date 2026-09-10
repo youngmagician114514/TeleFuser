@@ -316,6 +316,11 @@ class ABotWorldLiveKitService:
         self._pacing_eligible_sessions = 0
         self._pacing_throttled_sessions = 0
         self._pacing_buffered_sessions = 0
+        # External Motivation leases can sit in the policy queue while a
+        # publisher drains an earlier chunk. Count those boundary rejects
+        # separately from output eviction so a run can distinguish genuine
+        # producer/consumer mismatch from scheduler retries.
+        self._policy_batch_backpressure_rejections = 0
         # Observed wall-clock runtimes make deadline rendezvous conservative.
         # Start from any selected offline profile and only move upward online.
         self._batch_compute_estimates: dict[int, float] = dict(self._batch_compute_priors)
@@ -644,6 +649,13 @@ class ABotWorldLiveKitService:
                         raise RuntimeError(f"ABot policy session {session_id!r} is already in flight")
                     if state.migrating:
                         raise RuntimeError(f"ABot policy session {session_id!r} is migrating")
+                    backpressure_reason = self._policy_batch_block_reason(state, now)
+                    if backpressure_reason is not None:
+                        self._policy_batch_backpressure_rejections += 1
+                        raise RuntimeError(
+                            f"ABot policy session {session_id!r} is output-backpressured: "
+                            f"{backpressure_reason}"
+                        )
                     if str(chunk.get("type", "")) != "control_state":
                         raise ValueError("policy batches require control_state messages")
                     raw_controls = chunk.get("controls", [])
@@ -1158,6 +1170,7 @@ class ABotWorldLiveKitService:
                     "deadline_batch_waits_started": self._deadline_batch_waits_started,
                     "deadline_batch_wait_timeouts": self._deadline_batch_wait_timeouts,
                     "deadline_batch_filler_dispatches": self._deadline_batch_filler_dispatches,
+                    "policy_batch_backpressure_rejections": self._policy_batch_backpressure_rejections,
                     "publisher_frame_credit_enabled": int(self.publisher_frame_credit_enabled),
                     "publisher_frame_credit_target_seconds": round(self.publisher_frame_credit_target_seconds, 6),
                     "publisher_frame_credit_target_frames": (
@@ -1819,6 +1832,37 @@ class ABotWorldLiveKitService:
         """
         with state.output_queue.mutex:
             return sum(item.get("type") == "chunk" for item in state.output_queue.queue)
+
+    def _policy_batch_block_reason(
+        self,
+        state: _ABotWorldLiveKitSession,
+        now: float,
+    ) -> str | None:
+        """Return why an externally reserved one-shot is not safe to run.
+
+        ``push_batch`` is an execution boundary, not merely a control update:
+        a lease may have waited in the parent/worker IPC queues after the
+        policy snapshot was taken. Rechecking the same queue and publisher
+        credit gates used by ``_ready_sessions`` prevents a stale lease from
+        producing another chunk that would be evicted immediately.
+        """
+
+        if state.config["delivery_mode"] == "lossless" and state.output_queue.full():
+            return "lossless_output_queue_full"
+        if state.config["delivery_mode"] != "latest":
+            return None
+
+        frame_credit_enabled = self._uses_publisher_frame_credit(state)
+        buffered_video_payloads = 0 if frame_credit_enabled else self._queued_video_payloads(state)
+        pacing_ready_at = (
+            self._frame_credit_ready_at(state, now) if frame_credit_enabled else state.pacing_ready_at
+        )
+        pacing_ready = now + self._pacing_coalescing_slack_seconds(state) >= pacing_ready_at
+        if buffered_video_payloads:
+            return "queued_video_payload"
+        if not pacing_ready:
+            return "publisher_frame_credit" if frame_credit_enabled else "pacing_deadline"
+        return None
 
     def _select_batch(
         self,

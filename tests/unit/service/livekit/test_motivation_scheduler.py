@@ -457,8 +457,14 @@ def test_profile_loader_reads_abot_offline_table(tmp_path) -> None:
     table = load_motivation_profiles_csv(profile_path, max_batch_size=4)
 
     assert [row.batch_size for row in table.profiles_for(batch_size=1, gpu_id="gpu-0")] == [1]
-    assert table.profiles_for(batch_size=1, gpu_id="gpu-0")[0].quality == pytest.approx(0.7)
-    assert table.profiles_for(batch_size=4, gpu_id="gpu-0")[0].quality == pytest.approx(0.7)
+    # Runtime quality is normalized to the explicit B1/S4/W18 reference and
+    # is invariant across native batch sizes; raw evaluator values remain
+    # available for audit.
+    assert table.profiles_for(batch_size=1, gpu_id="gpu-0")[0].quality == pytest.approx(1.0)
+    assert table.profiles_for(batch_size=4, gpu_id="gpu-0")[0].quality == pytest.approx(1.0)
+    assert table.profiles_for(batch_size=4, gpu_id="gpu-0")[0].raw_quality == pytest.approx(0.7)
+    assert table.quality_reference_config == "b1_s4_w18_rho0_bf16"
+    assert table.quality_normalized is True
     assert table.profiles_for(batch_size=8, gpu_id="gpu-0") == ()
 
 

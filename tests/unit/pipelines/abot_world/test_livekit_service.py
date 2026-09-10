@@ -386,6 +386,43 @@ def test_policy_batch_executes_exact_selected_members_in_one_physical_call() -> 
     finally:
         service.stop()
 
+
+def test_policy_batch_rechecks_output_credit_before_accepting_stale_lease() -> None:
+    service, _ = _service(output_queue_size=2, max_batch_size=1, control_idle_timeout=30)
+    service.configure_session_capacity(1)
+    session_id = _create(service, "policy-backpressure")
+    state = service._session(session_id)
+    assert state is not None
+    try:
+        assert _take_and_notify(service, state)["type"] == "preview"
+        # A policy lease can arrive after a previous generated chunk has been
+        # dequeued from the model but before the publisher consumes it. It must
+        # wait/retry instead of evicting that chunk from latest-mode output.
+        state.output_queue.put({"type": "chunk", "index": 0, "frames": [object()] * 12})
+        with pytest.raises(RuntimeError, match="output-backpressured: queued_video_payload"):
+            service.push_batch(
+                [
+                    (
+                        session_id,
+                        {
+                            "type": "control_state",
+                            "controls": ["KeyW"],
+                            "motivation": {
+                                "kind": "action",
+                                "batch_size": 1,
+                                "fidelity": "b1_s4_w18_rho0_bf16",
+                                "one_shot": True,
+                            },
+                        },
+                    )
+                ]
+            )
+        assert service.runtime_metrics()["policy_batch_backpressure_rejections"] == 1
+        assert state.dropped_video_payloads == 0
+    finally:
+        service.stop()
+
+
 def test_motivation_one_shot_control_emits_one_chunk() -> None:
     service, pipeline = _service(output_queue_size=4, max_batch_size=1, control_idle_timeout=30)
     service.configure_session_capacity(1)

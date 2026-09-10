@@ -29,6 +29,7 @@ from .motivation_scheduler import (
     SessionSchedulingState,
     load_motivation_profiles_csv,
 )
+from .profile_quality import DEFAULT_QUALITY_REFERENCE_FIDELITY
 from .session_state_transfer import (
     SessionStateTransferBackend,
     SessionStateTransferManager,
@@ -56,10 +57,9 @@ class MotivationRuntimeController:
     """Connect event callbacks, global search, migration, and execution.
 
     ``schedule_once`` is safe to call from an event loop or a background
-    scheduler thread.  It starts at most one migration per call, allowing the
-    next invocation to observe readiness without blocking another GPU.  A
-    candidate with a remote owner is therefore prepared first and dispatched
-    only after migration commits and the candidate is searched again.
+    scheduler thread.  Motivation starts at most one migration per call,
+    allowing the next invocation to observe readiness without blocking another
+    GPU.  FIFO bypasses that path and keeps every session on its admitted owner.
     """
 
     def __init__(
@@ -79,6 +79,15 @@ class MotivationRuntimeController:
         self.migration_manager = migration_manager
         self.migration_backend_factory = migration_backend_factory
         self.migration_policy = migration_policy
+        # FIFO is a deliberately static baseline.  Keep the controller object
+        # reusable for the execution bridge, but remove all migration inputs at
+        # this boundary so a FIFO run cannot accidentally start a Motivation
+        # state-transfer path supplied by a caller or runtime bootstrap.
+        self._fifo_mode = scheduler.policy_name == "fifo"
+        if self._fifo_mode:
+            self.migration_manager = None
+            self.migration_backend_factory = None
+            self.migration_policy = None
         self._dispatch_owner_resolver = dispatch_owner_resolver
         self._search_executor = search_executor
         self._owns_search_executor = False
@@ -129,12 +138,21 @@ class MotivationRuntimeController:
         search_executor: SearchExecutor | None = None,
         diagnostics: MotivationDiagnosticsSink | None = None,
         clock: Callable[[], float] = time.monotonic,
+        normalize_quality: bool = True,
+        quality_reference_fidelity: str = DEFAULT_QUALITY_REFERENCE_FIDELITY,
+        batch_invariant_quality: bool = True,
     ) -> "MotivationRuntimeController":
         """Build an opt-in controller from the measured offline profile CSV."""
         policy_config = scheduler_config or MotivationSchedulerConfig()
+        profile_max_batch_size = (
+            1 if str(policy_config.policy_name).strip().lower() == "fifo" else policy_config.max_batch_size
+        )
         profile_table = load_motivation_profiles_csv(
             profile_path,
-            max_batch_size=policy_config.max_batch_size,
+            max_batch_size=profile_max_batch_size,
+            normalize_quality=normalize_quality,
+            quality_reference_fidelity=quality_reference_fidelity,
+            batch_invariant_quality=batch_invariant_quality,
         )
         scheduler = MotivationScheduler(
             profile_table,
@@ -295,13 +313,16 @@ class MotivationRuntimeController:
                 self._owns_search_executor = True
             executor = self._search_executor
         def search() -> DispatchCandidate | None:
-            pending_migrations = self.pending_migration_sessions()
+            pending_migrations, blocked_migrations = self._migration_filters(
+                now=max(observed_at, self.scheduler.current_time)
+            )
             # The task may start after an event callback has advanced policy
             # time.  Search from the scheduler's current timeline rather than
             # failing with a backwards-time error; dispatch_candidate still
             # rejects the captured epoch if the state changed meanwhile.
             search_at = max(observed_at, self.scheduler.current_time)
-            blocked_migrations = self.blocked_migration_sessions(now=search_at)
+            if not self._fifo_mode:
+                pending_migrations, blocked_migrations = self._migration_filters(now=search_at)
             try:
                 return self.scheduler.find_best(
                     now=search_at,
@@ -321,10 +342,12 @@ class MotivationRuntimeController:
                     now=self.scheduler.current_time,
                     wait_seconds=wait_seconds,
                     include_wait=True,
-                    exclude_session_ids=self.pending_migration_sessions(),
-                    blocked_migration_session_ids=self.blocked_migration_sessions(
+                    exclude_session_ids=self._migration_filters(
                         now=self.scheduler.current_time
-                    ),
+                    )[0],
+                    blocked_migration_session_ids=self._migration_filters(
+                        now=self.scheduler.current_time
+                    )[1],
                 )
 
         return executor.submit(search)
@@ -337,9 +360,9 @@ class MotivationRuntimeController:
     ) -> DispatchLease | None:
         """Search synchronously and dispatch one current candidate if possible."""
         observed_at = self._observed(now)
-        self._ensure_idle_jobs(now=observed_at)
-        pending_migrations = self.pending_migration_sessions()
-        blocked_migrations = self.blocked_migration_sessions(now=observed_at)
+        if not self._fifo_mode:
+            self._ensure_idle_jobs(now=observed_at)
+        pending_migrations, blocked_migrations = self._migration_filters(now=observed_at)
         candidate = self.scheduler.find_best(
             now=observed_at,
             wait_seconds=wait_seconds,
@@ -373,8 +396,8 @@ class MotivationRuntimeController:
             # The first candidate may contain a session that is still useful
             # on its owner GPU. Exclude only transfers already in flight;
             # migration-disabled search rejects remote alternatives itself.
-            exclude_session_ids=self.pending_migration_sessions(),
-            blocked_migration_session_ids=self.blocked_migration_sessions(now=fallback_now),
+            exclude_session_ids=self._migration_filters(now=fallback_now)[0],
+            blocked_migration_session_ids=self._migration_filters(now=fallback_now)[1],
         )
         if fallback is None:
             return None
@@ -401,6 +424,8 @@ class MotivationRuntimeController:
         jobs or mutate scheduler ownership. Callers can use it before a fresh
         search without reaching into controller internals.
         """
+        if self._fifo_mode:
+            return ()
         manager = self.migration_manager
         if manager is None:
             return ()
@@ -423,6 +448,8 @@ class MotivationRuntimeController:
         the residence window expires.
         """
 
+        if self._fifo_mode:
+            return ()
         policy = self.migration_policy
         if policy is None:
             return ()
@@ -436,9 +463,22 @@ class MotivationRuntimeController:
         """Backward-compatible alias for :meth:`pending_migration_sessions`."""
         return self.pending_migration_sessions()
 
+    def _migration_filters(self, *, now: float) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Return migration exclusions for a policy search.
+
+        Keeping this in one helper prevents the asynchronous and synchronous
+        paths from accidentally re-enabling migration for FIFO.
+        """
+        if self._fifo_mode:
+            return (), ()
+        return (
+            self.pending_migration_sessions(),
+            self.blocked_migration_sessions(now=now),
+        )
+
     def _ensure_idle_jobs(self, *, now: float) -> None:
         """Materialize at most one consumption-gated idle sentinel per session."""
-        if not self.scheduler.config.include_idle_jobs:
+        if self._fifo_mode or not self.scheduler.config.include_idle_jobs:
             return
         for state in self.scheduler.sessions():
             if state.departed:
@@ -468,6 +508,9 @@ class MotivationRuntimeController:
             if not self.scheduler.validate(candidate, now=observed_at):
                 self._record_dispatch(candidate, observed_at, "rejected", "stale")
                 return None
+            if self._fifo_mode and candidate.migration_count:
+                self._record_dispatch(candidate, observed_at, "rejected", "fifo_migration_forbidden")
+                return None
             # A candidate may be optimal in the projected timeline while its
             # target GPU is still running another invocation.  ``start_at``
             # is a planning fact, not permission to enqueue work early.  Only
@@ -495,7 +538,9 @@ class MotivationRuntimeController:
                     self._record_dispatch(candidate, observed_at, "rejected", "owner_mismatch")
                     return None
             jobs = tuple(
-                self.scheduler.session(session_id).ready_job(include_idle=True)
+                self.scheduler.session(session_id).ready_job(
+                    include_idle=self.scheduler.config.include_idle_jobs
+                )
                 for session_id in candidate.session_ids
             )
             if any(job is None for job in jobs):
@@ -600,6 +645,8 @@ class MotivationRuntimeController:
         return tuple(records)
 
     def _prepare_migration(self, candidate: DispatchCandidate, *, now: float) -> bool:
+        if self._fifo_mode:
+            return False
         if self.migration_manager is None or self.migration_backend_factory is None:
             # A policy caller that has no migration backend must not silently
             # execute a remote-state candidate.  It can still use local GPU

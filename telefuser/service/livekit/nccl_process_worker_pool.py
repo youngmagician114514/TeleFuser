@@ -1426,6 +1426,15 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                     for key, value in session_metrics.items()
                     if isinstance(value, int | float | str)
                 }
+            # Materialize the bounded parent output before notifying the
+            # Motivation bridge.  The callback may immediately release the
+            # scheduler lease and enqueue the next job; publishing the event
+            # first otherwise lets that next job overtake this payload and
+            # makes the parent queue look empty during a real handoff.
+            self._enqueue_model_output(
+                event["session_id"],
+                _ModelOutput(worker_id=event["worker_id"], payload=event["payload"]),
+            )
             output_callback = getattr(self._event_sink, "on_model_output", None)
             if callable(output_callback):
                 output_callback(
@@ -1435,10 +1444,6 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                     runtime_metrics=metrics if isinstance(metrics, dict) else None,
                     session_runtime_metrics=session_metrics if isinstance(session_metrics, dict) else None,
                 )
-            self._enqueue_model_output(
-                event["session_id"],
-                _ModelOutput(worker_id=event["worker_id"], payload=event["payload"]),
-            )
             return
         super()._dispatch_event(event)
 

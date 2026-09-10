@@ -87,6 +87,7 @@ def run_stream_server(
 
     motivation_controller = None
     if motivation_profile is not None:
+        normalized_policy = str(motivation_policy).strip().lower()
         gpu_states = [
             GpuSchedulingState(f"worker-{index}", memory_free_gb=motivation_memory_free_gb)
             for index in range(config.num_workers)
@@ -101,8 +102,11 @@ def run_stream_server(
             dispatch=lambda _lease: None,
             scheduler_config=MotivationSchedulerConfig(
                 max_batch_size=motivation_max_batch_size,
-                migration_enabled=motivation_migration,
-                policy_name=motivation_policy,
+                # FIFO is a static-owner baseline.  The scheduler also
+                # normalizes this defensively, but keeping the entrypoint
+                # value explicit makes runtime metadata and tests unambiguous.
+                migration_enabled=motivation_migration and normalized_policy != "fifo",
+                policy_name=normalized_policy,
             ),
             # Reuse the already documented runtime migration estimate so the
             # policy does not treat a remote GPU as free while an asynchronous

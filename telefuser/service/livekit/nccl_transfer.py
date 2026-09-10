@@ -310,10 +310,11 @@ def transfer_tensor_leaves_nccl_streamed(
 ) -> TensorTransferReport:
     """Transfer ordered state groups on an optional dedicated CUDA stream.
 
-    Both peers must supply identical groups.  Completing each group before
-    submitting the next gives the target a stable layer-ready boundary while
-    the caller's worker thread remains free to overlap later groups with model
-    computation on another CUDA stream.
+    Both peers must supply identical groups.  Groups are submitted in manifest
+    order, and per-group CUDA events provide a stable layer-ready boundary
+    while the caller's worker thread remains free to overlap later groups with
+    model computation on another CUDA stream.  A single final stream fence
+    still defines complete-transfer readiness.
     """
     if not dist.is_available() or not dist.is_initialized():
         raise RuntimeError("NCCL process group is not initialized")
@@ -341,16 +342,9 @@ def transfer_tensor_leaves_nccl_streamed(
                 for request in requests:
                     request.wait()
             # ``Work.wait()`` guarantees that the NCCL operation has been
-            # enqueued, but on some PyTorch/NCCL combinations it does not
-            # fence device-side writes issued on a non-default stream.  The
-            # receiver publishes a per-layer readiness event immediately
-            # after this point; synchronizing the dedicated transfer stream
-            # is therefore required before a target model may read the layer
-            # (especially its scalar KV cursor tensors).  Without this fence
-            # a target can observe uninitialized ``global_end_index`` values
-            # while the copy is still in flight.
-            if stream is not None:
-                stream.synchronize()
+            # submitted.  The event recorded below is the device-side fence
+            # consumed by the target compute stream; a host synchronize here
+            # would serialize every layer and erase the intended overlap.
             ready_event = None
             if stream is not None:
                 ready_event = torch.cuda.Event()

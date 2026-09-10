@@ -39,6 +39,25 @@ def _batch_controller(
     return MotivationRuntimeController(scheduler, dispatch=lambda lease: None, clock=lambda: now[0])
 
 
+def test_fifo_bridge_forces_the_motivation_batch_gate_off() -> None:
+    scheduler = MotivationScheduler(
+        StaticMotivationProfileTable(
+            [MotivationProfile(1, "b1_s4_w18_rho0_bf16", 0.4, 0.68, 20.0)]
+        ),
+        config=MotivationSchedulerConfig(policy_name="fifo"),
+    )
+    scheduler.add_gpu(GpuSchedulingState("gpu-0", memory_free_gb=80.0))
+    controller = MotivationRuntimeController(scheduler, dispatch=lambda lease: None)
+
+    bridge = MotivationExecutionBridge(
+        controller,
+        dispatch=lambda lease, payloads: None,
+        enable_batch_gate=True,
+    )
+
+    assert bridge._batch_gate is None
+
+
 class _FakeTimer:
     instances: list["_FakeTimer"] = []
 

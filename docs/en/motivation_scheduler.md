@@ -19,8 +19,14 @@ profiles = load_motivation_profiles_csv(
 
 The loader reads `B`, `latency_ms`, `latency_p95_ms`, `memory_GB`, and
 `Q_world` from the offline table; when `Q_world` is empty it averages the
-available component quality columns. Rows with `B > 4` are ignored by the
-default policy bound.
+available component quality columns. By default it exposes a normalized
+quality factor `Q`: the B1/S4/W18/BF16 row is `Q=1`, and every batch size in
+the same S/W family uses the family's B1 quality. Thus native batching changes
+latency/throughput, not the semantic quality value. The evaluator's original
+value remains available as `MotivationProfile.raw_quality`. A compact custom
+table without an S4/W18 reference falls back to raw values and marks the table
+metadata accordingly. Rows with `B > 4` are ignored by the default policy
+bound.
 
 ## State and job semantics
 
@@ -58,17 +64,26 @@ does not stop playback.  An explicitly paused consumer can set
 
 `MotivationPolicy` and `FIFOPolicy` are parallel implementations behind the
 small `SchedulingPolicy` interface. The scheduler coordinator continues to
-own session state, profile feasibility, migration, versioned reservations,
-completion, and diagnostics; a policy only chooses which ready sessions are
-offered to that shared machinery. This keeps a baseline from duplicating the
+own session state, physical feasibility, versioned reservations, completion,
+and diagnostics; a policy only chooses which ready work is offered to that
+shared machinery. Motivation additionally enables the migration path, while
+FIFO deliberately does not. This keeps a baseline from duplicating the
 LiveKit execution path and leaves room for additional policies later.
 
 The default is `motivation`. A deliberately simple FIFO baseline can be
-selected with `--motivation-policy fifo`. FIFO orders released jobs by their
-global sequence number, prioritizes action jobs over idle sentinels, and
-dispatches a singleton; profile, quality, memory, and migration checks are
-still applied by the common scheduler. The selected policy is included in
-scheduler snapshots and search/dispatch diagnostics.
+selected with `--motivation-policy fifo`. FIFO orders released action jobs by
+their global sequence number and dispatches one B1 singleton at the fixed
+`fifo_fidelity` row (`b1_s4_w18_rho0_bf16` by default). It keeps each session on
+its admitted owner GPU, does not create or select idle jobs, does not enumerate
+batch sizes B2--B4, and does not optimize quality, fairness, or a utility
+score. The common coordinator still performs the physical checks needed by the
+worker (fixed-row memory lookup, GPU availability, reservation, and
+stale-candidate validation), but never starts state migration for FIFO. A
+reduced test profile may provide one sole B1 row as a compatibility fallback;
+if multiple rows exist, a missing fixed row is reported instead of silently
+choosing by quality.
+The selected policy is included in scheduler snapshots and search/dispatch
+diagnostics.
 
 When the LiveKit runtime reports a session as running, the execution bridge
 materializes an idle sentinel if no action state is held. The bridge forwards

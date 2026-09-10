@@ -36,6 +36,11 @@ from .motivation_policies import (
     SchedulingSearchRequest,
     create_scheduling_policy,
 )
+from .profile_quality import (
+    DEFAULT_QUALITY_REFERENCE_FIDELITY,
+    normalize_profile_qualities,
+    profile_batch_family,
+)
 
 EPSILON = 1e-9
 JobKind = Literal["action", "idle"]
@@ -46,9 +51,10 @@ class MotivationProfile:
     """Measured execution point for one batch size and fidelity.
 
     ``gpu_id=None`` denotes a profile shared by homogeneous GPU replicas.
-    A GPU-specific row takes precedence over a shared row.  Quality is the
-    offline-table quality value used by the policy; the runtime does not run
-    a visual evaluator in the dispatch critical path.
+    A GPU-specific row takes precedence over a shared row.  ``quality`` is the
+    normalized semantic Q factor used by the policy; ``raw_quality`` retains
+    the offline evaluator value when the row came from a CSV table.  The
+    runtime does not run a visual evaluator in the dispatch critical path.
     """
 
     batch_size: int
@@ -59,6 +65,9 @@ class MotivationProfile:
     output_seconds: float = 1.0
     p95_seconds: float | None = None
     gpu_id: str | None = None
+    # Keep the evaluator's raw value alongside the normalized policy value for
+    # diagnostics/audit.  Existing positional constructors remain compatible.
+    raw_quality: float | None = None
 
     def __post_init__(self) -> None:
         if self.batch_size < 1 or self.batch_size > 4:
@@ -69,6 +78,10 @@ class MotivationProfile:
             raise ValueError("latency_seconds must be positive and finite")
         if not math.isfinite(self.quality) or self.quality <= 0:
             raise ValueError("quality must be positive and finite")
+        if self.raw_quality is not None and (
+            not math.isfinite(self.raw_quality) or self.raw_quality <= 0
+        ):
+            raise ValueError("raw_quality must be positive and finite when supplied")
         if not math.isfinite(self.memory_gb) or self.memory_gb <= 0:
             raise ValueError("memory_gb must be positive and finite")
         if not math.isfinite(self.output_seconds) or self.output_seconds <= 0:
@@ -85,20 +98,29 @@ def load_motivation_profiles_csv(
     max_batch_size: int = 4,
     gpu_id: str | None = None,
     output_seconds: float = 1.0,
+    normalize_quality: bool = True,
+    quality_reference_fidelity: str = DEFAULT_QUALITY_REFERENCE_FIDELITY,
+    batch_invariant_quality: bool = True,
 ) -> StaticMotivationProfileTable:
     """Load the measured offline-table rows used by the policy.
 
     The loader accepts the ABot profile schema directly.  ``Q_world`` is the
     preferred quality column; if it is empty, the mean of available
-    ``Q_action``, ``Q_temporal`` and ``Q_visual`` values is used.  The rows are
-    tagged as homogeneous (or with ``gpu_id`` when supplied), so GPU-specific
-    measurements can coexist with shared fallback rows.
+    ``Q_action``, ``Q_temporal`` and ``Q_visual`` values is used.  By default,
+    values are exposed as normalized ``Q`` factors relative to the explicit
+    B1/S4/W18 reference, and all batch sizes in one S/W family share the B1
+    quality.  Raw evaluator values remain on ``MotivationProfile.raw_quality``.
+    A reduced custom table without an S4/W18 reference transparently falls
+    back to raw values (and records that fact on the returned table).  The rows
+    are tagged as homogeneous (or with ``gpu_id`` when supplied), so
+    GPU-specific measurements can coexist with shared fallback rows.
     """
     if not 1 <= max_batch_size <= 4:
         raise ValueError("max_batch_size must be in [1, 4]")
     if output_seconds <= 0 or not math.isfinite(output_seconds):
         raise ValueError("output_seconds must be positive and finite")
-    rows: list[MotivationProfile] = []
+    parsed_rows: list[tuple[int, str, float, float, float, float, float]] = []
+    raw_quality_by_config: dict[str, float] = {}
     with Path(path).open(newline="", encoding="utf-8") as handle:
         for raw in csv.DictReader(handle):
             batch_size = int(raw["B"])
@@ -108,6 +130,7 @@ def load_motivation_profiles_csv(
             p95_raw = raw.get("latency_p95_ms", "")
             p95_ms = float(p95_raw) if p95_raw not in {None, ""} else latency_ms
             memory_gb = float(raw["memory_GB"])
+            fidelity = str(raw.get("config") or f"b{batch_size}")
             quality_raw = raw.get("Q_world", "")
             if quality_raw in {None, ""}:
                 quality_values = [
@@ -117,23 +140,63 @@ def load_motivation_profiles_csv(
                 ]
                 if not quality_values:
                     raise ValueError(f"profile row {raw.get('config', '<unknown>')} has no quality value")
-                quality = sum(quality_values) / len(quality_values)
+                raw_quality = sum(quality_values) / len(quality_values)
             else:
-                quality = float(quality_raw)
-            rows.append(
-                MotivationProfile(
-                    batch_size=batch_size,
-                    fidelity=str(raw.get("config") or f"b{batch_size}"),
-                    latency_seconds=latency_ms / 1000.0,
-                    p95_seconds=p95_ms / 1000.0,
-                    quality=quality,
-                    memory_gb=memory_gb,
-                    output_seconds=output_seconds,
-                    gpu_id=gpu_id,
+                raw_quality = float(quality_raw)
+            if fidelity in raw_quality_by_config:
+                raise ValueError(f"duplicate profile row: {fidelity!r}")
+            raw_quality_by_config[fidelity] = raw_quality
+            parsed_rows.append(
+                (
+                    batch_size,
+                    fidelity,
+                    latency_ms,
+                    p95_ms,
+                    raw_quality,
+                    memory_gb,
+                    output_seconds,
                 )
             )
-    if not rows:
+    if not parsed_rows:
         raise ValueError(f"no profiles with batch size <= {max_batch_size} found in {path}")
+
+    if normalize_quality:
+        quality_result = normalize_profile_qualities(
+            raw_quality_by_config,
+            reference_fidelity=quality_reference_fidelity,
+            batch_invariant=batch_invariant_quality,
+        )
+    else:
+        quality_result = normalize_profile_qualities(
+            raw_quality_by_config,
+            reference_fidelity=quality_reference_fidelity,
+            batch_invariant=False,
+        )
+        # Explicitly preserve the old/raw semantics when normalization is
+        # disabled, including the metadata flag used by reports.
+        quality_result = quality_result.__class__(
+            values=dict(raw_quality_by_config),
+            reference_config=quality_result.reference_config,
+            reference_raw=quality_result.reference_raw,
+            normalized=False,
+            batch_invariant=False,
+        )
+
+    rows: list[MotivationProfile] = []
+    for batch_size, fidelity, latency_ms, p95_ms, raw_quality, memory_gb, output_seconds in parsed_rows:
+        rows.append(
+            MotivationProfile(
+                batch_size=batch_size,
+                fidelity=fidelity,
+                latency_seconds=latency_ms / 1000.0,
+                p95_seconds=p95_ms / 1000.0,
+                quality=quality_result.values[fidelity],
+                memory_gb=memory_gb,
+                output_seconds=output_seconds,
+                gpu_id=gpu_id,
+                raw_quality=raw_quality,
+            )
+        )
 
     # Several historical ABot profile captures measured B1/B2/B4/B8 but
     # omitted B3. Treat that omission as a profile-data gap rather than
@@ -143,7 +206,7 @@ def load_motivation_profiles_csv(
     if max_batch_size >= 3:
         by_suffix: dict[str, dict[int, MotivationProfile]] = {}
         for row in rows:
-            suffix = row.fidelity.split("_", 1)[1] if "_" in row.fidelity else ""
+            _, suffix = profile_batch_family(row.fidelity)
             by_suffix.setdefault(suffix, {})[row.batch_size] = row
         for suffix, neighbors in by_suffix.items():
             lower = neighbors.get(2)
@@ -155,7 +218,23 @@ def load_motivation_profiles_csv(
                     + (upper.p95_seconds or upper.latency_seconds)
                 ) / 2.0
                 memory = (lower.memory_gb + upper.memory_gb) / 2.0
-                quality = min(lower.quality, upper.quality)
+                # Quality is a semantic family property.  Once the measured
+                # rows have been normalized, batching must not perturb it;
+                # use the lower-B row only as a fallback for reduced tables.
+                quality = (
+                    lower.quality
+                    if quality_result.normalized and quality_result.batch_invariant
+                    else min(lower.quality, upper.quality)
+                )
+                raw_quality = (
+                    lower.raw_quality
+                    if quality_result.normalized and quality_result.batch_invariant
+                    else min(
+                        value
+                        for value in (lower.raw_quality, upper.raw_quality)
+                        if value is not None
+                    )
+                )
                 gpu_id_for_row = lower.gpu_id
                 rows.append(
                     MotivationProfile(
@@ -167,9 +246,16 @@ def load_motivation_profiles_csv(
                         memory_gb=memory,
                         output_seconds=lower.output_seconds,
                         gpu_id=gpu_id_for_row,
+                        raw_quality=raw_quality,
                     )
                 )
-    return StaticMotivationProfileTable(rows)
+    return StaticMotivationProfileTable(
+        rows,
+        quality_reference_config=quality_result.reference_config,
+        quality_reference_raw=quality_result.reference_raw,
+        quality_normalized=quality_result.normalized,
+        batch_invariant_quality=quality_result.batch_invariant,
+    )
 
 
 class MotivationProfileProvider(Protocol):
@@ -182,10 +268,22 @@ class MotivationProfileProvider(Protocol):
 class StaticMotivationProfileTable:
     """Immutable-style lookup table backed by measured offline profiles."""
 
-    def __init__(self, profiles: Iterable[MotivationProfile]) -> None:
+    def __init__(
+        self,
+        profiles: Iterable[MotivationProfile],
+        *,
+        quality_reference_config: str | None = None,
+        quality_reference_raw: float | None = None,
+        quality_normalized: bool = False,
+        batch_invariant_quality: bool = False,
+    ) -> None:
         rows = tuple(profiles)
         if not rows:
             raise ValueError("at least one profile is required")
+        self.quality_reference_config = quality_reference_config
+        self.quality_reference_raw = quality_reference_raw
+        self.quality_normalized = bool(quality_normalized)
+        self.batch_invariant_quality = bool(batch_invariant_quality)
         self._rows: dict[tuple[str | None, int, str], MotivationProfile] = {}
         for profile in rows:
             key = (profile.gpu_id, profile.batch_size, profile.fidelity)
@@ -598,6 +696,11 @@ class MotivationSchedulerConfig:
     include_idle_jobs: bool = True
     migration_enabled: bool = True
     policy_name: str = "motivation"
+    # FIFO is intentionally a fixed-execution baseline.  The paper-facing
+    # baseline is pinned to the normalized S4/W18 B1 point; no quality/latency
+    # trade-off is made at runtime.  A caller may still override this in a
+    # reduced unit-test table, but production entrypoints use this default.
+    fifo_fidelity: str | None = "b1_s4_w18_rho0_bf16"
 
     def __post_init__(self) -> None:
         if not 1 <= self.max_batch_size <= 4:
@@ -622,6 +725,10 @@ class MotivationSchedulerConfig:
             raise ValueError("initial_quality must be positive and finite")
         if not isinstance(self.policy_name, str) or not self.policy_name.strip():
             raise ValueError("policy_name must be a non-empty string")
+        if self.fifo_fidelity is not None and (
+            not isinstance(self.fifo_fidelity, str) or not self.fifo_fidelity.strip()
+        ):
+            raise ValueError("fifo_fidelity must be a non-empty string or None")
 
 
 @dataclass(frozen=True)
@@ -675,8 +782,23 @@ class MotivationScheduler:
         policy: SchedulingPolicy | None = None,
     ) -> None:
         self.profile_provider = profile_provider
-        self.config = config or MotivationSchedulerConfig()
-        self._policy = policy or create_scheduling_policy(self.config.policy_name)
+        requested_config = config or MotivationSchedulerConfig()
+        self._policy = policy or create_scheduling_policy(requested_config.policy_name)
+        # FIFO is a policy-level baseline, not Motivation with a one-session
+        # candidate filter.  Normalize the coordinator knobs as a defensive
+        # boundary so callers cannot accidentally re-enable idle work, larger
+        # batches, or quality/fairness scoring by passing production defaults.
+        if self._policy.name == "fifo":
+            self.config = replace(
+                requested_config,
+                max_batch_size=1,
+                include_idle_jobs=False,
+                lambda_quality=0.0,
+                fairness_delta=0.0,
+                migration_enabled=False,
+            )
+        else:
+            self.config = requested_config
         self.migration_estimator = migration_estimator or LocalMigrationEstimator()
         self._diagnostics = diagnostics or NullMotivationDiagnostics()
         self._clock = clock
@@ -789,6 +911,13 @@ class MotivationScheduler:
             initial_quality = quality
             if initial_quality is None:
                 initial_quality = self.config.initial_quality
+            # FIFO does not maintain a quality objective.  Use a neutral
+            # bookkeeping value instead of scanning the profile table and
+            # selecting its maximum-quality row during session admission.
+            # Actual profile quality remains available in the execution trace
+            # for post-run reporting.
+            if initial_quality is None and self.policy_name == "fifo":
+                initial_quality = 1.0
             if initial_quality is None:
                 profiles = [
                     profile
@@ -991,25 +1120,232 @@ class MotivationScheduler:
         # retains ``action_count`` as the deterministic action-first tie-break.
         return tuple(ready)
 
-    def _ready_jobs_for_fifo(
+    def _find_fifo_candidate(
         self,
         *,
         now: float | None = None,
-    ) -> tuple[tuple[str, ActionJob], ...]:
-        """Return a stable ready-job view for the FIFO policy.
+        gpu_states: Sequence[GpuSchedulingState] | None = None,
+        wait_seconds: float = 0.0,
+        include_wait: bool = True,
+        allow_migrations: bool = True,
+        exclude_session_ids: Iterable[str] = (),
+        blocked_migration_session_ids: Iterable[str] = (),
+        policy_name: str = "fifo",
+    ) -> DispatchCandidate | None:
+        """Select one oldest action with a fixed B1 execution point.
 
-        The view is intentionally narrow: FIFO needs only the session/job
-        identity and sequence. Candidate feasibility and all state mutation
-        remain in the shared scheduler path, where epoch validation protects
-        this read from concurrent control updates.
+        This is intentionally a separate, linear policy path.  It never
+        invokes :meth:`_find_best_motivation`, never creates an idle candidate,
+        and never compares profile quality or scores.  The profile table is
+        consulted only to obtain the one fixed execution row required by the
+        physical worker (latency/memory/fidelity); the common scheduler still
+        performs snapshot validation and reservation.
         """
+        # These are Motivation-only inputs.  FIFO has a fixed singleton and a
+        # static owner, so it never evaluates a wait, migration estimate, or
+        # residence-cooldown rule.
+        del include_wait, allow_migrations, blocked_migration_session_ids
         observed_at = self._clock() if now is None else now
+        excluded = {str(value) for value in exclude_session_ids}
+
+        # Take the same immutable snapshot used by the Motivation search.  A
+        # candidate found outside the lock is still rejected by epoch/version
+        # validation if a concurrent event changes the ready queue.
         with self._lock:
-            self._advance_to(observed_at)
-            return tuple(
-                (state.session_id, job)
+            observed_at = self._advance_to(observed_at)
+            live_states = tuple(self._sessions.values())
+            snapshot_states = tuple(replace(state) for state in live_states)
+            snapshot_by_id = {state.session_id: state for state in snapshot_states}
+            all_ready = tuple(
+                (snapshot_by_id[state.session_id], job)
                 for state, job in self._ready_jobs()
+                if job.kind == "action"
             )
+            ready = tuple(
+                item for item in all_ready if item[0].session_id not in excluded
+            )
+            gpus = tuple(gpu_states) if gpu_states is not None else tuple(self._gpus.values())
+            snapshot_epoch = self._epoch
+
+        ordered_ready = tuple(
+            sorted(
+                ready,
+                key=lambda item: (
+                    item[1].sequence,
+                    item[1].created_at,
+                    item[1].job_id,
+                ),
+            )
+        )
+
+        # Look up one fixed row per owner GPU.  A reduced test/profile table
+        # may contain only one B1 row; accepting that sole row keeps tests
+        # useful without turning a missing fixed point into a quality choice.
+        profile_cache: dict[str, MotivationProfile | None] = {}
+        fallback_gpus: set[str] = set()
+
+        def fixed_profile(gpu: GpuSchedulingState) -> MotivationProfile | None:
+            if gpu.gpu_id in profile_cache:
+                return profile_cache[gpu.gpu_id]
+            profiles = tuple(
+                self.profile_provider.profiles_for(batch_size=1, gpu_id=gpu.gpu_id)
+            )
+            if not profiles:
+                profile_cache[gpu.gpu_id] = None
+                return None
+            requested = self.config.fifo_fidelity
+            profile = next(
+                (row for row in profiles if row.fidelity == requested),
+                None,
+            ) if requested is not None else None
+            if profile is None and len(profiles) == 1:
+                # A reduced test/profile table may contain only one B1 row.
+                # Accept that sole row, but never silently choose among
+                # multiple quality points when the requested fixed row is
+                # absent.
+                profile = profiles[0]
+                fallback_gpus.add(gpu.gpu_id)
+            profile_cache[gpu.gpu_id] = profile
+            return profile
+
+        enumerated = empty_batch_counts()
+        compatible = empty_batch_counts()
+        profiles_evaluated = empty_batch_counts()
+        feasible = empty_batch_counts()
+        rejected: dict[str, int] = {}
+
+        def reject(reason: str, count: int = 1) -> None:
+            rejected[reason] = rejected.get(reason, 0) + count
+
+        best: tuple[
+            tuple[float, int, str],
+            SessionSchedulingState,
+            ActionJob,
+            GpuSchedulingState,
+            MotivationProfile,
+            float,
+            float,
+        ] | None = None
+
+        # FIFO order is global over currently runnable actions.  A session is
+        # permanently tied to its admitted owner GPU; if that owner is busy,
+        # the candidate is projected for that GPU and the controller may look
+        # for a newer action on another *already free* owner in its fallback
+        # pass.  No remote placement or state transfer is attempted.
+        gpu_by_id = {gpu.gpu_id: gpu for gpu in gpus}
+        for state, job in ordered_ready:
+            gpu = gpu_by_id.get(state.owner_gpu)
+            if gpu is None:
+                reject("owner_gpu_missing")
+                continue
+            enumerated[1] += 1
+            compatible[1] += 1  # every singleton is structurally compatible
+            if not gpu.available:
+                reject("gpu_unavailable")
+                continue
+            profile = fixed_profile(gpu)
+            profiles_evaluated[1] = len(profile_cache)
+            if profile is None:
+                reject("fifo_fidelity_missing")
+                continue
+            effective_memory_free_gb = gpu.memory_free_gb
+            if (
+                gpu.free_at > observed_at + EPSILON
+                and gpu.memory_free_gb != math.inf
+            ):
+                effective_memory_free_gb += gpu.reserved_memory_gb
+            if profile.memory_gb > effective_memory_free_gb + EPSILON:
+                reject("memory")
+                continue
+            start_at = max(observed_at, gpu.free_at)
+            finish_at = start_at + profile.latency_seconds
+            target_key = (start_at, 0, gpu.gpu_id)
+            feasible[1] += 1
+            best = (
+                target_key,
+                state,
+                job,
+                gpu,
+                profile,
+                start_at,
+                finish_at,
+            )
+            break
+
+        selected: DispatchCandidate | None = None
+        if best is not None:
+            (
+                _target_key,
+                selected_state,
+                selected_job,
+                selected_gpu,
+                selected_profile,
+                selected_start,
+                selected_finish,
+            ) = best
+            selected_gpu_id = selected_gpu.gpu_id
+            selected = DispatchCandidate(
+                session_ids=(selected_state.session_id,),
+                job_ids=(selected_job.job_id,),
+                gpu_id=selected_gpu_id,
+                fidelity=selected_profile.fidelity,
+                profile=selected_profile,
+                start_at=selected_start,
+                finish_at=selected_finish,
+                migration_count=0,
+                migration_seconds=0.0,
+                # FIFO has no utility/quality score.  Keep the field at zero
+                # so downstream telemetry cannot be mistaken for optimization.
+                score=0.0,
+                # These fields belong to Motivation's objective projection;
+                # FIFO intentionally leaves them empty rather than computing
+                # slack or quality deltas that it never uses.
+                projected_slack={},
+                projected_quality={},
+                snapshot_epoch=snapshot_epoch,
+                session_versions={selected_state.session_id: selected_state.state_version},
+                gpu_version=selected_gpu.version,
+                policy_name=policy_name,
+            )
+
+        if fallback_gpus:
+            rejected["fifo_fidelity_fallback"] = len(fallback_gpus)
+        not_selected = empty_batch_counts()
+        if feasible[1] and selected is not None:
+            not_selected[1] = max(0, feasible[1] - 1)
+        summary = MotivationSearchSummary(
+            observed_at=observed_at,
+            snapshot_epoch=snapshot_epoch,
+            ready_count=len(ready),
+            ready_action_count=len(ready),
+            ready_idle_count=0,
+            excluded_ready_count=len(all_ready) - len(ready),
+            gpu_count=len(gpus),
+            include_wait=False,
+            allow_migrations=False,
+            wait_seconds=max(0.0, wait_seconds),
+            enumerated_by_batch_size=enumerated,
+            compatible_by_batch_size=compatible,
+            profiles_evaluated_by_batch_size=profiles_evaluated,
+            feasible_by_batch_size=feasible,
+            rejected_by_reason=rejected,
+            not_selected_by_score=not_selected,
+            selected_batch_size=selected.batch_size if selected is not None else 0,
+            selected_wait=False,
+            selected_gpu_id=selected.gpu_id if selected is not None else None,
+            selected_fidelity=selected.fidelity if selected is not None else None,
+            selected_score=0.0 if selected is not None else None,
+            selected_migration_count=(selected.migration_count if selected is not None else 0),
+            selected_session_ids=selected.session_ids if selected is not None else (),
+            selected_job_ids=selected.job_ids if selected is not None else (),
+            policy_name=policy_name,
+        )
+        try:
+            self._diagnostics.record_search(summary)
+        except Exception:
+            # Diagnostics must never affect policy availability.
+            pass
+        return selected
 
     @staticmethod
     def _utility(slack: float, cap: float) -> float:
@@ -1568,6 +1904,17 @@ class MotivationScheduler:
             gpu = self._gpus.get(candidate.gpu_id)
             if gpu is None or not gpu.available or gpu.version != candidate.gpu_version:
                 return False
+            if self.policy_name == "fifo":
+                # A FIFO candidate is always one action on its admitted owner;
+                # reject hand-built/stale candidates that try to smuggle in an
+                # idle job, a batch, or a remote placement.
+                if (
+                    candidate.batch_size != 1
+                    or candidate.migration_count
+                    or candidate.session_ids[0] not in self._sessions
+                    or self._sessions[candidate.session_ids[0]].owner_gpu != candidate.gpu_id
+                ):
+                    return False
             for session_id, job_id, version in zip(
                 candidate.session_ids,
                 candidate.job_ids,
@@ -1576,8 +1923,10 @@ class MotivationScheduler:
                 state = self._sessions.get(session_id)
                 if state is None or state.departed or state.state_version != version:
                     return False
-                job = state.ready_job(include_idle=True)
+                job = state.ready_job(include_idle=self.config.include_idle_jobs)
                 if job is None or job.job_id != job_id or state.in_flight is not None:
+                    return False
+                if self.policy_name == "fifo" and job.kind != "action":
                     return False
             return True
 
@@ -1634,7 +1983,7 @@ class MotivationScheduler:
             assert candidate.gpu_id is not None
             for session_id, job_id in zip(candidate.session_ids, candidate.job_ids):
                 state = self._sessions[session_id]
-                job = state.ready_job(include_idle=True)
+                job = state.ready_job(include_idle=self.config.include_idle_jobs)
                 assert job is not None and job.job_id == job_id
                 state.mark_dispatched(job)
                 if state.owner_gpu != candidate.gpu_id:
