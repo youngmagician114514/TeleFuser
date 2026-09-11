@@ -109,8 +109,21 @@ class SessionStateTransferManager:
     streams, page allocation, and transport-specific synchronization.
     """
 
-    def __init__(self, *, max_concurrent: int = 1, clock: Callable[[], float] = time.monotonic) -> None:
-        if max_concurrent < 1:
+    def __init__(
+        self,
+        *,
+        max_concurrent: int | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        """Create a transfer tracker.
+
+        ``None`` means that the manager does not impose a global transfer
+        count.  The actual transport still owns its per-session buffers and
+        stream synchronization; this class only tracks lifecycle state and
+        ownership commits.  Integer values remain available for tests and
+        deployments that intentionally want a bounded admission policy.
+        """
+        if max_concurrent is not None and max_concurrent < 1:
             raise ValueError("max_concurrent must be positive")
         self.max_concurrent = max_concurrent
         self._clock = clock
@@ -127,7 +140,7 @@ class SessionStateTransferManager:
         with self._lock:
             if request.session_id in self._active:
                 raise RuntimeError(f"session {request.session_id!r} already has an active transfer")
-            if len(self._active) >= self.max_concurrent:
+            if self.max_concurrent is not None and len(self._active) >= self.max_concurrent:
                 raise RuntimeError("maximum concurrent transfers reached")
             operation = backend.begin(request)
             transfer_id = uuid.uuid4().hex

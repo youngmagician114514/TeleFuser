@@ -57,9 +57,10 @@ class MotivationRuntimeController:
     """Connect event callbacks, global search, migration, and execution.
 
     ``schedule_once`` is safe to call from an event loop or a background
-    scheduler thread.  Motivation starts at most one migration per call,
-    allowing the next invocation to observe readiness without blocking another
-    GPU.  FIFO bypasses that path and keeps every session on its admitted owner.
+    scheduler thread.  Independent sessions in one candidate can start their
+    migrations together; the backend keeps duplicate requests for a single
+    session serialized.  FIFO bypasses that path and keeps every session on
+    its admitted owner.
     """
 
     def __init__(
@@ -526,8 +527,9 @@ class MotivationRuntimeController:
                 if not self._prepare_migration(candidate, now=observed_at):
                     self._record_dispatch(candidate, observed_at, "deferred", "migration_pending")
                     return None
-                # ``_prepare_migration`` commits at most one transfer. Search
-                # again after the ownership/version boundary.
+                # ``_prepare_migration`` may start/commit several independent
+                # transfers in this candidate. Search again after all
+                # ownership/version boundaries have been handled.
                 self._record_dispatch(candidate, observed_at, "deferred", "migration_ready")
                 return None
             assert candidate.gpu_id is not None
@@ -653,6 +655,7 @@ class MotivationRuntimeController:
             # candidates by supplying a migration-disabled estimator/config.
             return False
         assert candidate.gpu_id is not None
+        migration_started_or_committed = False
         for session_id in candidate.session_ids:
             state = self.scheduler.session(session_id)
             if state.owner_gpu == candidate.gpu_id:
@@ -666,14 +669,13 @@ class MotivationRuntimeController:
                 None,
             )
             if active is None:
-                # Migration is deliberately bounded so state transfer cannot
-                # consume all NCCL/PCIe resources during a user wave.  A
-                # candidate that arrives while the bound is full is simply
-                # deferred; the active backend's completion callback wakes
-                # the controller and causes a fresh search.  Do not let this
-                # expected back-pressure escape through LiveKit's data
-                # callback as an uncaught RuntimeError.
-                if len(self.migration_manager.active()) >= self.migration_manager.max_concurrent:
+                # The production process-NCCL backend is unlimited by
+                # default: independent sessions can transfer concurrently,
+                # while the backend's per-session locks and stream/event
+                # fencing preserve correctness.  Keep the optional integer
+                # guard for callers that explicitly configure a bound.
+                max_concurrent = self.migration_manager.max_concurrent
+                if max_concurrent is not None and len(self.migration_manager.active()) >= max_concurrent:
                     return False
                 policy = self.migration_policy
                 if policy is not None:
@@ -721,7 +723,12 @@ class MotivationRuntimeController:
                 add_done_callback = getattr(backend, "add_done_callback", None)
                 if callable(add_done_callback):
                     add_done_callback(lambda _done: self._notify_migration_wakeup())
-                return False
+                migration_started_or_committed = True
+                # Keep walking the candidate.  With the production unlimited
+                # manager this starts every independent session transfer in
+                # the same scheduling turn instead of serializing a batch
+                # behind one callback at a time.
+                continue
             record = self.migration_manager.poll(session_id, now=now)
             if record.state != "ready":
                 return False
@@ -734,6 +741,7 @@ class MotivationRuntimeController:
                 # next search can keep using the source GPU or retry later.
                 self.scheduler.clear_migration(session_id, now=now)
                 return False
+            migration_started_or_committed = True
             if self.migration_policy is not None:
                 self.migration_policy.record_commit(
                     session_id,
@@ -741,8 +749,7 @@ class MotivationRuntimeController:
                     record.request.target_gpu,
                     committed_at=now,
                 )
-            return False
-        return True
+        return not migration_started_or_committed
 
     def _notify_migration_wakeup(self) -> None:
         # The backend callback is the only event guaranteed to run after a

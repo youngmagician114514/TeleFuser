@@ -297,6 +297,12 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         self._migration_diagnostics = MigrationDiagnostics()
         self._nccl_ranks: dict[str, int] = {}
         self._nccl_warmup_ms = 0.0
+        # Migration state is keyed by session.  A global lock here serialized
+        # the entire drain/export/transfer/commit lifecycle, turning otherwise
+        # independent P2P copies into a convoy.  Keep a lock per session so a
+        # duplicate request for the same session remains serialized while
+        # different sessions can overlap all transport phases.
+        self._migration_session_locks: dict[str, asyncio.Lock] = {}
         self._migration_lock = asyncio.Lock()
         self._initializing_workers = False
         # ``ProcessLiveKitWorkerPool`` owns the parent JSONL writer for both
@@ -835,7 +841,11 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         *,
         on_compute_ready: Callable[[], None] | None = None,
     ) -> TurboServeOwnership:
-        async with self._migration_lock:
+        migration_session_lock = self._migration_session_locks.setdefault(
+            pipeline_session_id,
+            asyncio.Lock(),
+        )
+        async with migration_session_lock:
             source_worker_id = self._pipeline_routes[pipeline_session_id]
             if source_worker_id == target_worker_id:
                 return self._ownership.owner(pipeline_session_id)

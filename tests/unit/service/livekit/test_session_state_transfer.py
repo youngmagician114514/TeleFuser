@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from concurrent.futures import Future
 
+import pytest
+
 from telefuser.service.livekit.async_migration import AsyncMigrationManager, MigrationRequest
 from telefuser.service.livekit.session_state_transfer import (
     SessionStateTransferManager,
@@ -61,6 +63,31 @@ class _ProgressiveBackend:
         self.residual.cancel()
 
 
+class _UnlimitedBackend:
+    """Small backend used to verify that independent sessions can overlap."""
+
+    def __init__(self) -> None:
+        self.operations: list[object] = []
+
+    def begin(self, request: SessionStateTransferRequest) -> object:
+        operation = object()
+        self.operations.append(operation)
+        return operation
+
+    @staticmethod
+    def ready(operation: object) -> bool:
+        del operation
+        return False
+
+    @staticmethod
+    def commit(operation: object) -> None:
+        del operation
+
+    @staticmethod
+    def abort(operation: object) -> None:
+        del operation
+
+
 def test_session_state_transfer_manager_owns_lifecycle_only() -> None:
     backend = _Backend()
     manager = SessionStateTransferManager(clock=lambda: 1.0)
@@ -83,6 +110,26 @@ def test_session_state_transfer_manager_owns_lifecycle_only() -> None:
 def test_legacy_migration_names_remain_compatible() -> None:
     assert AsyncMigrationManager is SessionStateTransferManager
     assert MigrationRequest is SessionStateTransferRequest
+
+
+def test_default_transfer_manager_allows_independent_sessions() -> None:
+    backend = _UnlimitedBackend()
+    manager = SessionStateTransferManager()
+
+    manager.begin(SessionStateTransferRequest("session-a", "gpu-0", "gpu-1", 0.0, 0.5), backend)
+    manager.begin(SessionStateTransferRequest("session-b", "gpu-0", "gpu-1", 0.0, 0.5), backend)
+
+    assert manager.max_concurrent is None
+    assert len(manager.active()) == 2
+
+
+def test_transfer_manager_keeps_explicit_capacity_bound() -> None:
+    backend = _UnlimitedBackend()
+    manager = SessionStateTransferManager(max_concurrent=1)
+    manager.begin(SessionStateTransferRequest("session-a", "gpu-0", "gpu-1", 0.0, 0.5), backend)
+
+    with pytest.raises(RuntimeError, match="maximum concurrent transfers reached"):
+        manager.begin(SessionStateTransferRequest("session-b", "gpu-0", "gpu-1", 0.0, 0.5), backend)
 
 
 def test_progressive_transfer_remains_active_until_residual_copy_completes() -> None:

@@ -10,6 +10,7 @@ from telefuser.service.livekit.migration_hysteresis import MigrationCooldownPoli
 from telefuser.service.livekit.motivation_controller import MotivationRuntimeController
 from telefuser.service.livekit.motivation_diagnostics import MotivationDiagnosticsCollector
 from telefuser.service.livekit.motivation_scheduler import (
+    DispatchCandidate,
     GpuSchedulingState,
     MotivationProfile,
     MotivationScheduler,
@@ -414,6 +415,48 @@ def test_controller_prepares_async_migration_before_remote_dispatch() -> None:
     assert lease is not None
     assert lease.candidate.gpu_id == "gpu-1"
     assert leases == [lease]
+
+
+def test_controller_starts_all_independent_candidate_migrations() -> None:
+    scheduler = _make_scheduler()
+    scheduler.add_gpu(GpuSchedulingState("gpu-1", free_at=0.0, memory_free_gb=80.0))
+    scheduler.register_session("session-a", owner_gpu="gpu-0", now=0.0)
+    scheduler.register_session("session-b", owner_gpu="gpu-0", now=0.0)
+    backends: list[_ReadyBackend] = []
+
+    def make_backend(_request: MigrationRequest) -> _ReadyBackend:
+        backend = _ReadyBackend()
+        backends.append(backend)
+        return backend
+
+    manager = AsyncMigrationManager()
+    controller = MotivationRuntimeController(
+        scheduler,
+        dispatch=lambda _lease: None,
+        migration_manager=manager,
+        migration_backend_factory=make_backend,
+    )
+    candidate = DispatchCandidate(
+        session_ids=("session-a", "session-b"),
+        job_ids=("session-a:job", "session-b:job"),
+        gpu_id="gpu-1",
+        fidelity="high",
+        profile=None,
+        start_at=0.0,
+        finish_at=1.0,
+        migration_count=2,
+        migration_seconds=0.1,
+        score=0.0,
+        projected_slack={},
+        projected_quality={},
+        snapshot_epoch=scheduler.epoch,
+        session_versions={},
+        gpu_version=None,
+    )
+
+    assert controller._prepare_migration(candidate, now=0.0) is False
+    assert {record.request.session_id for record in manager.active()} == {"session-a", "session-b"}
+    assert len(backends) == 2
 
 
 def test_async_migration_completion_wakes_policy_search() -> None:

@@ -286,7 +286,11 @@ class LiveKitServeRuntime:
             # install the runtime migration backend in that mode.
             if controller.scheduler.policy_name != "fifo":
                 if controller.migration_manager is None:
-                    controller.migration_manager = SessionStateTransferManager()
+                    # Each session has its own migration lock in the
+                    # process-NCCL pool, so independent sessions are allowed
+                    # to transfer concurrently.  ``None`` explicitly means
+                    # no global admission cap.
+                    controller.migration_manager = SessionStateTransferManager(max_concurrent=None)
                 if controller.migration_backend_factory is None:
                     controller.migration_backend_factory = lambda _request: _RuntimeSessionStateTransferBackend(
                         self, self._motivation_loop

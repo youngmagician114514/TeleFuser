@@ -551,6 +551,59 @@ def test_migration_records_transport_phase_diagnostics(monkeypatch) -> None:
     asyncio.run(run())
 
 
+def test_independent_session_migrations_overlap_transport(monkeypatch) -> None:
+    """A slow copy for one session must not convoy an unrelated session."""
+
+    async def run() -> None:
+        pool = _pool()
+        pool._active_workers = {"worker-0", "worker-1"}
+        pool._nccl_ranks = {"worker-0": 0, "worker-1": 1}
+        for session_id in ("pipeline-a", "pipeline-b"):
+            pool._pipeline_routes[session_id] = "worker-0"
+            pool._session_workers[session_id] = "worker-0"
+            pool._ownership.register(session_id, "worker-0")
+        pool._send = lambda worker_id, command: None
+
+        transfer_ids: set[str] = set()
+        transfers_started = asyncio.Event()
+        transfer_release = asyncio.Event()
+
+        async def fake_request(worker_id: str, request_type: str, **kwargs: object) -> dict[str, object]:
+            del worker_id
+            if request_type == "model_output_drain_status":
+                return {
+                    "result": {
+                        "in_flight": False,
+                        "output_queue_empty": True,
+                        "publisher_unsubmitted_frames": 0,
+                    }
+                }
+            if request_type == "nccl_export":
+                return {"result": {"tensor_manifest": [], "state_bytes": 128}}
+            if request_type in {"nccl_send", "nccl_recv"}:
+                transfer_id = str(kwargs["transfer_id"])
+                transfer_ids.add(transfer_id)
+                if len(transfer_ids) >= 2:
+                    transfers_started.set()
+                await transfer_release.wait()
+                return {"result": {"groups": []}}
+            return {"result": True}
+
+        monkeypatch.setattr(pool, "_request", fake_request)
+        first = asyncio.create_task(pool.migrate_session("pipeline-a", "worker-1"))
+        second = asyncio.create_task(pool.migrate_session("pipeline-b", "worker-1"))
+
+        await asyncio.wait_for(transfers_started.wait(), timeout=1.0)
+        transfer_release.set()
+        ownership_a, ownership_b = await asyncio.gather(first, second)
+
+        assert ownership_a.worker_id == "worker-1"
+        assert ownership_b.worker_id == "worker-1"
+        assert len(transfer_ids) == 2
+
+    asyncio.run(run())
+
+
 def test_migration_failure_records_failed_phase_and_error_kind(monkeypatch) -> None:
     async def run() -> None:
         pool = _pool()
