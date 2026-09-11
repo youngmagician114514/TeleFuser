@@ -551,8 +551,8 @@ def test_migration_records_transport_phase_diagnostics(monkeypatch) -> None:
     asyncio.run(run())
 
 
-def test_independent_session_migrations_overlap_transport(monkeypatch) -> None:
-    """A slow copy for one session must not convoy an unrelated session."""
+def test_independent_migrations_overlap_prepare_and_serialize_process_group(monkeypatch) -> None:
+    """Control planes overlap while non-reentrant process-group copies stay ordered."""
 
     async def run() -> None:
         pool = _pool()
@@ -564,8 +564,10 @@ def test_independent_session_migrations_overlap_transport(monkeypatch) -> None:
             pool._ownership.register(session_id, "worker-0")
         pool._send = lambda worker_id, command: None
 
+        prepared_ids: set[str] = set()
         transfer_ids: set[str] = set()
-        transfers_started = asyncio.Event()
+        migrations_prepared = asyncio.Event()
+        first_transfer_started = asyncio.Event()
         transfer_release = asyncio.Event()
 
         async def fake_request(worker_id: str, request_type: str, **kwargs: object) -> dict[str, object]:
@@ -580,11 +582,15 @@ def test_independent_session_migrations_overlap_transport(monkeypatch) -> None:
                 }
             if request_type == "nccl_export":
                 return {"result": {"tensor_manifest": [], "state_bytes": 128}}
+            if request_type == "nccl_prepare_recv":
+                prepared_ids.add(str(kwargs["transfer_id"]))
+                if len(prepared_ids) >= 2:
+                    migrations_prepared.set()
+                return {"result": True}
             if request_type in {"nccl_send", "nccl_recv"}:
                 transfer_id = str(kwargs["transfer_id"])
                 transfer_ids.add(transfer_id)
-                if len(transfer_ids) >= 2:
-                    transfers_started.set()
+                first_transfer_started.set()
                 await transfer_release.wait()
                 return {"result": {"groups": []}}
             return {"result": True}
@@ -593,7 +599,14 @@ def test_independent_session_migrations_overlap_transport(monkeypatch) -> None:
         first = asyncio.create_task(pool.migrate_session("pipeline-a", "worker-1"))
         second = asyncio.create_task(pool.migrate_session("pipeline-b", "worker-1"))
 
-        await asyncio.wait_for(transfers_started.wait(), timeout=1.0)
+        await asyncio.wait_for(migrations_prepared.wait(), timeout=1.0)
+        await asyncio.wait_for(first_transfer_started.wait(), timeout=1.0)
+        # Both sessions have crossed export/target-prepare concurrently, but
+        # only one transfer ID may enter PyTorch's non-reentrant process-group
+        # coalescing section before it is released.
+        await asyncio.sleep(0)
+        assert len(prepared_ids) == 2
+        assert len(transfer_ids) == 1
         transfer_release.set()
         ownership_a, ownership_b = await asyncio.gather(first, second)
 

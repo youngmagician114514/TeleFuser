@@ -12,7 +12,7 @@ import contextlib
 import socket
 import threading
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, TypeVar
@@ -303,6 +303,17 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         # duplicate request for the same session remains serialized while
         # different sessions can overlap all transport phases.
         self._migration_session_locks: dict[str, asyncio.Lock] = {}
+        # PyTorch's process-group coalescing state is not re-entrant.  Keep
+        # migration admission/control-plane work concurrent, but submit only
+        # one process-group P2P transaction at a time.  The critical section
+        # is the streamed device copy, not drain/export/prepare/cleanup.
+        self._nccl_transfer_lock = asyncio.Lock()
+        # Scaling must remain exclusive with migration because it destroys
+        # and rebuilds the communicator.  A reader/writer guard allows any
+        # number of migrations to coexist while scale_to remains exclusive.
+        self._migration_topology_condition = asyncio.Condition()
+        self._migration_topology_readers = 0
+        self._migration_topology_scaling = False
         self._migration_lock = asyncio.Lock()
         self._initializing_workers = False
         # ``ProcessLiveKitWorkerPool`` owns the parent JSONL writer for both
@@ -356,7 +367,7 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
 
     async def scale_to(self, target_workers: int) -> int:
         """Rebuild the static NCCL communicator around a new replica set."""
-        async with self._migration_lock:
+        async with self._migration_lock, self._exclusive_migration_topology():
             if len(self._active_workers) == target_workers:
                 return target_workers
             if self._nccl_ranks:
@@ -369,6 +380,41 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
             if actual > 1 and not self._initializing_workers:
                 await self._init_nccl()
             return actual
+
+    @contextlib.asynccontextmanager
+    async def _shared_migration_topology(self) -> AsyncIterator[None]:
+        """Hold a shared communicator lease for one migration lifecycle."""
+
+        condition = self._migration_topology_condition
+        async with condition:
+            while self._migration_topology_scaling:
+                await condition.wait()
+            self._migration_topology_readers += 1
+        try:
+            yield
+        finally:
+            async with condition:
+                self._migration_topology_readers -= 1
+                if self._migration_topology_readers == 0:
+                    condition.notify_all()
+
+    @contextlib.asynccontextmanager
+    async def _exclusive_migration_topology(self) -> AsyncIterator[None]:
+        """Block communicator rebuild until every active migration exits."""
+
+        condition = self._migration_topology_condition
+        async with condition:
+            while self._migration_topology_scaling:
+                await condition.wait()
+            self._migration_topology_scaling = True
+            while self._migration_topology_readers:
+                await condition.wait()
+        try:
+            yield
+        finally:
+            async with condition:
+                self._migration_topology_scaling = False
+                condition.notify_all()
 
     def start_session(self, record: SessionRecord) -> None:
         if record.worker_id is None or record.worker_id not in self._active_workers:
@@ -845,7 +891,7 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
             pipeline_session_id,
             asyncio.Lock(),
         )
-        async with migration_session_lock:
+        async with migration_session_lock, self._shared_migration_topology():
             source_worker_id = self._pipeline_routes[pipeline_session_id]
             if source_worker_id == target_worker_id:
                 return self._ownership.owner(pipeline_session_id)
@@ -1043,22 +1089,23 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                 self._migration_ready_waiters[token.token_id] = ready_waiter
 
                 async def transfer_both() -> list[dict[str, Any]]:
-                    return await asyncio.gather(
-                        self._request(
-                            source_worker_id,
-                            "nccl_send",
-                            transfer_id=token.token_id,
-                            target_rank=self._nccl_ranks[target_worker_id],
-                            timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
-                        ),
-                        self._request(
-                            target_worker_id,
-                            "nccl_recv",
-                            transfer_id=token.token_id,
-                            source_rank=self._nccl_ranks[source_worker_id],
-                            timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
-                        ),
-                    )
+                    async with self._nccl_transfer_lock:
+                        return await asyncio.gather(
+                            self._request(
+                                source_worker_id,
+                                "nccl_send",
+                                transfer_id=token.token_id,
+                                target_rank=self._nccl_ranks[target_worker_id],
+                                timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
+                            ),
+                            self._request(
+                                target_worker_id,
+                                "nccl_recv",
+                                transfer_id=token.token_id,
+                                source_rank=self._nccl_ranks[source_worker_id],
+                                timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
+                            ),
+                        )
 
                 transfer_task = asyncio.create_task(
                     self._run_migration_phase(token.token_id, "transfer", transfer_both),
