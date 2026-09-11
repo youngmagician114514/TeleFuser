@@ -224,13 +224,13 @@ class LiveKitServeRuntime:
             migration_bandwidth_bytes_per_second=config.turboserve_migration_bandwidth_gbps * 1_000_000_000,
             migration_penalty=config.turboserve_migration_penalty,
         )
-        # A Motivation controller owns the global ``(B, c, g)`` placement
-        # decision, including asynchronous state migration. Keep the legacy
-        # TurboServe placement loop out of that mode: two independent
-        # controllers can select different owners for the same session while
-        # an NCCL transfer is in flight. Autoscaling remains independently
-        # controllable (when explicitly enabled), but it never performs a
-        # second placement decision for Motivation sessions.
+        # A configured policy controller owns the global ``(B, c, g)``
+        # placement decision, including any asynchronous state migration.
+        # Keep the legacy background placement loop out of that mode: two
+        # independent controllers can select different owners for the same
+        # session while an NCCL transfer is in flight. Autoscaling remains
+        # independently controllable (when explicitly enabled), but it never
+        # performs a second placement decision for policy-managed sessions.
         self._motivation_owns_placement = motivation_controller is not None
         self._background_rebalance_enabled = (
             config.turboserve_rebalance_enabled and not self._motivation_owns_placement
@@ -281,9 +281,9 @@ class LiveKitServeRuntime:
         if self._motivation_bridge is not None:
             self._motivation_loop = asyncio.get_running_loop()
             controller = self._motivation_bridge.controller
-            # Only Motivation owns placement and state transfer.  FIFO keeps
-            # each admitted session on its original worker, so do not even
-            # install the runtime migration backend in that mode.
+            # Motivation and TurboServe own placement and state transfer.
+            # FIFO keeps each admitted session on its original worker, so do
+            # not even install the runtime migration backend in that mode.
             if controller.scheduler.policy_name != "fifo":
                 if controller.migration_manager is None:
                     # Each session has its own migration lock in the
@@ -592,7 +592,11 @@ class LiveKitServeRuntime:
                 # retained for diagnosing why a controller was suppressed.
                 "enabled": self._background_rebalance_enabled,
                 "configured_enabled": self.config.turboserve_rebalance_enabled,
-                "owner": "motivation" if self._motivation_owns_placement else "turboserve",
+                "owner": (
+                    self._motivation_bridge.controller.scheduler.policy_name
+                    if self._motivation_bridge is not None
+                    else "turboserve"
+                ),
                 "last_plan": (
                     {
                         "session_id": self._last_migration_plan.session_id,

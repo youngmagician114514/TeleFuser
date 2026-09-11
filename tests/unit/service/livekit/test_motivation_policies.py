@@ -6,6 +6,7 @@ from telefuser.service.livekit.motivation_diagnostics import MotivationDiagnosti
 from telefuser.service.livekit.motivation_policies import (
     FIFOPolicy,
     MotivationPolicy,
+    TurboServePolicy,
     create_scheduling_policy,
 )
 from telefuser.service.livekit.motivation_scheduler import (
@@ -30,8 +31,83 @@ def _scheduler(policy_name: str, *, diagnostics=None) -> MotivationScheduler:
 def test_policy_registry_exposes_parallel_implementations() -> None:
     assert isinstance(create_scheduling_policy("motivation"), MotivationPolicy)
     assert isinstance(create_scheduling_policy("FIFO"), FIFOPolicy)
+    assert isinstance(create_scheduling_policy("TurboServe"), TurboServePolicy)
     with pytest.raises(ValueError, match="unknown scheduling policy"):
         create_scheduling_policy("unknown")
+
+
+def _turboserve_scheduler(*, migration_enabled: bool = True) -> MotivationScheduler:
+    profiles = [
+        MotivationProfile(1, "b1_s4_w18_rho0_bf16", 0.410, 1.0, 28.0),
+        MotivationProfile(2, "b2_s4_w18_rho0_bf16", 0.739, 1.0, 37.0),
+        MotivationProfile(3, "b3_s4_w18_rho0_bf16", 1.077, 1.0, 43.0),
+        MotivationProfile(4, "b4_s4_w18_rho0_bf16", 1.417, 1.0, 49.0),
+    ]
+    scheduler = MotivationScheduler(
+        StaticMotivationProfileTable(profiles),
+        config=MotivationSchedulerConfig(
+            policy_name="turboserve",
+            max_batch_size=4,
+            migration_enabled=migration_enabled,
+            turboserve_capacity_per_worker=8,
+            turboserve_min_gain_ms=40.0,
+        ),
+    )
+    scheduler.add_gpu(GpuSchedulingState("gpu-0", memory_free_gb=80.0))
+    scheduler.add_gpu(GpuSchedulingState("gpu-1", memory_free_gb=80.0))
+    return scheduler
+
+
+def test_turboserve_preserves_balanced_owners_and_coalesces_local_jobs() -> None:
+    scheduler = _turboserve_scheduler(migration_enabled=True)
+    owners = ("gpu-0", "gpu-1", "gpu-0", "gpu-1", "gpu-0", "gpu-1")
+    for index, owner in enumerate(owners):
+        scheduler.register_session(
+            f"s{index}", owner_gpu=owner, now=0.0, compatibility_key=(3,)
+        )
+        scheduler.submit_action(f"s{index}", ["W"], now=0.0)
+
+    candidate = scheduler.find_best(now=0.0, include_wait=False)
+
+    assert candidate is not None
+    assert candidate.policy_name == "turboserve"
+    assert candidate.gpu_id == "gpu-0"
+    assert candidate.session_ids == ("s0", "s2", "s4")
+    assert candidate.batch_size == 3
+    assert candidate.migration_count == 0
+    assert candidate.fidelity == "b3_s4_w18_rho0_bf16"
+
+
+def test_turboserve_is_not_motivation_quality_or_idle_mode() -> None:
+    scheduler = _turboserve_scheduler()
+
+    assert scheduler.config.include_idle_jobs is False
+    assert scheduler.config.lambda_quality == 0.0
+    assert scheduler.config.fairness_delta == 0.0
+    scheduler.register_session("idle", owner_gpu="gpu-0", now=0.0)
+    idle = scheduler.create_idle_job("idle", now=0.0)
+    assert idle is not None
+    assert scheduler.find_best(now=0.0, include_wait=False) is None
+
+
+def test_turboserve_migrates_only_after_minmax_gain_is_positive() -> None:
+    scheduler = _turboserve_scheduler(migration_enabled=True)
+    for index in range(4):
+        scheduler.register_session(
+            f"hot-{index}", owner_gpu="gpu-0", now=0.0, compatibility_key=(3,)
+        )
+        scheduler.submit_action(f"hot-{index}", ["W"], now=0.0)
+    scheduler.register_session("cool", owner_gpu="gpu-1", now=0.0, compatibility_key=(3,))
+    scheduler.submit_action("cool", ["W"], now=0.0)
+
+    candidate = scheduler.find_best(now=0.0, include_wait=False)
+
+    assert candidate is not None
+    assert candidate.policy_name == "turboserve"
+    assert candidate.gpu_id == "gpu-1"
+    assert candidate.migration_count == 1
+    assert "cool" in candidate.session_ids
+    assert candidate.fidelity.startswith("b2_s4_w18")
 
 
 def test_fifo_selects_oldest_released_action_instead_of_motivation_score() -> None:

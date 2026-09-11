@@ -3,8 +3,9 @@
 The policy objects decide *which* ready work should be offered to the shared
 scheduling coordinator.  State transitions, candidate validation,
 reservation, completion, and worker execution remain owned by
-``MotivationScheduler`` and ``MotivationRuntimeController``.  Only the
-Motivation policy uses the optional migration path.
+``MotivationScheduler`` and ``MotivationRuntimeController``.  Policies decide
+independently whether migration is part of their algorithm: Motivation and
+TurboServe may migrate, while FIFO is deliberately static.
 
 Keeping the policy boundary small is intentional: a baseline such as FIFO can
 reuse the production feasibility and lease machinery without becoming a second
@@ -89,9 +90,38 @@ class FIFOPolicy:
         )
 
 
+class TurboServePolicy:
+    """TurboServe-style placement and coalesced execution baseline.
+
+    The reference TurboServe controller is a placement policy: it keeps
+    sessions on their current workers, uses a least-loaded placement for new
+    work, and performs a bounded min--max migration only when the predicted
+    bottleneck reduction exceeds the migration cost.  It does not inspect the
+    Motivation slack/quality objective or choose among quality points.  The
+    coordinator still owns the common job lease and physical execution path;
+    this class only selects a fixed-family batch through the dedicated
+    ``_find_turboserve_candidate`` path.
+    """
+
+    name = "turboserve"
+
+    def select(self, scheduler: Any, request: SchedulingSearchRequest) -> Any:
+        return scheduler._find_turboserve_candidate(
+            now=request.now,
+            gpu_states=request.gpu_states,
+            wait_seconds=request.wait_seconds,
+            include_wait=request.include_wait,
+            allow_migrations=request.allow_migrations,
+            exclude_session_ids=request.exclude_session_ids,
+            blocked_migration_session_ids=request.blocked_migration_session_ids,
+            policy_name=self.name,
+        )
+
+
 _POLICY_TYPES: dict[str, type[SchedulingPolicy]] = {
     MotivationPolicy.name: MotivationPolicy,
     FIFOPolicy.name: FIFOPolicy,
+    TurboServePolicy.name: TurboServePolicy,
 }
 
 
@@ -108,6 +138,7 @@ def create_scheduling_policy(name: str) -> SchedulingPolicy:
 __all__ = [
     "FIFOPolicy",
     "MotivationPolicy",
+    "TurboServePolicy",
     "SchedulingPolicy",
     "SchedulingSearchRequest",
     "create_scheduling_policy",

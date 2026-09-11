@@ -133,8 +133,8 @@ class MotivationExecutionBridge:
         if not isinstance(defer_scheduling, bool):
             raise TypeError("defer_scheduling must be a bool")
         self._defer_scheduling = defer_scheduling
-        # The batch gate is a Motivation optimization: it waits briefly for
-        # compatible jobs so the profile-aware policy can form a larger batch.
+        # The batch gate is shared by policies that support aggregation: it
+        # waits briefly for compatible jobs so they can form a larger batch.
         # FIFO is a strict singleton baseline, so force the gate off even if
         # the caller leaves the production default enabled.  This also keeps
         # FIFO free of an extra hidden scheduler search on every control event.

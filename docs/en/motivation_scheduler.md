@@ -62,13 +62,14 @@ does not stop playback.  An explicitly paused consumer can set
 
 ## Pluggable policies
 
-`MotivationPolicy` and `FIFOPolicy` are parallel implementations behind the
-small `SchedulingPolicy` interface. The scheduler coordinator continues to
-own session state, physical feasibility, versioned reservations, completion,
-and diagnostics; a policy only chooses which ready work is offered to that
-shared machinery. Motivation additionally enables the migration path, while
-FIFO deliberately does not. This keeps a baseline from duplicating the
-LiveKit execution path and leaves room for additional policies later.
+`MotivationPolicy`, `FIFOPolicy`, and `TurboServePolicy` are parallel
+implementations behind the small `SchedulingPolicy` interface. The scheduler
+coordinator continues to own session state, physical feasibility, versioned
+reservations, completion, and diagnostics; a policy only chooses which ready
+work is offered to that shared machinery. Motivation and TurboServe may use
+the migration path, while FIFO deliberately does not. This keeps a baseline
+from duplicating the LiveKit execution path and leaves room for additional
+policies later.
 
 The default is `motivation`. A deliberately simple FIFO baseline can be
 selected with `--motivation-policy fifo`. FIFO orders released action jobs by
@@ -84,6 +85,24 @@ if multiple rows exist, a missing fixed row is reported instead of silently
 choosing by quality.
 The selected policy is included in scheduler snapshots and search/dispatch
 diagnostics.
+
+`TurboServePolicy` is the third parallel policy and can be selected with
+`--motivation-policy turboserve`. It follows the TurboServe paper's
+placement-side baseline: existing ownership is retained, new/active work is
+placed by least load, and a bounded min--max rebalancer proposes a move only
+when its predicted bottleneck reduction exceeds the configured migration
+threshold. It uses the fixed `S4/W18/BF16` execution family and native
+coalesced batches (up to `motivation-max-batch-size`); it does not call the
+Motivation slack, quality, fairness, or idle-job objective. Idle sessions are
+treated as suspended for this baseline. The common coordinator still owns
+versioned reservations, NCCL migration, completion, and all producer/client
+metrics, so the three policies are directly comparable on the same runner.
+
+When autoscaling is enabled, the runtime's existing TurboServe closed-loop
+controller independently applies the paper's target-utilization and
+hysteresis budget rule. For fixed-budget comparisons, disable autoscaling;
+the policy then differs from FIFO only in coalesced batching and
+migration-aware min--max placement.
 
 When the LiveKit runtime reports a session as running, the execution bridge
 materializes an idle sentinel if no action state is held. The bridge forwards

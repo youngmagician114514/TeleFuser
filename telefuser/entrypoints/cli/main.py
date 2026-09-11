@@ -223,7 +223,7 @@ def serve(
     default="motivation",
     type=str,
     show_default=True,
-    help="Global scheduling policy (motivation or fifo)",
+    help="Global scheduling policy (motivation, fifo, or turboserve)",
 )
 def stream_serve(
     pipe_path: str,

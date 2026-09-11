@@ -155,6 +155,14 @@ admission scheduler 删除，旧回调仍尝试发布 target owner。它没有�
 4. **对比实验：** MotivationPolicy 与 FIFOPolicy 已是并列 policy，实现可复用同一 runner、producer
    SLO/CPR/Q 分析器和迁移/吞吐诊断。后续 baseline 不应自行定义另一套指标。
 
+   当前又加入了与二者并列的 `TurboServePolicy`。它对应论文中的 placement baseline：保留现有
+   session owner，以 least-load 分配新 active session，并用 bounded min-max rebalancing 仅在预测
+   bottleneck 收益超过迁移阈值时迁移。它固定使用 S4/W18/BF16 的质量点，允许原生 coalesced batch，
+   不调用 Motivation 的 slack/quality/fairness/idle 目标；idle session 按 TurboServe 论文语义挂起。
+   lease、NCCL/SST、completion 和指标仍由共享 coordinator/runner 提供，因此三种策略可直接使用
+   同一套实验指标比较。开启 autoscaling 时，runtime 复用现有 TurboServe target-utilization 与
+   hysteresis controller；固定 GPU 预算对比时关闭 autoscaling。
+
 ## 复现实验
 
 ```bash

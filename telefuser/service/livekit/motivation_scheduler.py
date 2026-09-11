@@ -41,6 +41,14 @@ from .profile_quality import (
     normalize_profile_qualities,
     profile_batch_family,
 )
+from .turboserve import (
+    TurboServeClusterScheduler,
+    TurboServeLatencyModel,
+    TurboServeRuntimeCalibration,
+    TurboServeSchedulerConfig,
+    TurboServeSchedulingSnapshot,
+    TurboServeSessionView,
+)
 
 EPSILON = 1e-9
 JobKind = Literal["action", "idle"]
@@ -703,6 +711,15 @@ class MotivationSchedulerConfig:
     # trade-off is made at runtime.  A caller may still override this in a
     # reduced unit-test table, but production entrypoints use this default.
     fifo_fidelity: str | None = "b1_s4_w18_rho0_bf16"
+    # TurboServe is a separate policy path.  These knobs mirror the
+    # source-compatible closed-loop placement controller while keeping its
+    # fixed execution family independent from Motivation quality selection.
+    turboserve_capacity_per_worker: int = 8
+    turboserve_target_utilization: float = 0.9
+    turboserve_migration_eta: float = 0.01
+    turboserve_min_gain_ms: float = 40.0
+    turboserve_rebalance_iteration_limit: int = 3
+    turboserve_fidelity_family: str = "s4_w18_rho0_bf16"
 
     def __post_init__(self) -> None:
         if not 1 <= self.max_batch_size <= 4:
@@ -731,6 +748,29 @@ class MotivationSchedulerConfig:
             not isinstance(self.fifo_fidelity, str) or not self.fifo_fidelity.strip()
         ):
             raise ValueError("fifo_fidelity must be a non-empty string or None")
+        if (
+            not isinstance(self.turboserve_capacity_per_worker, int)
+            or isinstance(self.turboserve_capacity_per_worker, bool)
+            or self.turboserve_capacity_per_worker < 1
+        ):
+            raise ValueError("turboserve_capacity_per_worker must be a positive integer")
+        if (
+            not math.isfinite(float(self.turboserve_target_utilization))
+            or not 0 < self.turboserve_target_utilization <= 1
+        ):
+            raise ValueError("turboserve_target_utilization must be in (0, 1]")
+        for name in ("turboserve_migration_eta", "turboserve_min_gain_ms"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if (
+            not isinstance(self.turboserve_rebalance_iteration_limit, int)
+            or isinstance(self.turboserve_rebalance_iteration_limit, bool)
+            or not 1 <= self.turboserve_rebalance_iteration_limit <= 64
+        ):
+            raise ValueError("turboserve_rebalance_iteration_limit must be in [1, 64]")
+        if not isinstance(self.turboserve_fidelity_family, str) or not self.turboserve_fidelity_family.strip():
+            raise ValueError("turboserve_fidelity_family must be a non-empty string")
 
 
 @dataclass(frozen=True)
@@ -798,6 +838,17 @@ class MotivationScheduler:
                 lambda_quality=0.0,
                 fairness_delta=0.0,
                 migration_enabled=False,
+            )
+        elif self._policy.name == "turboserve":
+            # TurboServe suspends idle sessions and has no adaptive quality or
+            # fairness objective.  It retains native coalesced batching and
+            # migration-aware placement, both implemented in its own policy
+            # path below.
+            self.config = replace(
+                requested_config,
+                include_idle_jobs=False,
+                lambda_quality=0.0,
+                fairness_delta=0.0,
             )
         else:
             self.config = requested_config
@@ -927,7 +978,7 @@ class MotivationScheduler:
             # selecting its maximum-quality row during session admission.
             # Actual profile quality remains available in the execution trace
             # for post-run reporting.
-            if initial_quality is None and self.policy_name == "fifo":
+            if initial_quality is None and self.policy_name in {"fifo", "turboserve"}:
                 initial_quality = 1.0
             if initial_quality is None:
                 profiles = [
@@ -1136,6 +1187,345 @@ class MotivationScheduler:
         # sessions remain available as useful batch fillers. Candidate scoring
         # retains ``action_count`` as the deterministic action-first tie-break.
         return tuple(ready)
+
+    def _find_turboserve_candidate(
+        self,
+        *,
+        now: float | None = None,
+        gpu_states: Sequence[GpuSchedulingState] | None = None,
+        wait_seconds: float = 0.0,
+        include_wait: bool = True,
+        allow_migrations: bool = True,
+        exclude_session_ids: Iterable[str] = (),
+        blocked_migration_session_ids: Iterable[str] = (),
+        policy_name: str = "turboserve",
+    ) -> DispatchCandidate | None:
+        """Select one TurboServe-style coalesced chunk candidate.
+
+        TurboServe's reference policy is a placement controller rather than a
+        quality optimizer.  We therefore first run its least-load/min--max
+        placement calculation over the coordinator snapshot, then expose one
+        fixed-family batch to the shared lease machinery.  Existing owners are
+        retained whenever the placement controller finds no positive
+        bottleneck-reduction move; this is important for low-pressure traces,
+        where moving sessions merely to make a larger batch would be harmful.
+        """
+        observed_at = self._clock() if now is None else now
+        excluded = {str(value) for value in exclude_session_ids}
+        blocked = {str(value) for value in blocked_migration_session_ids}
+
+        with self._lock:
+            observed_at = self._advance_to(observed_at)
+            live_states = tuple(self._sessions.values())
+            snapshot_states = tuple(replace(state) for state in live_states)
+            snapshot_by_id = {state.session_id: state for state in snapshot_states}
+            all_ready = tuple(
+                (snapshot_by_id[state.session_id], job)
+                for state, job in self._ready_jobs()
+                if job.kind == "action"
+            )
+            ready = tuple(item for item in all_ready if item[0].session_id not in excluded)
+            gpus = tuple(gpu_states) if gpu_states is not None else tuple(self._gpus.values())
+            snapshot_epoch = self._epoch
+
+        available_gpus = tuple(gpu for gpu in gpus if gpu.available)
+        enumerated = empty_batch_counts()
+        compatible = empty_batch_counts()
+        profiles_evaluated = empty_batch_counts()
+        feasible = empty_batch_counts()
+        rejected: dict[str, int] = {}
+
+        def reject(reason: str, count: int = 1) -> None:
+            rejected[reason] = rejected.get(reason, 0) + count
+
+        def record_and_wait(selected: DispatchCandidate | None) -> DispatchCandidate | None:
+            result = selected
+            if result is None and include_wait:
+                result = self._wait_candidate(
+                    now=observed_at,
+                    wait_seconds=wait_seconds,
+                    states=snapshot_states,
+                    snapshot_epoch=snapshot_epoch,
+                    policy_name=policy_name,
+                )
+            not_selected = dict(feasible)
+            if result is not None and not result.wait:
+                not_selected[result.batch_size] = max(0, not_selected[result.batch_size] - 1)
+            summary = MotivationSearchSummary(
+                observed_at=observed_at,
+                snapshot_epoch=snapshot_epoch,
+                ready_count=len(ready),
+                ready_action_count=sum(1 for _, job in ready if job.kind == "action"),
+                ready_idle_count=sum(1 for _, job in ready if job.kind == "idle"),
+                excluded_ready_count=len(all_ready) - len(ready),
+                gpu_count=len(gpus),
+                include_wait=include_wait,
+                allow_migrations=allow_migrations,
+                wait_seconds=max(0.0, wait_seconds),
+                enumerated_by_batch_size=enumerated,
+                compatible_by_batch_size=compatible,
+                profiles_evaluated_by_batch_size=profiles_evaluated,
+                feasible_by_batch_size=feasible,
+                rejected_by_reason=rejected,
+                not_selected_by_score=not_selected,
+                selected_batch_size=result.batch_size if result is not None else 0,
+                selected_wait=bool(result.wait) if result is not None else False,
+                selected_gpu_id=result.gpu_id if result is not None else None,
+                selected_fidelity=result.fidelity if result is not None else None,
+                selected_score=result.score if result is not None else None,
+                selected_migration_count=result.migration_count if result is not None else 0,
+                selected_session_ids=result.session_ids if result is not None else (),
+                selected_job_ids=result.job_ids if result is not None else (),
+                policy_name=policy_name,
+            )
+            try:
+                self._diagnostics.record_search(summary)
+            except Exception:
+                pass
+            return result
+
+        if not ready or not available_gpus:
+            if not available_gpus:
+                reject("gpu_unavailable", max(1, len(ready)))
+            return record_and_wait(None)
+
+        # The baseline has one fixed semantic execution family.  Batching may
+        # change latency/throughput, but never causes a quality-point choice.
+        family = self.config.turboserve_fidelity_family.strip()
+        parsed_batch, parsed_family = profile_batch_family(family)
+        if parsed_batch is not None:
+            family = parsed_family
+
+        profile_cache: dict[tuple[str, int], MotivationProfile | None] = {}
+
+        def fixed_profile(gpu_id: str, batch_size: int) -> MotivationProfile | None:
+            key = (gpu_id, batch_size)
+            if key in profile_cache:
+                return profile_cache[key]
+            requested = f"b{batch_size}_{family}"
+            rows = tuple(
+                row
+                for row in self.profile_provider.profiles_for(
+                    batch_size=batch_size,
+                    gpu_id=gpu_id,
+                )
+                if row.fidelity == requested
+            )
+            profile_cache[key] = rows[0] if rows else None
+            profiles_evaluated[batch_size] += len(rows)
+            return profile_cache[key]
+
+        # The shared scheduler remains the source of truth for ownership and
+        # version validation. Calibrate TurboServe's analytic model from the
+        # same fixed B1 profile used by physical dispatch; its generic 180-ms
+        # default would otherwise undervalue measured ABot S4/W18 chunks.
+        b1_latencies_ms = tuple(
+            profile.latency_seconds * 1000.0
+            for gpu in available_gpus
+            if (profile := fixed_profile(gpu.gpu_id, 1)) is not None
+        )
+        base_chunk_latency_ms = (
+            sum(b1_latencies_ms) / len(b1_latencies_ms)
+            if b1_latencies_ms
+            else 0.0
+        )
+        worker_order = tuple(gpu.gpu_id for gpu in available_gpus)
+        active = {
+            state.session_id: TurboServeSessionView(
+                session_id=state.session_id,
+                # TurboServe's alpha_i is user activity.  The shared action
+                # adapter updates ``latest_controls`` even for non-release
+                # messages, making it the exact active/idle signal while an
+                # already in-flight chunk remains protected by the common
+                # lease state.
+                active=bool(state.latest_controls and not state.departed),
+                state_size_mb=1.0,
+            )
+            for state in snapshot_states
+        }
+        placement = {
+            state.session_id: state.owner_gpu
+            for state in snapshot_states
+            if not state.departed
+        }
+        route_ready_ms = max(
+            0.0,
+            float(getattr(self.migration_estimator, "first_layer_ready_seconds", 0.0)) * 1000.0,
+        )
+        latency_model = TurboServeLatencyModel()
+        if base_chunk_latency_ms > 0:
+            latency_model.base_chunk_latency_ms = base_chunk_latency_ms
+        cluster = TurboServeClusterScheduler(
+            TurboServeSchedulerConfig(
+                enable_autoscaling=False,
+                enable_migration=bool(self.config.migration_enabled and allow_migrations),
+                min_workers=1,
+                max_workers=len(worker_order),
+                capacity_per_worker=self.config.turboserve_capacity_per_worker,
+                target_utilization=self.config.turboserve_target_utilization,
+                migration_eta=self.config.turboserve_migration_eta,
+                min_gain_ms=self.config.turboserve_min_gain_ms,
+                rebalance_iteration_limit=self.config.turboserve_rebalance_iteration_limit,
+            ),
+            latency_model=latency_model,
+        )
+        placement_decision = cluster.decide(
+            TurboServeSchedulingSnapshot(
+                time_seconds=observed_at,
+                sessions=active,
+                placement=placement,
+                current_workers=len(worker_order),
+                worker_order=worker_order,
+                capacity_per_worker=self.config.turboserve_capacity_per_worker,
+                runtime_calibration=TurboServeRuntimeCalibration(
+                    average_route_ready_ms=route_ready_ms,
+                    p50_route_ready_ms=route_ready_ms,
+                    base_chunk_latency_ms=base_chunk_latency_ms,
+                ),
+            )
+        )
+        desired = placement_decision.placement
+
+        ready_by_id = {state.session_id: (state, job) for state, job in ready}
+        max_batch = min(self.config.max_batch_size, len(ready))
+        for size in range(1, max_batch + 1):
+            enumerated[size] = sum(math.comb(len(ready), size) for _ in available_gpus)
+
+        def make_candidate(
+            session_items: Sequence[tuple[SessionSchedulingState, ActionJob]],
+            gpu: GpuSchedulingState,
+            estimates: Mapping[str, MigrationEstimate] | None = None,
+        ) -> DispatchCandidate | None:
+            if not session_items:
+                return None
+            ordered = tuple(sorted(session_items, key=lambda item: (item[1].sequence, item[1].created_at, item[1].job_id)))
+            size = len(ordered)
+            if size > self.config.max_batch_size:
+                ordered = ordered[: self.config.max_batch_size]
+                size = len(ordered)
+            profile = fixed_profile(gpu.gpu_id, size)
+            if profile is None:
+                reject("no_profile")
+                return None
+            effective_memory = gpu.memory_free_gb
+            if gpu.free_at > observed_at + EPSILON and gpu.memory_free_gb != math.inf:
+                effective_memory += gpu.reserved_memory_gb
+            if profile.memory_gb > effective_memory + EPSILON:
+                reject("memory")
+                return None
+            migration_count = 0
+            migration_seconds = 0.0
+            max_ready_at = observed_at
+            if estimates is not None:
+                for state, _job in ordered:
+                    estimate = estimates.get(state.session_id)
+                    if estimate is None:
+                        continue
+                    if estimate.required:
+                        migration_count += 1
+                        migration_seconds += estimate.cost_seconds
+                    max_ready_at = max(max_ready_at, estimate.ready_at)
+            start_at = max(observed_at, gpu.free_at, max_ready_at)
+            finish_at = start_at + profile.latency_seconds
+            feasible[size] += 1
+            return DispatchCandidate(
+                session_ids=tuple(state.session_id for state, _job in ordered),
+                job_ids=tuple(job.job_id for _state, job in ordered),
+                gpu_id=gpu.gpu_id,
+                fidelity=profile.fidelity,
+                profile=profile,
+                start_at=start_at,
+                finish_at=finish_at,
+                migration_count=migration_count,
+                migration_seconds=migration_seconds,
+                score=0.0,
+                projected_slack={},
+                projected_quality={},
+                snapshot_epoch=snapshot_epoch,
+                session_versions={state.session_id: state.state_version for state, _job in ordered},
+                gpu_version=gpu.version,
+                policy_name=policy_name,
+            )
+
+        gpu_by_id = {gpu.gpu_id: gpu for gpu in available_gpus}
+
+        # First honor a positive min--max placement move.  Only one moved
+        # session is exposed per candidate; the next search observes the new
+        # ownership epoch and can coalesce another compatible local job.
+        if self.config.migration_enabled and allow_migrations:
+            move_options: list[tuple[int, SessionSchedulingState, ActionJob, str, MigrationEstimate]] = []
+            for session_id, (state, job) in ready_by_id.items():
+                target_id = desired.get(session_id)
+                if (
+                    target_id is None
+                    or target_id == state.owner_gpu
+                    or target_id not in gpu_by_id
+                    or session_id in blocked
+                ):
+                    continue
+                estimate = self.migration_estimator.estimate(
+                    state,
+                    target_gpu=target_id,
+                    now=observed_at,
+                )
+                if not estimate.required:
+                    continue
+                move_options.append((job.sequence, state, job, target_id, estimate))
+            if move_options:
+                _sequence, moved_state, moved_job, target_id, moved_estimate = min(
+                    move_options,
+                    key=lambda item: (item[0], item[1].session_id),
+                )
+                selected_items = [(moved_state, moved_job)]
+                for state, job in sorted(ready, key=lambda item: (item[1].sequence, item[0].session_id)):
+                    if state.session_id == moved_state.session_id or state.owner_gpu != target_id:
+                        continue
+                    if state.compatibility_key != moved_state.compatibility_key:
+                        continue
+                    if len(selected_items) >= self.config.max_batch_size:
+                        break
+                    selected_items.append((state, job))
+                candidate = make_candidate(
+                    selected_items,
+                    gpu_by_id[target_id],
+                    {moved_state.session_id: moved_estimate},
+                )
+                if candidate is not None:
+                    return record_and_wait(candidate)
+
+        # No beneficial move: preserve residency and emulate TurboServe's
+        # coalesced FCFS execution by grouping local ready jobs by compatibility
+        # key and selecting the oldest group.  This keeps free GPUs useful in
+        # low-pressure bursts instead of migrating sessions just to fill B>1.
+        local_options: list[tuple[tuple[float, int, int, str], DispatchCandidate]] = []
+        for gpu in available_gpus:
+            local = [
+                (state, job)
+                for state, job in ready
+                if state.owner_gpu == gpu.gpu_id
+            ]
+            groups: dict[tuple[object, ...], list[tuple[SessionSchedulingState, ActionJob]]] = {}
+            for state, job in local:
+                groups.setdefault(state.compatibility_key, []).append((state, job))
+            for members in groups.values():
+                members.sort(key=lambda item: (item[1].sequence, item[0].session_id))
+                compatible[min(len(members), self.config.max_batch_size)] += 1
+                selected = members[: self.config.max_batch_size]
+                candidate = make_candidate(selected, gpu)
+                if candidate is None:
+                    continue
+                first_sequence = selected[0][1].sequence
+                priority = (
+                    candidate.start_at,
+                    first_sequence,
+                    -candidate.batch_size,
+                    gpu.gpu_id,
+                )
+                local_options.append((priority, candidate))
+        if local_options:
+            local_options.sort(key=lambda item: item[0])
+            return record_and_wait(local_options[0][1])
+        return record_and_wait(None)
 
     def _find_fifo_candidate(
         self,
