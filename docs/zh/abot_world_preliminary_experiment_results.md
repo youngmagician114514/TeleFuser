@@ -157,11 +157,13 @@ admission scheduler 删除，旧回调仍尝试发布 target owner。它没有�
 
    当前又加入了与二者并列的 `TurboServePolicy`。它对应论文中的 placement baseline：保留现有
    session owner，以 least-load 分配新 active session，并用 bounded min-max rebalancing 仅在预测
-   bottleneck 收益超过迁移阈值时迁移。它固定使用 S4/W18/BF16 的质量点，允许原生 coalesced batch，
-   不调用 Motivation 的 slack/quality/fairness/idle 目标；idle session 按 TurboServe 论文语义挂起。
-   lease、NCCL/SST、completion 和指标仍由共享 coordinator/runner 提供，因此三种策略可直接使用
-   同一套实验指标比较。开启 autoscaling 时，runtime 复用现有 TurboServe target-utilization 与
-   hysteresis controller；固定 GPU 预算对比时关闭 autoscaling。
+   bottleneck 收益超过迁移阈值时迁移。论文描述了 coalesced chunk processing，但检查 `/lwb/TurboServe`
+   源码后，实际 worker 是 `LocalRoundRobinStepScheduler` 每次选一个 `SessionState`，再调用一次
+   `step_one_block`，demo 输入也是 `batch_size=1`。因此当前 baseline 忠实采用固定 S4/W18/BF16/B1，
+   不额外发明跨 session batching；也不调用 Motivation 的 slack/quality/fairness/idle 目标，idle
+   session 按 TurboServe 语义挂起。lease、NCCL/SST、completion 和指标仍由共享 coordinator/runner
+   提供，因此三种策略可直接使用同一套实验指标比较。开启 autoscaling 时，runtime 复用现有
+   TurboServe target-utilization 与 hysteresis controller；固定 GPU 预算对比时关闭 autoscaling。
 
 ## 复现实验
 

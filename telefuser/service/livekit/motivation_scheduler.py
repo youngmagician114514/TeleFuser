@@ -841,11 +841,13 @@ class MotivationScheduler:
             )
         elif self._policy.name == "turboserve":
             # TurboServe suspends idle sessions and has no adaptive quality or
-            # fairness objective.  It retains native coalesced batching and
-            # migration-aware placement, both implemented in its own policy
-            # path below.
+            # fairness objective.  The checked TurboServe source executes one
+            # SessionState at a time with LocalRoundRobinStepScheduler, so this
+            # source-faithful baseline is a fixed B1 singleton path.  Its
+            # migration-aware placement remains implemented below.
             self.config = replace(
                 requested_config,
+                max_batch_size=1,
                 include_idle_jobs=False,
                 lambda_quality=0.0,
                 fairness_delta=0.0,
@@ -1200,12 +1202,12 @@ class MotivationScheduler:
         blocked_migration_session_ids: Iterable[str] = (),
         policy_name: str = "turboserve",
     ) -> DispatchCandidate | None:
-        """Select one TurboServe-style coalesced chunk candidate.
+        """Select one source-faithful TurboServe singleton chunk candidate.
 
         TurboServe's reference policy is a placement controller rather than a
         quality optimizer.  We therefore first run its least-load/min--max
         placement calculation over the coordinator snapshot, then expose one
-        fixed-family batch to the shared lease machinery.  Existing owners are
+        fixed-family B1 job to the shared lease machinery.  Existing owners are
         retained whenever the placement controller finds no positive
         bottleneck-reduction move; this is important for low-pressure traces,
         where moving sessions merely to make a larger batch would be harmful.
@@ -1289,8 +1291,10 @@ class MotivationScheduler:
                 reject("gpu_unavailable", max(1, len(ready)))
             return record_and_wait(None)
 
-        # The baseline has one fixed semantic execution family.  Batching may
-        # change latency/throughput, but never causes a quality-point choice.
+        # The source baseline has one fixed semantic execution family and one
+        # session per model invocation.  The paper discusses coalesced chunks,
+        # but the checked repository implementation's round-robin worker does
+        # not assemble cross-session batches; keep this path B1-only.
         family = self.config.turboserve_fidelity_family.strip()
         parsed_batch, parsed_family = profile_batch_family(family)
         if parsed_batch is not None:
@@ -1387,22 +1391,18 @@ class MotivationScheduler:
         desired = placement_decision.placement
 
         ready_by_id = {state.session_id: (state, job) for state, job in ready}
-        max_batch = min(self.config.max_batch_size, len(ready))
-        for size in range(1, max_batch + 1):
-            enumerated[size] = sum(math.comb(len(ready), size) for _ in available_gpus)
+        enumerated[1] = len(ready) * len(available_gpus)
 
         def make_candidate(
             session_items: Sequence[tuple[SessionSchedulingState, ActionJob]],
             gpu: GpuSchedulingState,
             estimates: Mapping[str, MigrationEstimate] | None = None,
         ) -> DispatchCandidate | None:
-            if not session_items:
+            if len(session_items) != 1:
+                reject("turboserve_singleton_only")
                 return None
             ordered = tuple(sorted(session_items, key=lambda item: (item[1].sequence, item[1].created_at, item[1].job_id)))
-            size = len(ordered)
-            if size > self.config.max_batch_size:
-                ordered = ordered[: self.config.max_batch_size]
-                size = len(ordered)
+            size = 1
             profile = fixed_profile(gpu.gpu_id, size)
             if profile is None:
                 reject("no_profile")
@@ -1451,7 +1451,7 @@ class MotivationScheduler:
 
         # First honor a positive min--max placement move.  Only one moved
         # session is exposed per candidate; the next search observes the new
-        # ownership epoch and can coalesce another compatible local job.
+        # ownership epoch and can dispatch the next singleton local job.
         if self.config.migration_enabled and allow_migrations:
             move_options: list[tuple[int, SessionSchedulingState, ActionJob, str, MigrationEstimate]] = []
             for session_id, (state, job) in ready_by_id.items():
@@ -1476,27 +1476,18 @@ class MotivationScheduler:
                     move_options,
                     key=lambda item: (item[0], item[1].session_id),
                 )
-                selected_items = [(moved_state, moved_job)]
-                for state, job in sorted(ready, key=lambda item: (item[1].sequence, item[0].session_id)):
-                    if state.session_id == moved_state.session_id or state.owner_gpu != target_id:
-                        continue
-                    if state.compatibility_key != moved_state.compatibility_key:
-                        continue
-                    if len(selected_items) >= self.config.max_batch_size:
-                        break
-                    selected_items.append((state, job))
                 candidate = make_candidate(
-                    selected_items,
+                    [(moved_state, moved_job)],
                     gpu_by_id[target_id],
                     {moved_state.session_id: moved_estimate},
                 )
                 if candidate is not None:
                     return record_and_wait(candidate)
 
-        # No beneficial move: preserve residency and emulate TurboServe's
-        # coalesced FCFS execution by grouping local ready jobs by compatibility
-        # key and selecting the oldest group.  This keeps free GPUs useful in
-        # low-pressure bursts instead of migrating sessions just to fill B>1.
+        # No beneficial move: preserve residency and emulate the source
+        # worker's FCFS-over-round-robin singleton execution. Select the oldest
+        # local action on each GPU, then choose the earliest available GPU.
+        # There is intentionally no cross-session compatibility group.
         local_options: list[tuple[tuple[float, int, int, str], DispatchCandidate]] = []
         for gpu in available_gpus:
             local = [
@@ -1504,24 +1495,14 @@ class MotivationScheduler:
                 for state, job in ready
                 if state.owner_gpu == gpu.gpu_id
             ]
-            groups: dict[tuple[object, ...], list[tuple[SessionSchedulingState, ActionJob]]] = {}
-            for state, job in local:
-                groups.setdefault(state.compatibility_key, []).append((state, job))
-            for members in groups.values():
-                members.sort(key=lambda item: (item[1].sequence, item[0].session_id))
-                compatible[min(len(members), self.config.max_batch_size)] += 1
-                selected = members[: self.config.max_batch_size]
-                candidate = make_candidate(selected, gpu)
-                if candidate is None:
-                    continue
-                first_sequence = selected[0][1].sequence
-                priority = (
-                    candidate.start_at,
-                    first_sequence,
-                    -candidate.batch_size,
-                    gpu.gpu_id,
-                )
-                local_options.append((priority, candidate))
+            local.sort(key=lambda item: (item[1].sequence, item[0].session_id))
+            state, job = local[0]
+            compatible[1] += 1
+            candidate = make_candidate([(state, job)], gpu)
+            if candidate is None:
+                continue
+            priority = (candidate.start_at, job.sequence, 0, gpu.gpu_id)
+            local_options.append((priority, candidate))
         if local_options:
             local_options.sort(key=lambda item: item[0])
             return record_and_wait(local_options[0][1])

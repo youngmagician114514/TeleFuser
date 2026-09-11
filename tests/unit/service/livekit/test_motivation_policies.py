@@ -58,7 +58,7 @@ def _turboserve_scheduler(*, migration_enabled: bool = True) -> MotivationSchedu
     return scheduler
 
 
-def test_turboserve_preserves_balanced_owners_and_coalesces_local_jobs() -> None:
+def test_turboserve_preserves_balanced_owners_and_dispatches_singletons() -> None:
     scheduler = _turboserve_scheduler(migration_enabled=True)
     owners = ("gpu-0", "gpu-1", "gpu-0", "gpu-1", "gpu-0", "gpu-1")
     for index, owner in enumerate(owners):
@@ -72,15 +72,16 @@ def test_turboserve_preserves_balanced_owners_and_coalesces_local_jobs() -> None
     assert candidate is not None
     assert candidate.policy_name == "turboserve"
     assert candidate.gpu_id == "gpu-0"
-    assert candidate.session_ids == ("s0", "s2", "s4")
-    assert candidate.batch_size == 3
+    assert candidate.session_ids == ("s0",)
+    assert candidate.batch_size == 1
     assert candidate.migration_count == 0
-    assert candidate.fidelity == "b3_s4_w18_rho0_bf16"
+    assert candidate.fidelity == "b1_s4_w18_rho0_bf16"
 
 
 def test_turboserve_is_not_motivation_quality_or_idle_mode() -> None:
     scheduler = _turboserve_scheduler()
 
+    assert scheduler.config.max_batch_size == 1
     assert scheduler.config.include_idle_jobs is False
     assert scheduler.config.lambda_quality == 0.0
     assert scheduler.config.fairness_delta == 0.0
@@ -106,8 +107,10 @@ def test_turboserve_migrates_only_after_minmax_gain_is_positive() -> None:
     assert candidate.policy_name == "turboserve"
     assert candidate.gpu_id == "gpu-1"
     assert candidate.migration_count == 1
-    assert "cool" in candidate.session_ids
-    assert candidate.fidelity.startswith("b2_s4_w18")
+    assert candidate.batch_size == 1
+    assert len(candidate.session_ids) == 1
+    assert candidate.session_ids[0].startswith("hot-")
+    assert candidate.fidelity == "b1_s4_w18_rho0_bf16"
 
 
 def test_fifo_selects_oldest_released_action_instead_of_motivation_score() -> None:

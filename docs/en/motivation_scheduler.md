@@ -91,18 +91,21 @@ diagnostics.
 placement-side baseline: existing ownership is retained, new/active work is
 placed by least load, and a bounded min--max rebalancer proposes a move only
 when its predicted bottleneck reduction exceeds the configured migration
-threshold. It uses the fixed `S4/W18/BF16` execution family and native
-coalesced batches (up to `motivation-max-batch-size`); it does not call the
-Motivation slack, quality, fairness, or idle-job objective. Idle sessions are
-treated as suspended for this baseline. The common coordinator still owns
-versioned reservations, NCCL migration, completion, and all producer/client
-metrics, so the three policies are directly comparable on the same runner.
+threshold. The paper describes coalesced chunk processing, but the checked
+repository implementation currently uses `LocalRoundRobinStepScheduler` to
+pick one `SessionState` and calls `step_one_block` once per turn; its demo
+constructs `batch_size=1` inputs. To keep this baseline faithful to the actual
+source, it therefore uses only the fixed `S4/W18/BF16/B1` execution point and
+does not add cross-session batching. It also does not call the Motivation
+slack, quality, fairness, or idle-job objective. Idle sessions are treated as
+suspended for this baseline. The common coordinator still owns versioned
+reservations, NCCL migration, completion, and all producer/client metrics, so
+the three policies are directly comparable on the same runner.
 
 When autoscaling is enabled, the runtime's existing TurboServe closed-loop
 controller independently applies the paper's target-utilization and
 hysteresis budget rule. For fixed-budget comparisons, disable autoscaling;
-the policy then differs from FIFO only in coalesced batching and
-migration-aware min--max placement.
+the policy then differs from FIFO only in migration-aware min--max placement.
 
 When the LiveKit runtime reports a session as running, the execution bridge
 materializes an idle sentinel if no action state is held. The bridge forwards

@@ -91,7 +91,7 @@ class FIFOPolicy:
 
 
 class TurboServePolicy:
-    """TurboServe-style placement and coalesced execution baseline.
+    """TurboServe-style placement and source-faithful singleton baseline.
 
     The reference TurboServe controller is a placement policy: it keeps
     sessions on their current workers, uses a least-loaded placement for new
@@ -99,8 +99,11 @@ class TurboServePolicy:
     bottleneck reduction exceeds the migration cost.  It does not inspect the
     Motivation slack/quality objective or choose among quality points.  The
     coordinator still owns the common job lease and physical execution path;
-    this class only selects a fixed-family batch through the dedicated
-    ``_find_turboserve_candidate`` path.
+    this class only selects a fixed-family B1 candidate through the dedicated
+    ``_find_turboserve_candidate`` path.  The paper describes coalesced
+    chunks, but the checked repository worker executes one session per step;
+    this policy follows that implementation rather than inventing a new
+    cross-session batching runtime.
     """
 
     name = "turboserve"
