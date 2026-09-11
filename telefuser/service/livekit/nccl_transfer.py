@@ -307,6 +307,7 @@ def transfer_tensor_leaves_nccl_streamed(
     groups: Sequence[TensorTransferGroup],
     stream: torch.cuda.Stream | None = None,
     on_group_complete: TransferGroupCallback | None = None,
+    submission_lock: threading.Lock | None = None,
 ) -> TensorTransferReport:
     """Transfer ordered state groups on an optional dedicated CUDA stream.
 
@@ -338,7 +339,13 @@ def transfer_tensor_leaves_nccl_streamed(
             ordered = [leaves[path].contiguous() for path in group.paths]
             ops = [dist.P2POp(dist.isend if send else dist.irecv, tensor, peer_rank) for tensor in ordered]
             if ops:
-                requests = dist.batch_isend_irecv(ops)
+                # ``batch_isend_irecv`` updates process-group coalescing state
+                # that is not thread-safe.  Serialize only this short
+                # submission call; request completion and CUDA transfers may
+                # continue concurrently with other GPU pairs.
+                lock_context = submission_lock if submission_lock is not None else contextlib.nullcontext()
+                with lock_context:
+                    requests = dist.batch_isend_irecv(ops)
                 for request in requests:
                     request.wait()
             # ``Work.wait()`` guarantees that the NCCL operation has been

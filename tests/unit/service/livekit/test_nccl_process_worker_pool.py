@@ -544,8 +544,9 @@ def test_migration_records_transport_phase_diagnostics(monkeypatch) -> None:
         assert diagnostics["last"]["outcome"] == "success"
         assert diagnostics["last"]["state_bytes"] == 128
         assert all(diagnostics["phase_timings"][phase]["success"] == 1 for phase in (
-            "pause", "export", "prepare_recv", "transfer", "compute_ready", "commit_source", "route_commit"
+            "export", "prepare_recv", "transfer", "compute_ready", "commit_source", "route_commit"
         ))
+        assert diagnostics["phase_timings"]["pause"]["count"] == 0
         assert diagnostics["phase_timings"]["drain"]["count"] == 0
 
     asyncio.run(run())
@@ -716,7 +717,7 @@ def test_source_cleanup_failure_preserves_committed_target_owner(monkeypatch) ->
     asyncio.run(run())
 
 
-def test_migration_pause_failure_resumes_source(monkeypatch) -> None:
+def test_migration_export_failure_resumes_source(monkeypatch) -> None:
     async def run() -> None:
         pool = _pool()
         pool._active_workers = {"worker-0", "worker-1"}
@@ -727,41 +728,22 @@ def test_migration_pause_failure_resumes_source(monkeypatch) -> None:
         sent: list[tuple[str, dict[str, object]]] = []
         requests: list[tuple[str, str]] = []
         pool._send = lambda worker_id, command: sent.append((worker_id, command))
-        paused = False
-
-        async def fake_parent_drain(session_id: str, *, timeout: float) -> None:
-            del session_id, timeout
-
         async def fake_request(worker_id: str, request_type: str, **kwargs: object) -> dict[str, object]:
-            nonlocal paused
             requests.append((worker_id, request_type))
             del worker_id, kwargs
-            if request_type == "model_output_drain_status":
-                if paused:
-                    raise RuntimeError("status barrier unavailable")
-                return {
-                    "result": {
-                        "in_flight": False,
-                        "output_queue_empty": True,
-                        "publisher_unsubmitted_frames": 0,
-                    }
-                }
-            if request_type == "model_output_pause":
-                paused = True
             if request_type == "nccl_export":
-                return {"result": {"tensor_manifest": [], "state_bytes": 128}}
+                raise RuntimeError("export failed")
             return {"result": True}
 
-        monkeypatch.setattr(pool, "_wait_for_model_output_drain", fake_parent_drain)
         monkeypatch.setattr(pool, "_request", fake_request)
 
-        with pytest.raises(RuntimeError, match="status barrier unavailable"):
+        with pytest.raises(RuntimeError, match="export failed"):
             await pool.migrate_session("pipeline-1", "worker-1")
 
         assert ("worker-0", "model_output_resume") in requests
         diagnostics = pool.turboserve_snapshot()["migration_diagnostics"]
         assert diagnostics["failure_total"] == 1
-        assert diagnostics["last_failure"]["failed_phase"] == "pause"
+        assert diagnostics["last_failure"]["failed_phase"] == "export"
 
     asyncio.run(run())
 

@@ -842,6 +842,9 @@ class ABotWorldLiveKitService:
             # The two KV cursors are control metadata, not model payload.
             # Serialize them in the control message and recreate device
             # tensors on import, avoiding NCCL's tiny mixed-dtype P2P path.
+            cursor_tensors: list[torch.Tensor] = []
+            cursor_slots: list[tuple[dict[str, Any], str]] = []
+
             def serialize_cache(cache: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
                 serialized: list[dict[str, Any]] = []
                 for layer in cache:
@@ -851,17 +854,35 @@ class ABotWorldLiveKitService:
                         if isinstance(value, torch.Tensor):
                             if value.numel() != 1:
                                 raise ValueError(f"ABot migration cursor {key!r} must be scalar")
-                            copied[key] = int(value.item())
+                            if value.device.type == "cuda":
+                                # Defer one batched device-to-host copy until
+                                # both caches have been traversed. Repeated
+                                # scalar .item() calls otherwise introduce a
+                                # synchronization point for every layer.
+                                cursor_tensors.append(value.detach().reshape(1))
+                                cursor_slots.append((copied, key))
+                            else:
+                                copied[key] = int(value.item())
                         elif value is not None:
                             copied[key] = int(value)
                     serialized.append(copied)
                 return serialized
 
+            def materialize_cursor_values() -> None:
+                if not cursor_tensors:
+                    return
+                host_values = torch.cat(cursor_tensors, dim=0).detach().cpu().tolist()
+                for (slot, key), value in zip(cursor_slots, host_values, strict=True):
+                    slot[key] = int(value)
+
+            self_cache = serialize_cache(session.self_cache)
+            cross_cache = serialize_cache(session.cross_cache)
+            materialize_cursor_values()
             payload = {
                 "prompt_emb": session.prompt_emb,
                 "first_frame_latent": session.first_frame_latent,
-                "self_cache": serialize_cache(session.self_cache),
-                "cross_cache": serialize_cache(session.cross_cache),
+                "self_cache": self_cache,
+                "cross_cache": cross_cache,
                 "vae_feat_cache": session.vae_decode_state.feat_cache,
                 "taew_decode_state": self.pipeline.taew_decode_stage.export_decode_state_for_nccl(
                     session.taew_decode_state

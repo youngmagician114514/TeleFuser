@@ -303,11 +303,11 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         # duplicate request for the same session remains serialized while
         # different sessions can overlap all transport phases.
         self._migration_session_locks: dict[str, asyncio.Lock] = {}
-        # PyTorch's process-group coalescing state is not re-entrant.  Keep
-        # migration admission/control-plane work concurrent, but submit only
-        # one process-group P2P transaction at a time.  The critical section
-        # is the streamed device copy, not drain/export/prepare/cleanup.
-        self._nccl_transfer_lock = asyncio.Lock()
+        # NCCL P2P ordering is required only for one unordered worker pair:
+        # messages on that channel have no user-visible tag.  Different GPU
+        # pairs can therefore transfer concurrently instead of forming a
+        # convoy behind one process-wide lock.
+        self._nccl_pair_transfer_locks: dict[tuple[str, str], asyncio.Lock] = {}
         # Scaling must remain exclusive with migration because it destroys
         # and rebuilds the communicator.  A reader/writer guard allows any
         # number of migrations to coexist while scale_to remains exclusive.
@@ -928,21 +928,10 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
             self._active_migrations.add(pipeline_session_id)
             self._migrating_controls[pipeline_session_id] = []
             started = time.monotonic()
-            source_output_paused = False
             completed = False
-            export_quiesced = asyncio.Event()
-            pause_task: asyncio.Task[None] | None = None
 
             async def rollback_migration() -> None:
                 """Best-effort cleanup for cancellation or transport failure."""
-
-                # Let a background pause/status request settle before resume
-                # or source cleanup. The export event also releases it when
-                # export itself failed before reaching the normal boundary.
-                export_quiesced.set()
-                if pause_task is not None and not pause_task.done():
-                    with contextlib.suppress(BaseException):
-                        await pause_task
 
                 with contextlib.suppress(BaseException):
                     await self._request(
@@ -958,13 +947,15 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                         session_id=pipeline_session_id,
                         transfer_id=token.token_id,
                     )
-                if source_output_paused:
-                    with contextlib.suppress(BaseException):
-                        await self._request(
-                            source_worker_id,
-                            "model_output_resume",
-                            session_id=pipeline_session_id,
-                        )
+                # ``nccl_export`` pauses the source pump before taking its
+                # snapshot.  Resume is idempotent and is needed even when
+                # export failed after the pause was accepted.
+                with contextlib.suppress(BaseException):
+                    await self._request(
+                        source_worker_id,
+                        "model_output_resume",
+                        session_id=pipeline_session_id,
+                    )
                 with contextlib.suppress(BaseException):
                     self._ownership.abort_migration(token)
                 self._pipeline_routes[pipeline_session_id] = source_worker_id
@@ -1007,52 +998,9 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                             acknowledge=False,
                         )
             try:
-                async def pause_and_verify() -> None:
-                    nonlocal source_output_paused
-                    await self._request(
-                        source_worker_id,
-                        "model_output_pause",
-                        session_id=pipeline_session_id,
-                        timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
-                    )
-                    # The pause command may have taken effect even when the
-                    # following status barrier fails. Mark it immediately so
-                    # the failure path always attempts to resume the source.
-                    source_output_paused = True
-                    # Publisher/output-pump state is not part of the model
-                    # snapshot. Wait until nccl_export has performed the
-                    # authoritative per-session quiesce, then validate it in
-                    # the background before ownership commit.
-                    await export_quiesced.wait()
-                    paused_status_event = await self._request(
-                        source_worker_id,
-                        "model_output_drain_status",
-                        session_id=pipeline_session_id,
-                        timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
-                    )
-                    if not self._source_model_output_drain_complete(
-                        paused_status_event.get("result"),
-                        require_output_queue=None,
-                        require_publisher=False,
-                    ):
-                        raise RuntimeError("Source output changed while preparing NCCL migration")
-                    paused_status = paused_status_event.get("result")
-                    if isinstance(paused_status, dict):
-                        self._migration_deferred_publisher_frames += max(
-                            0, int(paused_status.get("publisher_unsubmitted_frames", 0))
-                        )
-
-                pause_task = asyncio.create_task(
-                    self._run_migration_phase(token.token_id, "pause", pause_and_verify),
-                    name=f"sst-pause-{token.token_id}",
-                )
-
-                # prepare_migration_nccl_metadata is the single authoritative
-                # model-state boundary: it marks this session migrating and
-                # waits for its own in-flight compute, while ignoring already
-                # materialized publisher payloads. A separate parent drain
-                # round trip duplicated that same barrier on the critical
-                # path and is intentionally omitted.
+                # The child stops its output pump and takes the authoritative
+                # model-state boundary in one command. This removes a pause
+                # status round trip from the migration critical path.
                 exported = await self._run_migration_phase(
                     token.token_id,
                     "export",
@@ -1064,7 +1012,6 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                         timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
                     ),
                 )
-                export_quiesced.set()
                 metadata = dict(exported["result"])
                 state_bytes = metadata.get("state_bytes", 0)
                 if isinstance(diagnostics, MigrationDiagnostics):
@@ -1088,8 +1035,11 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                 ready_waiter = asyncio.get_running_loop().create_future()
                 self._migration_ready_waiters[token.token_id] = ready_waiter
 
+                pair_key = tuple(sorted((source_worker_id, target_worker_id)))
+                pair_lock = self._nccl_pair_transfer_locks.setdefault(pair_key, asyncio.Lock())
+
                 async def transfer_both() -> list[dict[str, Any]]:
-                    async with self._nccl_transfer_lock:
+                    async with pair_lock:
                         return await asyncio.gather(
                             self._request(
                                 source_worker_id,
@@ -1161,11 +1111,6 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                 # The route is already usable, but the transaction cannot be
                 # committed until the complete target state has arrived.
                 transfer_events = await transfer_task
-                # Output-pump pause/status is allowed to overlap export,
-                # target preparation and transfer, but ownership is never
-                # committed until the source validation has succeeded.
-                if pause_task is not None:
-                    await pause_task
                 if isinstance(diagnostics, MigrationDiagnostics) and isinstance(transfer_events, list):
                     for event in reversed(transfer_events):
                         report = event.get("result") if isinstance(event, dict) else None
@@ -1664,23 +1609,27 @@ async def _run_nccl_model_worker(
     ] = {}
     incoming: dict[str, tuple[dict[str, Any], dict[tuple[Any, ...], torch.Tensor], str, int, int]] = {}
     transfer_tasks: set[asyncio.Task[None]] = set()
-    transfer_stream = torch.cuda.Stream(device=torch.device("cuda", int(spec.gpu_ids[0])))
+    warmup_stream = torch.cuda.Stream(device=torch.device("cuda", int(spec.gpu_ids[0])))
+    # batch_isend_irecv has process-local coalescing state. Protect only its
+    # submission call; each migration gets its own CUDA stream so copies on
+    # independent worker pairs can overlap after submission.
+    nccl_submission_lock = threading.Lock()
 
     def warmup_nccl_collective() -> None:
         """Initialize communicator-wide NCCL channels before pair-only P2P."""
 
         torch.cuda.set_device(int(spec.gpu_ids[0]))
-        with torch.cuda.stream(transfer_stream):
-            tensor = torch.ones(1, dtype=torch.float32, device=transfer_stream.device)
+        with torch.cuda.stream(warmup_stream):
+            tensor = torch.ones(1, dtype=torch.float32, device=warmup_stream.device)
             dist.all_reduce(tensor)
-            transfer_stream.synchronize()
+            warmup_stream.synchronize()
 
     def warmup_nccl_peer(peer_rank: int, *, send_first: bool) -> None:
         """Eagerly establish one pair's lazy NCCL P2P transport channels."""
 
         torch.cuda.set_device(int(spec.gpu_ids[0]))
-        with torch.cuda.stream(transfer_stream):
-            send_tensor = torch.zeros(1, dtype=torch.uint8, device=transfer_stream.device)
+        with torch.cuda.stream(warmup_stream):
+            send_tensor = torch.zeros(1, dtype=torch.uint8, device=warmup_stream.device)
             recv_tensor = torch.empty_like(send_tensor)
             send_op = dist.P2POp(dist.isend, send_tensor, peer_rank)
             recv_op = dist.P2POp(dist.irecv, recv_tensor, peer_rank)
@@ -1689,7 +1638,7 @@ async def _run_nccl_model_worker(
             )
             for request in requests:
                 request.wait()
-            transfer_stream.synchronize()
+            warmup_stream.synchronize()
 
     def transfer_on_worker_device(
         leaves: dict[tuple[Any, ...], torch.Tensor],
@@ -1701,6 +1650,7 @@ async def _run_nccl_model_worker(
     ) -> dict[str, Any]:
         """Run NCCL transfer on a worker thread with the child CUDA device selected."""
         torch.cuda.set_device(int(spec.gpu_ids[0]))
+        transfer_stream = torch.cuda.Stream(device=torch.device("cuda", int(spec.gpu_ids[0])))
 
         def group_complete(group: TensorTransferGroup, event: torch.cuda.Event | None) -> None:
             if progress is not None and group.layer_index is not None:
@@ -1712,6 +1662,7 @@ async def _run_nccl_model_worker(
             send=send,
             groups=groups,
             stream=transfer_stream,
+            submission_lock=nccl_submission_lock,
             on_group_complete=group_complete if progress is not None else None,
         ).as_dict()
 
@@ -1883,6 +1834,31 @@ async def _run_nccl_model_worker(
                 await asyncio.gather(import_task, return_exceptions=True)
             await result(request_id, error=exc)
 
+    async def run_nccl_prepare_recv(command: dict[str, Any]) -> None:
+        """Allocate receive leaves off the command loop's event-loop thread."""
+        request_id = command.get("request_id")
+        transfer_id = str(command["transfer_id"])
+        metadata = command["metadata"]
+
+        def allocate() -> dict[tuple[Any, ...], torch.Tensor]:
+            torch.cuda.set_device(int(spec.gpu_ids[0]))
+            return allocate_tensor_tree_leaves(
+                metadata["tensor_manifest"], torch.device(f"cuda:{spec.gpu_ids[0]}")
+            )
+
+        try:
+            leaves = await asyncio.to_thread(allocate)
+            incoming[transfer_id] = (
+                metadata,
+                leaves,
+                command["owner_worker_id"],
+                command["ownership_epoch"],
+                int(command.get("model_output_credit_window", _MODEL_OUTPUT_PARENT_QUEUE_SIZE)),
+            )
+            await result(request_id)
+        except Exception as exc:
+            await result(request_id, error=exc)
+
     try:
         while True:
             command = await asyncio.to_thread(commands.get)
@@ -2010,7 +1986,15 @@ async def _run_nccl_model_worker(
                 elif kind == "scheduler_resume":
                     service.resume_scheduler()
                 elif kind == "nccl_export":
+                    # Pause consumption before snapshotting and discard only
+                    # payloads that were already materialized at the boundary.
+                    # The model generator remains authoritative; no LiveKit
+                    # consumer state is consulted on this hot path.
+                    await stop_pump(command["session_id"])
                     metadata = await asyncio.to_thread(service.prepare_migration_nccl_metadata, command["session_id"])
+                    discard_pending = getattr(service, "discard_pending_migration_outputs", None)
+                    if callable(discard_pending):
+                        await asyncio.to_thread(discard_pending, command["session_id"])
                     tensor_leaves = metadata.pop("_nccl_tensor_leaves")
                     _validate_nccl_source_leaves(tensor_leaves)
                     outgoing[command["transfer_id"]] = (
@@ -2020,17 +2004,12 @@ async def _run_nccl_model_worker(
                     await result(request_id, metadata)
                     continue
                 elif kind == "nccl_prepare_recv":
-                    metadata = command["metadata"]
-                    leaves = allocate_tensor_tree_leaves(
-                        metadata["tensor_manifest"], torch.device(f"cuda:{spec.gpu_ids[0]}")
+                    task = asyncio.create_task(
+                        run_nccl_prepare_recv(command), name=f"nccl-prepare-{command['transfer_id']}"
                     )
-                    incoming[command["transfer_id"]] = (
-                        metadata,
-                        leaves,
-                        command["owner_worker_id"],
-                        command["ownership_epoch"],
-                        int(command.get("model_output_credit_window", _MODEL_OUTPUT_PARENT_QUEUE_SIZE)),
-                    )
+                    transfer_tasks.add(task)
+                    task.add_done_callback(transfer_tasks.discard)
+                    continue
                 elif kind == "nccl_send":
                     # The parent still waits for this request result before
                     # committing ownership, but unrelated commands can run
