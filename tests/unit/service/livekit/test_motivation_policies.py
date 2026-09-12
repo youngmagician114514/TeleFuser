@@ -78,6 +78,19 @@ def test_turboserve_preserves_balanced_owners_and_dispatches_singletons() -> Non
     assert candidate.fidelity == "b1_s4_w18_rho0_bf16"
 
 
+def test_turboserve_skips_workers_without_local_ready_jobs() -> None:
+    scheduler = _turboserve_scheduler(migration_enabled=False)
+    scheduler.register_session("only", owner_gpu="gpu-0", now=0.0, compatibility_key=(3,))
+    scheduler.submit_action("only", ["W"], now=0.0)
+
+    candidate = scheduler.find_best(now=0.0, include_wait=False)
+
+    assert candidate is not None
+    assert candidate.gpu_id == "gpu-0"
+    assert candidate.session_ids == ("only",)
+    assert candidate.batch_size == 1
+
+
 def test_turboserve_is_not_motivation_quality_or_idle_mode() -> None:
     scheduler = _turboserve_scheduler()
 

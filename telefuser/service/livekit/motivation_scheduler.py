@@ -1495,6 +1495,12 @@ class MotivationScheduler:
                 for state, job in ready
                 if state.owner_gpu == gpu.gpu_id
             ]
+            # A worker may have no local ready job while another worker does
+            # (especially during session close or an in-flight migration).
+            # TurboServe is a singleton placement policy; an empty local set
+            # is simply not a candidate, not a scheduler error.
+            if not local:
+                continue
             local.sort(key=lambda item: (item[1].sequence, item[0].session_id))
             state, job = local[0]
             compatible[1] += 1
