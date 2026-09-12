@@ -178,6 +178,28 @@ def test_slackserve_does_not_rehome_into_a_full_relaxed_worker() -> None:
     assert candidate.migration_count == 0
 
 
+def test_slackserve_limits_one_receiver_rehome_per_control_window() -> None:
+    scheduler = _scheduler(source_free_at=1.0)
+    for name in ("urgent-0", "urgent-1", "urgent-2"):
+        scheduler.register_session(name, owner_gpu="gpu-0", now=0.0, slack_seconds=0.1)
+        scheduler.submit_action(name, ["W"], now=0.0)
+
+    first = scheduler.find_best(now=0.0, include_wait=False)
+    assert first is not None and first.migration_count == 1
+    scheduler.set_migration_ready(
+        first.session_ids[0], target_gpu="gpu-1", ready_at=0.05, now=0.0
+    )
+    second = scheduler.find_best(
+        now=0.0,
+        include_wait=False,
+        exclude_session_ids=(first.session_ids[0],),
+    )
+
+    assert second is not None
+    assert second.migration_count == 0
+    assert second.gpu_id == "gpu-0"
+
+
 def test_slackserve_diagnostics_disclose_unsupported_elastic_sp() -> None:
     scheduler = _scheduler()
 

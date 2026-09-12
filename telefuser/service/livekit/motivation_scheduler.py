@@ -737,6 +737,9 @@ class MotivationSchedulerConfig:
     slackserve_relaxed_multiplier: float = 4.0
     slackserve_rehoming_enabled: bool = True
     slackserve_capacity_per_worker: int = 8
+    slackserve_rehoming_control_interval_seconds: float = 3.0
+    slackserve_max_rehomes_per_sender: int = 2
+    slackserve_max_rehomes_per_receiver: int = 1
 
     def __post_init__(self) -> None:
         if not 1 <= self.max_batch_size <= 4:
@@ -815,6 +818,18 @@ class MotivationSchedulerConfig:
             or self.slackserve_capacity_per_worker < 1
         ):
             raise ValueError("slackserve_capacity_per_worker must be a positive integer")
+        if (
+            not math.isfinite(float(self.slackserve_rehoming_control_interval_seconds))
+            or self.slackserve_rehoming_control_interval_seconds <= 0
+        ):
+            raise ValueError("slackserve_rehoming_control_interval_seconds must be positive and finite")
+        for name in (
+            "slackserve_max_rehomes_per_sender",
+            "slackserve_max_rehomes_per_receiver",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
 
 
 @dataclass(frozen=True)
@@ -945,6 +960,12 @@ class MotivationScheduler:
         self._action_jobs_superseded_pending = 0
         self._action_jobs_completed = 0
         self._action_jobs_dropped_on_departure = 0
+        # Paper re-homing limits are control-tick limits, not global lifetime
+        # limits.  Counts are recorded when a migration actually starts; a
+        # fresh policy search can therefore admit at most two sends per source
+        # and one receive per target in one SlackServe control window.
+        self._slackserve_rehome_sends: dict[tuple[int, str], int] = {}
+        self._slackserve_rehome_receives: dict[tuple[int, str], int] = {}
         self._epoch = 0
         self._now = 0.0
         self._lock = threading.RLock()
@@ -1229,6 +1250,21 @@ class MotivationScheduler:
         with self._lock:
             observed_at = self._advance_to(observed_at)
             state = self._sessions[session_id]
+            if self.policy_name == "slackserve" and state.owner_gpu != target_gpu:
+                bucket = int(
+                    math.floor(
+                        observed_at
+                        / self.config.slackserve_rehoming_control_interval_seconds
+                    )
+                )
+                source_key = (bucket, state.owner_gpu)
+                target_key = (bucket, target_gpu)
+                self._slackserve_rehome_sends[source_key] = (
+                    self._slackserve_rehome_sends.get(source_key, 0) + 1
+                )
+                self._slackserve_rehome_receives[target_key] = (
+                    self._slackserve_rehome_receives.get(target_key, 0) + 1
+                )
             state.migration_target_gpu = target_gpu
             state.migration_ready_at = ready_at
             self._epoch += 1
@@ -1329,6 +1365,8 @@ class MotivationScheduler:
                 item for item in all_ready if item[0].session_id not in excluded
             )
             gpus = tuple(gpu_states) if gpu_states is not None else tuple(self._gpus.values())
+            rehome_sends = dict(self._slackserve_rehome_sends)
+            rehome_receives = dict(self._slackserve_rehome_receives)
             snapshot_epoch = self._epoch
 
         available_gpus = tuple(gpu for gpu in gpus if gpu.available)
@@ -1412,6 +1450,11 @@ class MotivationScheduler:
         quality_floor = self.config.slackserve_quality_floor
         if quality_floor is None:
             quality_floor = median_quality_floor(tuple(unique_rows.values()))
+        rehome_bucket = int(
+            math.floor(
+                observed_at / self.config.slackserve_rehoming_control_interval_seconds
+            )
+        )
 
         def assess(
             state: SessionSchedulingState,
@@ -1556,6 +1599,12 @@ class MotivationScheduler:
                 queue = local_queues[source.gpu_id]
                 if not queue:
                     continue
+                if (
+                    rehome_sends.get((rehome_bucket, source.gpu_id), 0)
+                    >= self.config.slackserve_max_rehomes_per_sender
+                ):
+                    reject("rehoming_sender_tick_limit")
+                    continue
                 # If the worker can immediately run its sole head, migration
                 # only adds transfer latency and cannot improve completion.
                 if source.free_at <= observed_at + EPSILON and len(queue) <= 1:
@@ -1572,6 +1621,10 @@ class MotivationScheduler:
                         if (
                             receiver.gpu_id == source.gpu_id
                             or not receiver_relaxed.get(receiver.gpu_id, False)
+                            or rehome_receives.get(
+                                (rehome_bucket, receiver.gpu_id), 0
+                            )
+                            >= self.config.slackserve_max_rehomes_per_receiver
                         ):
                             continue
                         target_item = assess(item.state, receiver, item.job)
