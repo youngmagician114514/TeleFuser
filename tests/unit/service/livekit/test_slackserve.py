@@ -41,7 +41,9 @@ def _scheduler(
         config=MotivationSchedulerConfig(
             policy_name="slackserve",
             max_batch_size=4,
-            include_idle_jobs=False,
+            # Deliberately pass the production default to verify that the
+            # SlackServe policy boundary disables Motivation idle sentinels.
+            include_idle_jobs=True,
             migration_enabled=migration_enabled,
             slackserve_capacity_per_worker=capacity_per_worker,
         ),
@@ -77,24 +79,27 @@ def test_slackserve_profile_primitives_match_bmpr_and_credit_rules() -> None:
     assert urgency_tier(credit, 0.3) is SlackServeTier.URGENT
 
 
-def test_slackserve_is_a_singleton_idle_aware_policy() -> None:
+def test_slackserve_is_a_singleton_action_only_policy() -> None:
     scheduler = _scheduler()
 
     assert scheduler.config.max_batch_size == 1
-    assert scheduler.config.include_idle_jobs is True
+    assert scheduler.config.include_idle_jobs is False
     assert scheduler.config.lambda_quality == 0.0
     assert scheduler.config.fairness_delta == 0.0
 
-    state = scheduler.register_session("idle", owner_gpu="gpu-0", now=0.0)
+    state = scheduler.register_session("stream", owner_gpu="gpu-0", now=0.0)
     # Paper TTFC budget is 4x the profiled highest-quality B1 chunk.
     assert state.slack_seconds == pytest.approx(2.0)
-    idle = scheduler.create_idle_job("idle", now=0.0)
+    idle = scheduler.create_idle_job("stream", now=0.0)
+    assert idle is not None
+    assert scheduler.find_best(now=0.0, include_wait=False) is None
+    action, _ = scheduler.submit_action("stream", ["W"], now=0.0)
     candidate = scheduler.find_best(now=0.0, include_wait=False)
 
-    assert idle is not None and candidate is not None
+    assert action is not None and candidate is not None
     assert candidate.policy_name == "slackserve"
     assert candidate.batch_size == 1
-    assert candidate.job_ids == (idle.job_id,)
+    assert candidate.job_ids == (action.job_id,)
     assert candidate.fidelity == "b1_high"
 
 

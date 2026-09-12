@@ -117,8 +117,9 @@ same production execution path:
 - an urgent queued stream can be re-homed only to an empty or relaxed-only
   worker, only when the measured migration route-ready delay still gives an
   earlier predicted finish, with the paper's 60-second residence cooldown;
-- idle chunks remain eligible because SlackServe manages continuous playout,
-  rather than only explicit interaction events.
+- only explicit trace action/chunk Jobs are eligible.  The paper's stream
+  chunk is represented directly by one B1 Job; the shared coordinator's
+  Motivation-only idle sentinel is not synthesized for this baseline.
 
 The local `slack_serve_sim` tree is a CPU timing simulator, not the paper's
 official GPU code. The ABot runtime also has no primitive for executing one

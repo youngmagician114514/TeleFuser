@@ -934,12 +934,12 @@ class MotivationScheduler:
             # SlackServe schedules one sequential chunk per stream.  Its
             # BMPR and service-credit logic is policy-local; it does not use
             # Motivation's batch, utility, quality-EMA, or fairness objective.
-            # Idle chunks remain enabled because the paper manages continuous
-            # playout, including time without a fresh interaction event.
+            # Idle sentinels are a Motivation-only extension.  SlackServe
+            # consumes only the requested trace action/chunk Jobs.
             self.config = replace(
                 requested_config,
                 max_batch_size=1,
-                include_idle_jobs=True,
+                include_idle_jobs=False,
                 lambda_quality=0.0,
                 fairness_delta=0.0,
             )
