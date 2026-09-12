@@ -145,8 +145,11 @@ class MotivationRuntimeController:
     ) -> "MotivationRuntimeController":
         """Build an opt-in controller from the measured offline profile CSV."""
         policy_config = scheduler_config or MotivationSchedulerConfig()
+        normalized_policy = str(policy_config.policy_name).strip().lower()
         profile_max_batch_size = (
-            1 if str(policy_config.policy_name).strip().lower() == "fifo" else policy_config.max_batch_size
+            1
+            if normalized_policy in {"fifo", "turboserve", "slackserve", "slackserver"}
+            else policy_config.max_batch_size
         )
         profile_table = load_motivation_profiles_csv(
             profile_path,

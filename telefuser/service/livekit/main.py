@@ -88,6 +88,8 @@ def run_stream_server(
     motivation_controller = None
     if motivation_profile is not None:
         normalized_policy = str(motivation_policy).strip().lower()
+        if normalized_policy == "slackserver":
+            normalized_policy = "slackserve"
         gpu_states = [
             GpuSchedulingState(f"worker-{index}", memory_free_gb=motivation_memory_free_gb)
             for index in range(config.num_workers)
@@ -112,20 +114,20 @@ def run_stream_server(
                 turboserve_migration_eta=config.turboserve_migration_eta,
                 turboserve_min_gain_ms=config.turboserve_min_migration_gain_ms,
                 turboserve_rebalance_iteration_limit=config.turboserve_rebalance_iteration_limit,
+                slackserve_capacity_per_worker=config.session_capacity_limit() or 8,
             ),
             # Charge the complete route-ready critical path. Residual layer
             # copy and source cleanup overlap target compute and are excluded.
             migration_estimator=LocalMigrationEstimator(
                 first_layer_ready_seconds=config.motivation_migration_route_ready_seconds,
             ),
-            # Motivation keeps its residence hysteresis; TurboServe already
-            # has the paper's min-gain guard and bounded rebalancing, so a
-            # second temporal cooldown would change the baseline algorithm.
+            # Motivation and SlackServe keep a 60-second residence cooldown;
+            # TurboServe already has its own min-gain/bounded-rebalance guard.
             migration_policy=(
                 MigrationCooldownPolicy(
                     cooldown_seconds=config.motivation_migration_cooldown_seconds,
                 )
-                if normalized_policy == "motivation"
+                if normalized_policy in {"motivation", "slackserve"}
                 else None
             ),
             diagnostics=diagnostics,

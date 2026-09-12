@@ -41,6 +41,13 @@ from .profile_quality import (
     normalize_profile_qualities,
     profile_batch_family,
 )
+from .slackserve import (
+    SlackServeTier,
+    choose_bmpr_profile,
+    median_quality_floor,
+    service_credit as slackserve_service_credit,
+    urgency_tier as slackserve_urgency_tier,
+)
 from .turboserve import (
     TurboServeClusterScheduler,
     TurboServeLatencyModel,
@@ -720,6 +727,16 @@ class MotivationSchedulerConfig:
     turboserve_min_gain_ms: float = 40.0
     turboserve_rebalance_iteration_limit: int = 3
     turboserve_fidelity_family: str = "s4_w18_rho0_bf16"
+    # SlackServe is a B1 stream scheduler. BMPR chooses among the measured B1
+    # Pareto points, while service credit and re-homing follow the paper's
+    # 2T/4T tiers. ``None`` derives the global quality floor as the median of
+    # the available B1 profile qualities.
+    slackserve_quality_floor: float | None = None
+    slackserve_initial_slack_multiplier: float = 4.0
+    slackserve_urgent_multiplier: float = 2.0
+    slackserve_relaxed_multiplier: float = 4.0
+    slackserve_rehoming_enabled: bool = True
+    slackserve_capacity_per_worker: int = 8
 
     def __post_init__(self) -> None:
         if not 1 <= self.max_batch_size <= 4:
@@ -771,6 +788,33 @@ class MotivationSchedulerConfig:
             raise ValueError("turboserve_rebalance_iteration_limit must be in [1, 64]")
         if not isinstance(self.turboserve_fidelity_family, str) or not self.turboserve_fidelity_family.strip():
             raise ValueError("turboserve_fidelity_family must be a non-empty string")
+        if self.slackserve_quality_floor is not None and (
+            not math.isfinite(float(self.slackserve_quality_floor))
+            or float(self.slackserve_quality_floor) <= 0
+        ):
+            raise ValueError("slackserve_quality_floor must be positive and finite")
+        for name in (
+            "slackserve_initial_slack_multiplier",
+            "slackserve_urgent_multiplier",
+            "slackserve_relaxed_multiplier",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if self.slackserve_initial_slack_multiplier <= 0:
+            raise ValueError("slackserve_initial_slack_multiplier must be positive")
+        if self.slackserve_relaxed_multiplier <= self.slackserve_urgent_multiplier:
+            raise ValueError(
+                "slackserve_relaxed_multiplier must exceed slackserve_urgent_multiplier"
+            )
+        if not isinstance(self.slackserve_rehoming_enabled, bool):
+            raise ValueError("slackserve_rehoming_enabled must be a bool")
+        if (
+            not isinstance(self.slackserve_capacity_per_worker, int)
+            or isinstance(self.slackserve_capacity_per_worker, bool)
+            or self.slackserve_capacity_per_worker < 1
+        ):
+            raise ValueError("slackserve_capacity_per_worker must be a positive integer")
 
 
 @dataclass(frozen=True)
@@ -802,6 +846,25 @@ class DispatchCandidate:
     @property
     def action_count(self) -> int:
         return sum(1 for job_id in self.job_ids if ":idle" not in job_id)
+
+
+@dataclass(frozen=True)
+class _SlackServeAssessment:
+    """One cached B1 BMPR/credit decision within a search snapshot."""
+
+    state: SessionSchedulingState
+    job: ActionJob | None
+    gpu: GpuSchedulingState
+    profile: MotivationProfile
+    credit: float
+    tier: SlackServeTier
+
+    @property
+    def priority(self) -> tuple[int, float, int, str]:
+        # Only ready assessments enter a worker queue.  Resident-only
+        # assessments use ``job=None`` solely for receiver tier checks.
+        sequence = self.job.sequence if self.job is not None else 0
+        return (int(self.tier), self.credit, sequence, self.state.session_id)
 
 
 class MotivationScheduler:
@@ -849,6 +912,19 @@ class MotivationScheduler:
                 requested_config,
                 max_batch_size=1,
                 include_idle_jobs=False,
+                lambda_quality=0.0,
+                fairness_delta=0.0,
+            )
+        elif self._policy.name == "slackserve":
+            # SlackServe schedules one sequential chunk per stream.  Its
+            # BMPR and service-credit logic is policy-local; it does not use
+            # Motivation's batch, utility, quality-EMA, or fairness objective.
+            # Idle chunks remain enabled because the paper manages continuous
+            # playout, including time without a fresh interaction event.
+            self.config = replace(
+                requested_config,
+                max_batch_size=1,
+                include_idle_jobs=True,
                 lambda_quality=0.0,
                 fairness_delta=0.0,
             )
@@ -992,12 +1068,33 @@ class MotivationScheduler:
                 if not profiles:
                     raise ValueError("profile provider has no quality values")
                 initial_quality = max(profile.quality for profile in profiles)
+            initial_slack = self.config.initial_slack_seconds
+            if self.policy_name == "slackserve" and slack_seconds is None:
+                # SlackServe gives the first chunk a TTFC budget of four times
+                # its profiled high-quality chunk duration.  Use the measured
+                # B1 point rather than a model-independent constant.
+                first_chunk_profiles = tuple(
+                    self.profile_provider.profiles_for(batch_size=1, gpu_id=owner_gpu)
+                )
+                if first_chunk_profiles:
+                    highest_quality = max(
+                        first_chunk_profiles,
+                        key=lambda profile: (
+                            profile.quality,
+                            -profile.latency_seconds,
+                            profile.fidelity,
+                        ),
+                    )
+                    initial_slack = (
+                        self.config.slackserve_initial_slack_multiplier
+                        * highest_quality.latency_seconds
+                    )
             state = SessionSchedulingState(
                 session_id=session_id,
                 owner_gpu=owner_gpu,
                 quality_update_rate=self.config.quality_ema,
                 slack_seconds=(
-                    self.config.initial_slack_seconds if slack_seconds is None else slack_seconds
+                    initial_slack if slack_seconds is None else slack_seconds
                 ),
                 quality_ema=initial_quality,
                 compatibility_key=tuple(compatibility_key),
@@ -1189,6 +1286,361 @@ class MotivationScheduler:
         # sessions remain available as useful batch fillers. Candidate scoring
         # retains ``action_count`` as the deterministic action-first tie-break.
         return tuple(ready)
+
+    def _find_slackserve_candidate(
+        self,
+        *,
+        now: float | None = None,
+        gpu_states: Sequence[GpuSchedulingState] | None = None,
+        wait_seconds: float = 0.0,
+        include_wait: bool = True,
+        allow_migrations: bool = True,
+        exclude_session_ids: Iterable[str] = (),
+        blocked_migration_session_ids: Iterable[str] = (),
+        policy_name: str = "slackserve",
+    ) -> DispatchCandidate | None:
+        """Select one SlackServe stream head using credit, BMPR, and re-homing.
+
+        This path is intentionally independent from Motivation's Cartesian
+        batch/quality search.  Each worker has a B1 stream queue ordered by
+        service credit ``P - (R + T)``.  BMPR selects one measured Pareto
+        profile per stream.  Before local dispatch, an urgent queued stream
+        may be re-homed when an empty/relaxed receiver would finish it sooner
+        after the measured route-ready delay.
+
+        SlackServe's Elastic SP is not synthesized here.  It requires one
+        model invocation to execute across two workers; ABot currently exposes
+        only one-worker singleton or cross-session data-parallel batch calls.
+        """
+
+        observed_at = self._clock() if now is None else now
+        excluded = {str(value) for value in exclude_session_ids}
+        blocked = {str(value) for value in blocked_migration_session_ids}
+
+        with self._lock:
+            observed_at = self._advance_to(observed_at)
+            snapshot_states = tuple(replace(state) for state in self._sessions.values())
+            snapshot_by_id = {state.session_id: state for state in snapshot_states}
+            all_ready = tuple(
+                (snapshot_by_id[state.session_id], job)
+                for state, job in self._ready_jobs()
+            )
+            ready = tuple(
+                item for item in all_ready if item[0].session_id not in excluded
+            )
+            gpus = tuple(gpu_states) if gpu_states is not None else tuple(self._gpus.values())
+            snapshot_epoch = self._epoch
+
+        available_gpus = tuple(gpu for gpu in gpus if gpu.available)
+        gpu_by_id = {gpu.gpu_id: gpu for gpu in available_gpus}
+        enumerated = empty_batch_counts()
+        compatible = empty_batch_counts()
+        profiles_evaluated = empty_batch_counts()
+        feasible = empty_batch_counts()
+        rejected: dict[str, int] = {}
+
+        def reject(reason: str, count: int = 1) -> None:
+            rejected[reason] = rejected.get(reason, 0) + count
+
+        def record(selected: DispatchCandidate | None) -> DispatchCandidate | None:
+            result = selected
+            if result is None and include_wait:
+                result = self._wait_candidate(
+                    now=observed_at,
+                    wait_seconds=wait_seconds,
+                    states=snapshot_states,
+                    snapshot_epoch=snapshot_epoch,
+                    policy_name=policy_name,
+                )
+            not_selected = dict(feasible)
+            if result is not None and not result.wait:
+                not_selected[1] = max(0, not_selected[1] - 1)
+            summary = MotivationSearchSummary(
+                observed_at=observed_at,
+                snapshot_epoch=snapshot_epoch,
+                ready_count=len(ready),
+                ready_action_count=sum(1 for _, job in ready if job.kind == "action"),
+                ready_idle_count=sum(1 for _, job in ready if job.kind == "idle"),
+                excluded_ready_count=len(all_ready) - len(ready),
+                gpu_count=len(gpus),
+                include_wait=include_wait,
+                allow_migrations=allow_migrations,
+                wait_seconds=max(0.0, wait_seconds),
+                enumerated_by_batch_size=enumerated,
+                compatible_by_batch_size=compatible,
+                profiles_evaluated_by_batch_size=profiles_evaluated,
+                feasible_by_batch_size=feasible,
+                rejected_by_reason=rejected,
+                not_selected_by_score=not_selected,
+                selected_batch_size=result.batch_size if result is not None else 0,
+                selected_wait=bool(result.wait) if result is not None else False,
+                selected_gpu_id=result.gpu_id if result is not None else None,
+                selected_fidelity=result.fidelity if result is not None else None,
+                selected_score=result.score if result is not None else None,
+                selected_migration_count=result.migration_count if result is not None else 0,
+                selected_session_ids=result.session_ids if result is not None else (),
+                selected_job_ids=result.job_ids if result is not None else (),
+                policy_name=policy_name,
+            )
+            try:
+                self._diagnostics.record_search(summary)
+            except Exception:
+                pass
+            return result
+
+        if not ready or not available_gpus:
+            if not available_gpus:
+                reject("gpu_unavailable", max(1, len(ready)))
+            return record(None)
+
+        enumerated[1] = len(ready) * len(available_gpus)
+        profile_rows: dict[str, tuple[MotivationProfile, ...]] = {}
+        unique_rows: dict[tuple[str, float, float], MotivationProfile] = {}
+        for gpu in available_gpus:
+            rows = tuple(
+                self.profile_provider.profiles_for(batch_size=1, gpu_id=gpu.gpu_id)
+            )
+            profile_rows[gpu.gpu_id] = rows
+            profiles_evaluated[1] += len(rows)
+            for row in rows:
+                unique_rows.setdefault(
+                    (row.fidelity, row.latency_seconds, row.quality), row
+                )
+        if not unique_rows:
+            reject("no_profile", len(ready))
+            return record(None)
+        quality_floor = self.config.slackserve_quality_floor
+        if quality_floor is None:
+            quality_floor = median_quality_floor(tuple(unique_rows.values()))
+
+        def assess(
+            state: SessionSchedulingState,
+            gpu: GpuSchedulingState,
+            job: ActionJob | None,
+            *,
+            remaining_seconds: float = 0.0,
+        ) -> _SlackServeAssessment | None:
+            rows = profile_rows.get(gpu.gpu_id, ())
+            if not rows:
+                reject("no_profile")
+                return None
+            try:
+                profile = choose_bmpr_profile(
+                    rows,
+                    slack_budget_seconds=state.slack_seconds,
+                    quality_floor=quality_floor,
+                )
+            except ValueError:
+                reject("quality_floor")
+                return None
+            credit = slackserve_service_credit(
+                playout_slack_seconds=state.slack_seconds,
+                remaining_seconds=remaining_seconds,
+                next_chunk_seconds=profile.latency_seconds,
+            )
+            tier = slackserve_urgency_tier(
+                credit,
+                profile.latency_seconds,
+                urgent_multiplier=self.config.slackserve_urgent_multiplier,
+                relaxed_multiplier=self.config.slackserve_relaxed_multiplier,
+            )
+            return _SlackServeAssessment(state, job, gpu, profile, credit, tier)
+
+        def has_memory(gpu: GpuSchedulingState, profile: MotivationProfile) -> bool:
+            effective_memory = gpu.memory_free_gb
+            if gpu.free_at > observed_at + EPSILON and effective_memory != math.inf:
+                effective_memory += gpu.reserved_memory_gb
+            return profile.memory_gb <= effective_memory + EPSILON
+
+        def make_candidate(
+            assessment: _SlackServeAssessment,
+            *,
+            estimate: MigrationEstimate | None = None,
+        ) -> DispatchCandidate | None:
+            job = assessment.job
+            if job is None:
+                return None
+            if not has_memory(assessment.gpu, assessment.profile):
+                reject("memory")
+                return None
+            migration_count = int(estimate is not None and estimate.required)
+            migration_seconds = estimate.cost_seconds if migration_count else 0.0
+            ready_at = estimate.ready_at if estimate is not None else observed_at
+            start_at = max(observed_at, assessment.gpu.free_at, ready_at)
+            finish_at = start_at + assessment.profile.latency_seconds
+            feasible[1] += 1
+            return DispatchCandidate(
+                session_ids=(assessment.state.session_id,),
+                job_ids=(job.job_id,),
+                gpu_id=assessment.gpu.gpu_id,
+                fidelity=assessment.profile.fidelity,
+                profile=assessment.profile,
+                start_at=start_at,
+                finish_at=finish_at,
+                migration_count=migration_count,
+                migration_seconds=migration_seconds,
+                # SlackServe minimizes credit. Negation keeps the common
+                # diagnostic field's larger-is-better convention readable.
+                score=-assessment.credit,
+                projected_slack={
+                    assessment.state.session_id: (
+                        assessment.state.slack_seconds
+                        - max(0.0, finish_at - observed_at)
+                        + assessment.profile.output_seconds
+                    )
+                },
+                projected_quality={
+                    assessment.state.session_id: assessment.profile.quality
+                },
+                snapshot_epoch=snapshot_epoch,
+                session_versions={
+                    assessment.state.session_id: assessment.state.state_version
+                },
+                gpu_version=assessment.gpu.version,
+                policy_name=policy_name,
+            )
+
+        # Build each worker's credit-ordered stream-head queue.  A session has
+        # at most one ready head in the common coordinator.
+        local_queues: dict[str, list[_SlackServeAssessment]] = {
+            gpu.gpu_id: [] for gpu in available_gpus
+        }
+        for state, job in ready:
+            owner = gpu_by_id.get(state.owner_gpu)
+            if owner is None:
+                reject("owner_gpu_missing")
+                continue
+            assessment = assess(state, owner, job)
+            if assessment is not None:
+                compatible[1] += 1
+                local_queues[owner.gpu_id].append(assessment)
+        for queue in local_queues.values():
+            queue.sort(key=lambda item: item.priority)
+
+        # Paper-style re-homing runs before local dispatch.  Only queued
+        # urgent work is considered, and a receiver must contain no urgent or
+        # normal resident stream.  The finish-time check includes the actual
+        # route-ready estimate, so a migration is never selected merely to
+        # balance counts.
+        migration_options: list[
+            tuple[tuple[float, float, int, str, str], DispatchCandidate]
+        ] = []
+        if (
+            self.config.migration_enabled
+            and self.config.slackserve_rehoming_enabled
+            and allow_migrations
+        ):
+            receiver_relaxed: dict[str, bool] = {}
+            for receiver in available_gpus:
+                relaxed_only = True
+                remaining = max(0.0, receiver.free_at - observed_at)
+                resident_count = 0
+                for state in snapshot_states:
+                    if state.departed or state.owner_gpu != receiver.gpu_id:
+                        continue
+                    resident_count += 1
+                    resident = assess(
+                        state,
+                        receiver,
+                        None,
+                        remaining_seconds=(remaining if state.in_flight is not None else 0.0),
+                    )
+                    if resident is None or resident.tier is not SlackServeTier.RELAXED:
+                        relaxed_only = False
+                        break
+                if resident_count >= self.config.slackserve_capacity_per_worker:
+                    relaxed_only = False
+                receiver_relaxed[receiver.gpu_id] = relaxed_only
+
+            for source in available_gpus:
+                queue = local_queues[source.gpu_id]
+                if not queue:
+                    continue
+                # If the worker can immediately run its sole head, migration
+                # only adds transfer latency and cannot improve completion.
+                if source.free_at <= observed_at + EPSILON and len(queue) <= 1:
+                    continue
+                source_cursor = max(observed_at, source.free_at)
+                for item in queue:
+                    source_finish = source_cursor + item.profile.latency_seconds
+                    source_cursor = source_finish
+                    if item.tier is not SlackServeTier.URGENT:
+                        continue
+                    if item.state.session_id in blocked:
+                        continue
+                    for receiver in available_gpus:
+                        if (
+                            receiver.gpu_id == source.gpu_id
+                            or not receiver_relaxed.get(receiver.gpu_id, False)
+                        ):
+                            continue
+                        target_item = assess(item.state, receiver, item.job)
+                        if target_item is None:
+                            continue
+                        estimate = self.migration_estimator.estimate(
+                            item.state,
+                            target_gpu=receiver.gpu_id,
+                            now=observed_at,
+                        )
+                        if not estimate.required:
+                            continue
+                        target_start = max(
+                            observed_at, receiver.free_at, estimate.ready_at
+                        )
+                        target_finish = target_start + target_item.profile.latency_seconds
+                        if target_finish >= source_finish - EPSILON:
+                            reject("rehoming_no_gain")
+                            continue
+                        candidate = make_candidate(target_item, estimate=estimate)
+                        if candidate is None:
+                            continue
+                        migration_options.append(
+                            (
+                                (
+                                    item.credit,
+                                    target_finish,
+                                    item.job.sequence if item.job is not None else 0,
+                                    item.state.session_id,
+                                    receiver.gpu_id,
+                                ),
+                                candidate,
+                            )
+                        )
+            if migration_options:
+                migration_options.sort(key=lambda option: option[0])
+                return record(migration_options[0][1])
+
+        # Dispatch the head of every worker-local credit queue, preferring a
+        # worker that is physically available first.  This mirrors independent
+        # per-worker queues while still using the common global drain loop to
+        # fill several idle GPUs in one scheduling turn.
+        local_options: list[
+            tuple[tuple[float, int, float, int, str], DispatchCandidate]
+        ] = []
+        for gpu in available_gpus:
+            queue = local_queues[gpu.gpu_id]
+            if not queue:
+                continue
+            item = queue[0]
+            candidate = make_candidate(item)
+            if candidate is None:
+                continue
+            local_options.append(
+                (
+                    (
+                        candidate.start_at,
+                        int(item.tier),
+                        item.credit,
+                        item.job.sequence if item.job is not None else 0,
+                        gpu.gpu_id,
+                    ),
+                    candidate,
+                )
+            )
+        if local_options:
+            local_options.sort(key=lambda option: option[0])
+            return record(local_options[0][1])
+        return record(None)
 
     def _find_turboserve_candidate(
         self,
@@ -2294,6 +2746,17 @@ class MotivationScheduler:
                     "supersedes an action that is already in flight"
                 ),
             }
+            if self.policy_name == "slackserve":
+                snapshot["slackserve_capabilities"] = {
+                    "service_credit": True,
+                    "bmpr": True,
+                    "rehoming": bool(self.config.slackserve_rehoming_enabled),
+                    "elastic_sp": False,
+                    "elastic_sp_reason": (
+                        "ABot has no single-session SP=2 execution primitive; "
+                        "cross-session B2 batching is not Elastic SP"
+                    ),
+                }
         return snapshot
 
     def validate(self, candidate: DispatchCandidate, *, now: float | None = None) -> bool:
@@ -2323,6 +2786,8 @@ class MotivationScheduler:
                     or self._sessions[candidate.session_ids[0]].owner_gpu != candidate.gpu_id
                 ):
                     return False
+            if self.policy_name in {"turboserve", "slackserve"} and candidate.batch_size != 1:
+                return False
             for session_id, job_id, version in zip(
                 candidate.session_ids,
                 candidate.job_ids,

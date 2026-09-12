@@ -30,6 +30,7 @@ from .motivation_policies import (
     MotivationPolicy,
     SchedulingPolicy,
     SchedulingSearchRequest,
+    SlackServePolicy,
     TurboServePolicy,
     create_scheduling_policy,
 )
@@ -100,6 +101,7 @@ __all__ = [
     "release_on_control_state",
     "FIFOPolicy",
     "MotivationPolicy",
+    "SlackServePolicy",
     "TurboServePolicy",
     "SchedulingPolicy",
     "SchedulingSearchRequest",

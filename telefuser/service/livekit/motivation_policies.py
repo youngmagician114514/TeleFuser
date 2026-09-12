@@ -4,8 +4,8 @@ The policy objects decide *which* ready work should be offered to the shared
 scheduling coordinator.  State transitions, candidate validation,
 reservation, completion, and worker execution remain owned by
 ``MotivationScheduler`` and ``MotivationRuntimeController``.  Policies decide
-independently whether migration is part of their algorithm: Motivation and
-TurboServe may migrate, while FIFO is deliberately static.
+independently whether migration is part of their algorithm: Motivation,
+TurboServe, and SlackServe may migrate, while FIFO is deliberately static.
 
 Keeping the policy boundary small is intentional: a baseline such as FIFO can
 reuse the production feasibility and lease machinery without becoming a second
@@ -121,16 +121,54 @@ class TurboServePolicy:
         )
 
 
+class SlackServePolicy:
+    """SlackServe service-credit, BMPR, and re-homing baseline.
+
+    The policy follows the paper's singleton stream scheduling boundary.  It
+    ranks each worker's stream head by ``P - (R + T)``, selects a measured B1
+    fidelity through bi-modal profile routing, and may re-home urgent work to
+    a receiver containing only relaxed streams.  It deliberately does not
+    call Motivation's utility/fairness search or cross-session batch builder.
+
+    The current ABot execution layer cannot run one stream with Elastic SP=2;
+    treating a two-session data-parallel batch as SP would be a different
+    algorithm.  That unsupported mechanism is exposed in diagnostics rather
+    than silently approximated.
+    """
+
+    name = "slackserve"
+
+    def select(self, scheduler: Any, request: SchedulingSearchRequest) -> Any:
+        return scheduler._find_slackserve_candidate(
+            now=request.now,
+            gpu_states=request.gpu_states,
+            wait_seconds=request.wait_seconds,
+            include_wait=request.include_wait,
+            allow_migrations=request.allow_migrations,
+            exclude_session_ids=request.exclude_session_ids,
+            blocked_migration_session_ids=request.blocked_migration_session_ids,
+            policy_name=self.name,
+        )
+
+
 _POLICY_TYPES: dict[str, type[SchedulingPolicy]] = {
     MotivationPolicy.name: MotivationPolicy,
     FIFOPolicy.name: FIFOPolicy,
     TurboServePolicy.name: TurboServePolicy,
+    SlackServePolicy.name: SlackServePolicy,
+}
+
+_POLICY_ALIASES = {
+    # The paper/system name is SlackServe, but accepting the common
+    # "SlackServer" spelling keeps experiment scripts unsurprising.
+    "slackserver": SlackServePolicy.name,
 }
 
 
 def create_scheduling_policy(name: str) -> SchedulingPolicy:
     """Create a registered policy by name without coupling callers to classes."""
     normalized = str(name).strip().lower()
+    normalized = _POLICY_ALIASES.get(normalized, normalized)
     policy_type = _POLICY_TYPES.get(normalized)
     if policy_type is None:
         available = ", ".join(sorted(_POLICY_TYPES))
@@ -141,6 +179,7 @@ def create_scheduling_policy(name: str) -> SchedulingPolicy:
 __all__ = [
     "FIFOPolicy",
     "MotivationPolicy",
+    "SlackServePolicy",
     "TurboServePolicy",
     "SchedulingPolicy",
     "SchedulingSearchRequest",

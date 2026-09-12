@@ -104,12 +104,14 @@ run, add `--motivation-profile /path/to/profile_evaluated.csv`; the optional
 `--motivation-max-batch-size` and `--motivation-memory-free-gb` flags set the
 policy limits. The profile's `max_batch_size` should match
 `TELEFUSER_ABOT_MAX_BATCH_SIZE` so the worker does not split a policy-selected
-batch. Use `--motivation-policy fifo` for the simple singleton FIFO baseline;
-the default is the profile/slack-aware `motivation` policy. FIFO consumes only
+batch. Use `--motivation-policy fifo` for the simple singleton FIFO baseline,
+`--motivation-policy turboserve` for source-compatible placement, or
+`--motivation-policy slackserve` for B1 service-credit scheduling with BMPR
+and re-homing; the default is the profile/slack-aware `motivation` policy. FIFO consumes only
 released action jobs, uses one fixed B1 fidelity on each session's admitted
 owner GPU, and has no idle-job, batch-size, quality, fairness, or migration
-selection. Both policies reuse the versioned reservation and execution safety
-path; only Motivation installs the state-transfer backend. The default runtime
+selection. All policies reuse the versioned reservation and execution safety
+path; every migration-capable policy installs the state-transfer backend. The default runtime
 without a controller is unchanged.
 
 The checked-in browser demo forces TCP TURN relay. Run the following development-only stack in four terminals:

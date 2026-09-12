@@ -134,10 +134,15 @@ class MotivationExecutionBridge:
             raise TypeError("defer_scheduling must be a bool")
         self._defer_scheduling = defer_scheduling
         # The batch gate is only meaningful for Motivation's profile-aware
-        # aggregation. FIFO and the checked TurboServe source are singleton
-        # execution paths, so force the gate off for both baselines. This also
-        # keeps them free of an extra hidden scheduler search on each event.
-        if getattr(controller.scheduler, "policy_name", "motivation") in {"fifo", "turboserve"}:
+        # aggregation. FIFO, TurboServe, and SlackServe are singleton execution
+        # paths, so force the gate off for all baselines. SlackServe Elastic SP
+        # would be model parallelism for one session, not this cross-session
+        # batch gate.
+        if getattr(controller.scheduler, "policy_name", "motivation") in {
+            "fifo",
+            "turboserve",
+            "slackserve",
+        }:
             enable_batch_gate = False
         self._batch_gate = (
             (

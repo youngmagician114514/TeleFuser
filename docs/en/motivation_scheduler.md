@@ -62,12 +62,12 @@ does not stop playback.  An explicitly paused consumer can set
 
 ## Pluggable policies
 
-`MotivationPolicy`, `FIFOPolicy`, and `TurboServePolicy` are parallel
+`MotivationPolicy`, `FIFOPolicy`, `TurboServePolicy`, and `SlackServePolicy` are parallel
 implementations behind the small `SchedulingPolicy` interface. The scheduler
 coordinator continues to own session state, physical feasibility, versioned
 reservations, completion, and diagnostics; a policy only chooses which ready
-work is offered to that shared machinery. Motivation and TurboServe may use
-the migration path, while FIFO deliberately does not. This keeps a baseline
+work is offered to that shared machinery. Motivation, TurboServe, and
+SlackServe may use the migration path, while FIFO deliberately does not. This keeps a baseline
 from duplicating the LiveKit execution path and leaves room for additional
 policies later.
 
@@ -100,7 +100,34 @@ does not add cross-session batching. It also does not call the Motivation
 slack, quality, fairness, or idle-job objective. Idle sessions are treated as
 suspended for this baseline. The common coordinator still owns versioned
 reservations, NCCL migration, completion, and all producer/client metrics, so
-the three policies are directly comparable on the same runner.
+the policies are directly comparable on the same runner.
+
+`SlackServePolicy` is selected with `--motivation-policy slackserve`
+(`slackserver` is accepted as a spelling alias). It ports the scheduling
+semantics from the paper and the local `slack_serve_sim` reference into the
+same production execution path:
+
+- each worker dispatches B1 stream heads ordered by service credit
+  `C = P - (R + T)`, with the paper's urgent/normal/relaxed `2T` and `4T`
+  thresholds;
+- BMPR computes the measured B1 latency/quality Pareto frontier, uses the
+  median profile quality as its floor, selects the highest-quality point that
+  fits current playout slack, and falls back to the fastest point above the
+  floor in recovery mode;
+- an urgent queued stream can be re-homed only to an empty or relaxed-only
+  worker, only when the measured migration route-ready delay still gives an
+  earlier predicted finish, with the paper's 60-second residence cooldown;
+- idle chunks remain eligible because SlackServe manages continuous playout,
+  rather than only explicit interaction events.
+
+The local `slack_serve_sim` tree is a CPU timing simulator, not the paper's
+official GPU code. The ABot runtime also has no primitive for executing one
+stream with Elastic SP=2. The baseline therefore reports Elastic SP as
+unsupported in `slackserve_capabilities`; it does not mislabel a B2
+cross-session batch as model parallelism. Paged-KV eviction remains owned by
+the shared ABot state runtime rather than being reconstructed inside the
+policy. Consequently this is a real-GPU SlackServe scheduling baseline for
+credit/BMPR/re-homing, but not a claim of full paper-system reproduction.
 
 When autoscaling is enabled, the runtime's existing TurboServe closed-loop
 controller independently applies the paper's target-utilization and

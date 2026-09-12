@@ -6,6 +6,7 @@ from telefuser.service.livekit.motivation_diagnostics import MotivationDiagnosti
 from telefuser.service.livekit.motivation_policies import (
     FIFOPolicy,
     MotivationPolicy,
+    SlackServePolicy,
     TurboServePolicy,
     create_scheduling_policy,
 )
@@ -32,6 +33,8 @@ def test_policy_registry_exposes_parallel_implementations() -> None:
     assert isinstance(create_scheduling_policy("motivation"), MotivationPolicy)
     assert isinstance(create_scheduling_policy("FIFO"), FIFOPolicy)
     assert isinstance(create_scheduling_policy("TurboServe"), TurboServePolicy)
+    assert isinstance(create_scheduling_policy("SlackServe"), SlackServePolicy)
+    assert isinstance(create_scheduling_policy("SlackServer"), SlackServePolicy)
     with pytest.raises(ValueError, match="unknown scheduling policy"):
         create_scheduling_policy("unknown")
 

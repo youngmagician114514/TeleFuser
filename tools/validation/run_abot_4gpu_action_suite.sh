@@ -73,7 +73,7 @@ Options:
   --livekit-bin PATH              LiveKit server binary.
   --profile PATH                  Evaluated motivation profile CSV.
   --scenario PATH                 Base LiveKit replay scenario.
-  --motivation-policy NAME        Global policy: motivation or fifo (default: motivation).
+  --motivation-policy NAME        Global policy: motivation, fifo, turboserve, or slackserve (default: motivation).
   --startup-timeout-seconds N     Wait up to N seconds for TeleFuser startup (default: 900).
   ABOT_ACTION_SUITE_FRAME_CREDIT_ENABLED=0
                                   Disable publisher handoff credit for a compute-side run.
