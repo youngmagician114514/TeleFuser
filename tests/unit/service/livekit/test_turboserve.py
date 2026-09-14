@@ -100,3 +100,19 @@ def test_ownership_migration_commit_is_atomic_and_epoch_guarded() -> None:
     assert committed.epoch == 2
     with pytest.raises(RuntimeError, match="stale"):
         table.commit_migration(token)
+
+
+def test_progressive_ownership_can_roll_back_after_early_commit() -> None:
+    table = TurboServeOwnershipTable()
+    table.register("session-a", "gpu-0")
+    token = table.prepare_migration("session-a", "gpu-0", "gpu-1")
+
+    committed = table.commit_migration(token)
+    assert committed.worker_id == "gpu-1"
+
+    table.rollback_committed_migration(token)
+
+    owner = table.owner("session-a")
+    assert owner.worker_id == "gpu-0"
+    assert owner.epoch == 1
+    table.finalize_migration(token)

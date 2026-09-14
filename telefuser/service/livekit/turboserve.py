@@ -353,6 +353,11 @@ class TurboServeOwnershipTable:
     def __init__(self) -> None:
         self._owners: dict[str, TurboServeOwnership] = {}
         self._pending: dict[str, TurboServeMigrationToken] = {}
+        # Keep the token for the short residual-copy window.  This permits a
+        # progressive transfer to publish the target owner at first-layer
+        # readiness while still rolling back atomically if a later layer
+        # fails.
+        self._committed: dict[str, TurboServeMigrationToken] = {}
         self._lock = threading.RLock()
 
     def register(self, session_id: str, worker_id: str) -> TurboServeOwnership:
@@ -399,7 +404,30 @@ class TurboServeOwnershipTable:
             committed = TurboServeOwnership(token.session_id, token.target_worker_id, owner.epoch + 1)
             self._owners[token.session_id] = committed
             del self._pending[token.session_id]
+            self._committed[token.session_id] = token
             return committed
+
+    def rollback_committed_migration(self, token: TurboServeMigrationToken) -> None:
+        """Restore the source owner after a progressive residual failure."""
+
+        with self._lock:
+            if self._committed.get(token.session_id) != token:
+                return
+            owner = self._owners.get(token.session_id)
+            if owner is not None and owner.worker_id == token.target_worker_id and owner.epoch == token.source_epoch + 1:
+                self._owners[token.session_id] = TurboServeOwnership(
+                    token.session_id,
+                    token.source_worker_id,
+                    token.source_epoch,
+                )
+            self._committed.pop(token.session_id, None)
+
+    def finalize_migration(self, token: TurboServeMigrationToken) -> None:
+        """Forget a committed token after source cleanup is durable."""
+
+        with self._lock:
+            if self._committed.get(token.session_id) == token:
+                self._committed.pop(token.session_id, None)
 
     def abort_migration(self, token: TurboServeMigrationToken) -> None:
         with self._lock:
@@ -409,6 +437,7 @@ class TurboServeOwnershipTable:
     def release(self, session_id: str) -> None:
         with self._lock:
             self._pending.pop(session_id, None)
+            self._committed.pop(session_id, None)
             self._owners.pop(session_id, None)
 
 

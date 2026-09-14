@@ -1059,6 +1059,8 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
             self._migrating_controls[pipeline_session_id] = []
             started = time.monotonic()
             completed = False
+            ownership_committed = False
+            ownership: TurboServeOwnership | None = None
             background_cleanup_scheduled = False
 
             async def rollback_migration() -> None:
@@ -1088,7 +1090,10 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                         session_id=pipeline_session_id,
                     )
                 with contextlib.suppress(BaseException):
-                    self._ownership.abort_migration(token)
+                    if ownership_committed:
+                        self._ownership.rollback_committed_migration(token)
+                    else:
+                        self._ownership.abort_migration(token)
                 self._pipeline_routes[pipeline_session_id] = source_worker_id
                 self._session_workers[pipeline_session_id] = source_worker_id
                 pending_controls = self._migrating_controls.pop(pipeline_session_id, [])
@@ -1227,6 +1232,7 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                 await ready_waiter
 
                 async def publish_compute_route() -> None:
+                    nonlocal ownership, ownership_committed
                     # The target session has receive buffers for every cache
                     # layer, and the direct ABot path waits on the per-layer
                     # CUDA events while the residual copy continues.  Publish
@@ -1246,6 +1252,13 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                             target_worker_id,
                             {"type": "model_push", "session_id": pipeline_session_id, "chunk": chunk},
                         )
+                    # The state-transfer manager treats first-layer readiness
+                    # as the ownership handoff.  Commit the shared route now;
+                    # residual layers are fenced by LayerTransferProgress and
+                    # can finish in the background without holding the
+                    # foreground migration call.
+                    ownership = self._ownership.commit_migration(token)
+                    ownership_committed = True
                     if on_compute_ready is not None:
                         on_compute_ready()
 
@@ -1279,12 +1292,14 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                                     self._migration_transfer_complete_ms.append(float(transfer_complete_ms))
                             break
                 async def commit_route() -> TurboServeOwnership:
-                    ownership = self._ownership.commit_migration(token)
+                    if ownership is None:
+                        raise RuntimeError("NCCL migration reached route commit before first-layer ownership")
                     self._pipeline_routes[pipeline_session_id] = target_worker_id
                     self._session_workers[pipeline_session_id] = target_worker_id
                     return ownership
 
                 ownership = await self._run_migration_phase(token.token_id, "route_commit", commit_route)
+                self._ownership.finalize_migration(token)
                 # Ownership is the transaction commit point. Source cleanup is
                 # deliberately ordered afterwards: if that worker disappears,
                 # the imported target remains authoritative instead of trying
