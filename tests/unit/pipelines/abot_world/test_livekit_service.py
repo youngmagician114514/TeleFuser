@@ -387,6 +387,46 @@ def test_policy_batch_executes_exact_selected_members_in_one_physical_call() -> 
         service.stop()
 
 
+def test_policy_batch_queues_while_previous_physical_call_is_in_flight() -> None:
+    service, pipeline = _service(output_queue_size=4, max_batch_size=1, control_idle_timeout=30)
+    service.configure_session_capacity(1)
+    session_id = _create(service, "policy-queued-followup")
+    state = service._session(session_id)
+    assert state is not None
+    try:
+        assert _take_and_notify(service, state)["type"] == "preview"
+        with service._scheduler_condition:
+            service._scheduler_paused = True
+        def payload(job_id: str) -> dict:
+            return {
+                "type": "control_state",
+                "controls": ["KeyW"],
+                "motivation": {
+                    "job_id": job_id,
+                    "kind": "action",
+                    "batch_size": 1,
+                    "fidelity": "b1_s4_w18_rho0_bf16",
+                    "one_shot": True,
+                },
+            }
+
+        service.push_batch([(session_id, payload("policy-queued:first"))])
+        assert state.in_flight is True
+        # The child-side physical boundary can lag the parent lease by a
+        # small IPC interval. This lease must queue without replacing the
+        # metadata of the running invocation.
+        service.push_batch([(session_id, payload("policy-queued:second"))])
+        assert state.motivation_job_id == "policy-queued:first"
+        with service._scheduler_condition:
+            service._scheduler_paused = False
+            service._scheduler_condition.notify_all()
+        assert _take_and_notify(service, state)["scheduler"]["motivation_job_id"] == "policy-queued:first"
+        assert _take_and_notify(service, state)["scheduler"]["motivation_job_id"] == "policy-queued:second"
+        assert pipeline.batch_sizes[-2:] == [1, 1]
+    finally:
+        service.stop()
+
+
 def test_policy_batch_rechecks_output_credit_before_accepting_stale_lease() -> None:
     service, _ = _service(output_queue_size=2, max_batch_size=1, control_idle_timeout=30)
     service.configure_session_capacity(1)

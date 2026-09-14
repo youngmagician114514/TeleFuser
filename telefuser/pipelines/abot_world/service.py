@@ -160,6 +160,11 @@ class _PolicyBatch:
     states: tuple[_ABotWorldLiveKitSession, ...]
     controls: tuple[dict[str, bool], ...]
     members: tuple[_PolicyBatchMember, ...]
+    # A policy lease can arrive while the previous physical invocation is
+    # clearing its service-local in-flight bit.  Such members are activated
+    # only when this queue entry reaches the single physical lane; otherwise
+    # accepting the lease would overwrite the running job's metadata.
+    activate_on_pop: tuple[bool, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -652,8 +657,6 @@ class ABotWorldLiveKitService:
                 with state.lock:
                     if not state.active:
                         raise RuntimeError(f"ABot policy session {session_id!r} is inactive")
-                    if state.in_flight:
-                        raise RuntimeError(f"ABot policy session {session_id!r} is already in flight")
                     if state.migrating:
                         raise RuntimeError(f"ABot policy session {session_id!r} is migrating")
                     backpressure_reason = self._policy_batch_block_reason(state, now)
@@ -709,26 +712,59 @@ class ABotWorldLiveKitService:
             # running; keep it in the FIFO policy queue and let that lane
             # execute it after the earlier batch clears. Rejecting here makes
             # an otherwise valid lease look like a physical dispatch failure.
+            activate_on_pop: list[bool] = []
             for state, (_, chunk), applied_controls in zip(states, entries, controls, strict=True):
                 motivation = chunk["motivation"]
                 with state.lock:
-                    state.controls = set(applied_controls)
-                    state.motivation_one_shot = True
-                    state.motivation_kind = str(motivation.get("kind", "action"))
-                    state.motivation_job_id = str(motivation.get("job_id")) if motivation.get("job_id") else None
-                    state.motivation_fidelity = str(motivation["fidelity"])
-                    state.last_control_at = now
-                    idle_one_shot = state.motivation_kind == "idle"
-                    state.ready_since = now if state.controls or idle_one_shot else None
-                    state.pacing_ready_at = now
-                    state.control_event.set()
-                    state.in_flight = True
-                    if state.controls:
-                        self._workload_detector.record_active(state.session_id, now)
-                    else:
-                        self._workload_detector.record_idle(state.session_id, now)
-            self._policy_batches.append(_PolicyBatch(tuple(states), tuple(controls), tuple(members)))
+                    # Do not reject a valid lease merely because the child
+                    # has not yet published the previous physical boundary.
+                    # The scheduler lane is serialized, so defer only this
+                    # member's metadata update until the queued lease runs.
+                    activate_later = bool(state.in_flight)
+                    activate_on_pop.append(activate_later)
+                    if activate_later:
+                        continue
+                    self._activate_policy_state(
+                        state,
+                        applied_controls,
+                        motivation,
+                        now=now,
+                    )
+            self._policy_batches.append(
+                _PolicyBatch(
+                    tuple(states),
+                    tuple(controls),
+                    tuple(members),
+                    tuple(activate_on_pop),
+                )
+            )
             self._scheduler_condition.notify_all()
+
+    def _activate_policy_state(
+        self,
+        state: _ABotWorldLiveKitSession,
+        applied_controls: dict[str, bool],
+        motivation: Mapping[str, Any],
+        *,
+        now: float,
+    ) -> None:
+        """Install one queued lease in the service's physical lane."""
+
+        state.controls = set(applied_controls)
+        state.motivation_one_shot = True
+        state.motivation_kind = str(motivation.get("kind", "action"))
+        state.motivation_job_id = str(motivation.get("job_id")) if motivation.get("job_id") else None
+        state.motivation_fidelity = str(motivation["fidelity"])
+        state.last_control_at = now
+        idle_one_shot = state.motivation_kind == "idle"
+        state.ready_since = now if state.controls or idle_one_shot else None
+        state.pacing_ready_at = now
+        state.control_event.set()
+        state.in_flight = True
+        if state.controls:
+            self._workload_detector.record_active(state.session_id, now)
+        else:
+            self._workload_detector.record_idle(state.session_id, now)
 
     async def pull_chunks(self, session_id: str) -> AsyncGenerator[dict, None]:
         """Yield preview and generated frames in per-session sequence order."""
@@ -1498,6 +1534,35 @@ class ABotWorldLiveKitService:
                     batch = list(policy_batch.states)
                     controls = list(policy_batch.controls)
                     members = list(policy_batch.members)
+                    # A lease submitted during the previous physical call was
+                    # validated but not installed into the service state. The
+                    # scheduler loop is the only physical invocation lane, so
+                    # activate those deferred members immediately before
+                    # executing this queued batch.
+                    activation = policy_batch.activate_on_pop
+                    if activation:
+                        for state, applied_controls, member, activate_later in zip(
+                            batch,
+                            controls,
+                            members,
+                            activation,
+                            strict=True,
+                        ):
+                            if not activate_later:
+                                continue
+                            with state.lock:
+                                if not state.active:
+                                    continue
+                                self._activate_policy_state(
+                                    state,
+                                    applied_controls,
+                                    {
+                                        "job_id": member.job_id,
+                                        "kind": member.kind,
+                                        "fidelity": member.fidelity,
+                                    },
+                                    now=now,
+                                )
                     # A session can depart while its reserved lease is still
                     # queued. Do not execute stale controls against an inactive
                     # service state; clear the local marks and let the bridge
