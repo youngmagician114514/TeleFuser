@@ -972,13 +972,13 @@ def test_migration_publishes_compute_route_at_first_layer_ready(monkeypatch) -> 
                 "session_id": "pipeline-1",
             }
         )
-        # First-layer readiness is sufficient for the provisional direct path.
-        # The ownership table remains source-authoritative until the complete
-        # transfer commits, so a late copy failure can still roll back safely.
+        # First-layer readiness is sufficient for the progressive handoff.
+        # The ownership table commits early; the retained migration token makes
+        # a late copy failure rollback-safe.
         await asyncio.wait_for(compute_ready.wait(), timeout=1.0)
         assert not migration.done()
         assert pool._pipeline_routes["pipeline-1"] == "worker-1"
-        assert pool._ownership.owner("pipeline-1").worker_id == "worker-0"
+        assert pool._ownership.owner("pipeline-1").worker_id == "worker-1"
         pool._dispatch_event(_successful_dispatch_trace("pipeline-1", worker_id="worker-1"))
         # Compute may finish on the provisional target, but its scheduler
         # lease cannot commit until the residual state transfer commits.
@@ -1069,7 +1069,7 @@ def test_complete_copy_failure_replays_controls_without_exposing_target(monkeypa
         )
         await asyncio.wait_for(compute_ready.wait(), timeout=1.0)
         assert pool._pipeline_routes["pipeline-1"] == "worker-1"
-        assert pool._ownership.owner("pipeline-1").worker_id == "worker-0"
+        assert pool._ownership.owner("pipeline-1").worker_id == "worker-1"
         control = {"type": "action", "action": ["D"]}
         pool.push_model_chunk("pipeline-1", control)
         pool._dispatch_event(_successful_dispatch_trace("pipeline-1", worker_id="worker-1"))
