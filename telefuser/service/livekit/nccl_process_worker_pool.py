@@ -1555,6 +1555,14 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                 else:
                     ready.set_exception(RuntimeError(str(event.get("error", "model session creation failed"))))
             return
+        if event_type == "model_migration_manifest":
+            session_id = str(event.get("session_id", ""))
+            worker_id = str(event.get("worker_id", ""))
+            if self._session_workers.get(session_id) == worker_id:
+                manifest = event.get("tensor_manifest")
+                if isinstance(manifest, list) and all(isinstance(entry, dict) for entry in manifest):
+                    self._migration_manifests[session_id] = [dict(entry) for entry in manifest]
+            return
         if event.get("type") == "nccl_first_layer_ready":
             waiter = self._migration_ready_waiters.get(str(event.get("transfer_id", "")))
             if waiter is not None and not waiter.done():
@@ -2138,6 +2146,28 @@ async def _run_nccl_model_worker(
                             "session_id": session_id,
                         }
                     )
+                    # Publish shape-only transfer metadata once.  The parent
+                    # can then ask the target worker to reserve reusable pages
+                    # before a future source export reaches its boundary.
+                    manifest_fn = getattr(service, "migration_tensor_manifest", None)
+                    if callable(manifest_fn):
+                        try:
+                            manifest = manifest_fn(session_id)
+                            if isinstance(manifest, list):
+                                events.put(
+                                    {
+                                        "type": "model_migration_manifest",
+                                        "worker_id": spec.worker_id,
+                                        "session_id": session_id,
+                                        "tensor_manifest": manifest,
+                                    }
+                                )
+                        except Exception as exc:
+                            logger.debug(
+                                "Unable to publish migration manifest: session=%s error=%s",
+                                session_id,
+                                exc,
+                            )
                     start_pump(
                         session_id,
                         credit_window=int(command.get("model_output_credit_window", _MODEL_OUTPUT_PARENT_QUEUE_SIZE)),

@@ -922,6 +922,37 @@ class ABotWorldLiveKitService:
             "_nccl_tensor_leaves": leaves,
         }
 
+    def migration_tensor_manifest(self, session_id: str) -> list[dict[str, Any]]:
+        """Return the stable tensor shape manifest without quiescing the session.
+
+        The manifest contains shapes/dtypes/paths only; it never exposes
+        tensor values.  It is safe to publish once at session creation and
+        lets a later state-transfer manager reserve target pages while the
+        source finishes its current chunk.
+        """
+
+        state = self._session(session_id)
+        if state is None:
+            raise KeyError(f"Unknown ABot session {session_id!r}")
+        session = state.pipeline_session
+        session_lock = getattr(session, "lock", None)
+        lock_context = session_lock if session_lock is not None else contextlib.nullcontext()
+        with lock_context:
+            if session.taew_decode_state is None:
+                raise RuntimeError("ABot session is missing its TAeW2.2 decode state")
+            payload = {
+                "prompt_emb": session.prompt_emb,
+                "first_frame_latent": session.first_frame_latent,
+                "self_cache": session.self_cache,
+                "cross_cache": session.cross_cache,
+                "vae_feat_cache": session.vae_decode_state.feat_cache,
+                "taew_decode_state": self.pipeline.taew_decode_stage.export_decode_state_for_nccl(
+                    session.taew_decode_state
+                ),
+            }
+            _, manifest, _ = flatten_tensor_tree(payload)
+        return [dict(entry) for entry in manifest]
+
     def import_migration_nccl(
         self,
         metadata: Mapping[str, Any],
