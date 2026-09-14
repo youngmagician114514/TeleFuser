@@ -1134,10 +1134,11 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                             acknowledge=False,
                         )
             try:
-                # Once a session has migrated once, its tensor manifest is
-                # immutable for the lifetime of the session.  Reserve target
-                # pages immediately so allocator work overlaps source
-                # quiescing instead of extending the migration critical path.
+                # Once a session has completed an export, its current tensor
+                # manifest is cached and target pages can be reserved while
+                # the source is quiescing.  Do not infer the manifest from
+                # model creation: ABot-World may add cache/state leaves after
+                # the initial session shell is created.
                 cached_manifest = self._migration_manifests.get(pipeline_session_id)
                 if cached_manifest is not None:
                     await self._run_migration_phase(
@@ -2068,6 +2069,37 @@ async def _run_nccl_model_worker(
                 state_page_pool.release(slot)
             await result(request_id, error=exc)
 
+    def _slot_matches_manifest(
+        leaves: dict[tuple[Any, ...], torch.Tensor], manifest: Any
+    ) -> bool:
+        """Check an opportunistically reserved slot against current metadata.
+
+        The parent-side cache is only an optimization.  A model can discover
+        additional state leaves between creation and export, so accepting a
+        stale slot would make the NCCL path fail with a path-set mismatch.
+        This check is metadata-only and does not synchronize CUDA.
+        """
+
+        if not isinstance(manifest, list) or len(leaves) != len(manifest):
+            return False
+        for entry in manifest:
+            if not isinstance(entry, dict):
+                return False
+            try:
+                path = tuple(entry["path"])
+                expected_shape = tuple(int(value) for value in entry["shape"])
+                expected_dtype = str(entry["dtype"]).removeprefix("torch.")
+            except (KeyError, TypeError, ValueError):
+                return False
+            tensor = leaves.get(path)
+            if tensor is None:
+                return False
+            if tuple(tensor.shape) != expected_shape:
+                return False
+            if str(tensor.dtype).removeprefix("torch.") != expected_dtype:
+                return False
+        return True
+
     async def run_nccl_prepare_recv(command: dict[str, Any]) -> None:
         """Allocate receive leaves off the command loop's event-loop thread."""
         request_id = command.get("request_id")
@@ -2086,6 +2118,12 @@ async def _run_nccl_model_worker(
                 leaves, slot = await asyncio.to_thread(allocate)
             else:
                 leaves, slot = prepared
+                # Reservation is deliberately speculative.  If the source
+                # export reports a newer manifest, return the stale pages and
+                # allocate exactly the leaves needed by this transfer.
+                if not _slot_matches_manifest(leaves, metadata.get("tensor_manifest")):
+                    state_page_pool.release(slot)
+                    leaves, slot = await asyncio.to_thread(allocate)
             incoming[transfer_id] = (
                 metadata,
                 leaves,
@@ -2161,28 +2199,6 @@ async def _run_nccl_model_worker(
                             "session_id": session_id,
                         }
                     )
-                    # Publish shape-only transfer metadata once.  The parent
-                    # can then ask the target worker to reserve reusable pages
-                    # before a future source export reaches its boundary.
-                    manifest_fn = getattr(service, "migration_tensor_manifest", None)
-                    if callable(manifest_fn):
-                        try:
-                            manifest = manifest_fn(session_id)
-                            if isinstance(manifest, list):
-                                events.put(
-                                    {
-                                        "type": "model_migration_manifest",
-                                        "worker_id": spec.worker_id,
-                                        "session_id": session_id,
-                                        "tensor_manifest": manifest,
-                                    }
-                                )
-                        except Exception as exc:
-                            logger.debug(
-                                "Unable to publish migration manifest: session=%s error=%s",
-                                session_id,
-                                exc,
-                            )
                     start_pump(
                         session_id,
                         credit_window=int(command.get("model_output_credit_window", _MODEL_OUTPUT_PARENT_QUEUE_SIZE)),
