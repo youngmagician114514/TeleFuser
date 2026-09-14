@@ -6,12 +6,41 @@ import torch
 from telefuser.service.livekit.config import LiveKitServeConfig
 from telefuser.service.livekit.nccl_transfer import (
     LayerTransferProgress,
+    PersistentTensorPagePool,
     TensorTransferGroup,
     build_layer_transfer_groups,
     flatten_tensor_tree,
     rebuild_tensor_tree,
     transfer_tensor_leaves_nccl_streamed,
 )
+
+
+def test_persistent_tensor_page_pool_reuses_matching_pages() -> None:
+    pool = PersistentTensorPagePool(max_cached_bytes=1024)
+    manifest = [
+        {"path": ["cache", 0], "shape": [2, 3], "dtype": "torch.float32"},
+        {"path": ["cache", 1], "shape": [4], "dtype": "torch.int64"},
+    ]
+
+    first, slot = pool.acquire(manifest, torch.device("cpu"))
+    first_ids = {path: id(value) for path, value in first.items()}
+    pool.release(slot)
+    assert pool.snapshot()["cached_pages"] == 2
+
+    second, second_slot = pool.acquire(manifest, torch.device("cpu"))
+    assert {path: id(value) for path, value in second.items()} == first_ids
+    assert pool.snapshot()["cached_pages"] == 0
+    pool.release(second_slot)
+
+
+def test_persistent_tensor_page_pool_eviction_is_bounded() -> None:
+    pool = PersistentTensorPagePool(max_cached_bytes=16)
+    manifest = [{"path": ["cache", 0], "shape": [4, 4], "dtype": "torch.float32"}]
+    _, slot = pool.acquire(manifest, torch.device("cpu"))
+    pool.release(slot)
+    snapshot = pool.snapshot()
+    assert snapshot["cached_bytes"] == 0
+    assert snapshot["cached_pages"] == 0
 
 
 def test_tensor_manifest_round_trip_preserves_nested_structure() -> None:

@@ -28,8 +28,9 @@ from .dispatch_trace import DispatchTraceWriter as _DispatchTraceWriter
 from .migration_diagnostics import MigrationDiagnostics, classify_migration_error
 from .nccl_transfer import (
     LayerTransferProgress,
+    PersistentTensorPagePool,
+    PersistentTensorSlot,
     TensorTransferGroup,
-    allocate_tensor_tree_leaves,
     build_layer_transfer_groups,
     transfer_tensor_leaves_nccl_streamed,
 )
@@ -310,6 +311,11 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         # duplicate request for the same session remains serialized while
         # different sessions can overlap all transport phases.
         self._migration_session_locks: dict[str, asyncio.Lock] = {}
+        # The manifest is stable for a session's model shape.  Keeping it in
+        # the parent lets a subsequent migration reserve target pages before
+        # the source reaches its quiescent boundary, overlapping allocation
+        # with the only unavoidable source-side wait.
+        self._migration_manifests: dict[str, list[dict[str, Any]]] = {}
         # NCCL P2P ordering is required only for one unordered worker pair:
         # messages on that channel have no user-visible tag.  Different GPU
         # pairs can therefore transfer concurrently instead of forming a
@@ -664,6 +670,7 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         self._migrating_controls.pop(session_id, None)
         self._provisional_migration_controls.pop(session_id, None)
         self._provisional_model_events.pop(session_id, None)
+        self._migration_manifests.pop(session_id, None)
         self._session_runtime_metrics.pop(session_id, None)
         self._publisher_progress_sequences.pop(session_id, None)
         self._publisher_frame_tracking.pop(session_id, None)
@@ -1122,6 +1129,23 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                             acknowledge=False,
                         )
             try:
+                # Once a session has migrated once, its tensor manifest is
+                # immutable for the lifetime of the session.  Reserve target
+                # pages immediately so allocator work overlaps source
+                # quiescing instead of extending the migration critical path.
+                cached_manifest = self._migration_manifests.get(pipeline_session_id)
+                if cached_manifest is not None:
+                    await self._run_migration_phase(
+                        token.token_id,
+                        "reserve_recv",
+                        lambda: self._request(
+                            target_worker_id,
+                            "nccl_reserve_recv",
+                            transfer_id=token.token_id,
+                            tensor_manifest=cached_manifest,
+                            timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
+                        ),
+                    )
                 # The child stops its output pump and takes the authoritative
                 # model-state boundary in one command. This removes a pause
                 # status round trip from the migration critical path.
@@ -1137,6 +1161,11 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                     ),
                 )
                 metadata = dict(exported["result"])
+                manifest = metadata.get("tensor_manifest")
+                if isinstance(manifest, list):
+                    self._migration_manifests[pipeline_session_id] = [
+                        dict(entry) for entry in manifest if isinstance(entry, dict)
+                    ]
                 state_bytes = metadata.get("state_bytes", 0)
                 if isinstance(diagnostics, MigrationDiagnostics):
                     diagnostics.set_state_bytes(token.token_id, state_bytes)
@@ -1729,7 +1758,32 @@ async def _run_nccl_model_worker(
         str,
         tuple[dict[tuple[Any, ...], torch.Tensor], tuple[TensorTransferGroup, ...]],
     ] = {}
-    incoming: dict[str, tuple[dict[str, Any], dict[tuple[Any, ...], torch.Tensor], str, int, int]] = {}
+    incoming: dict[
+        str,
+        tuple[
+            dict[str, Any],
+            dict[tuple[Any, ...], torch.Tensor],
+            str,
+            int,
+            int,
+            PersistentTensorSlot,
+        ],
+    ] = {}
+    # A prepared slot has no session owner yet.  It is safe to allocate it
+    # before source export finishes; ownership is assigned only when the full
+    # metadata arrives and ``run_nccl_recv`` installs the target session.
+    prepared_slots: dict[
+        str,
+        tuple[dict[tuple[Any, ...], torch.Tensor], PersistentTensorSlot],
+    ] = {}
+    # The pool keeps recently released tensor pages resident on this worker.
+    # It is deliberately independent of model-session capacity: a page can be
+    # reused by the next migration, but the bounded byte budget prevents it
+    # from turning into an unbounded hidden reservation.
+    state_page_pool = PersistentTensorPagePool(
+        max_cached_bytes=int(max(0.0, float(config.migration_state_pool_cache_gb)) * (1 << 30))
+    )
+    session_slots: dict[str, PersistentTensorSlot] = {}
     transfer_tasks: set[asyncio.Task[None]] = set()
     warmup_stream = torch.cuda.Stream(device=torch.device("cuda", int(spec.gpu_ids[0])))
     # batch_isend_irecv has process-local coalescing state. Protect only its
@@ -1832,6 +1886,11 @@ async def _run_nccl_model_worker(
         if drop_credit_state:
             output_credits.pop(session_id, None)
 
+    def release_session_slot(session_id: str) -> None:
+        """Return a migrated session's target pages after its model closes."""
+
+        state_page_pool.release(session_slots.pop(session_id, None))
+
     async def result(request_id: str | None, value: Any = True, error: Exception | None = None) -> None:
         if request_id is not None:
             events.put(
@@ -1867,9 +1926,11 @@ async def _run_nccl_model_worker(
         transfer_task: asyncio.Task[dict[str, Any]] | None = None
         import_task: asyncio.Task[str] | None = None
         progress: LayerTransferProgress | None = None
+        slot: PersistentTensorSlot | None = None
+        installed_session_id: str | None = None
         try:
             transfer_id = str(command["transfer_id"])
-            metadata, leaves, owner, epoch, credit_window = incoming.pop(transfer_id)
+            metadata, leaves, owner, epoch, credit_window, slot = incoming.pop(transfer_id)
             groups = build_layer_transfer_groups(metadata["tensor_manifest"])
             layer_count = max(
                 (group.layer_index for group in groups if group.layer_index is not None),
@@ -1918,6 +1979,9 @@ async def _run_nccl_model_worker(
                 # partially initialized target session can become visible.
                 await transfer_task
             session_id = await import_task
+            installed_session_id = session_id
+            if slot is not None:
+                session_slots[session_id] = slot
             events.put(
                 {
                     "type": "nccl_first_layer_ready",
@@ -1977,6 +2041,8 @@ async def _run_nccl_model_worker(
             # parent's subsequent nccl_discard cannot race a late insert.
             if import_task is not None and not import_task.done():
                 await asyncio.gather(import_task, return_exceptions=True)
+            if installed_session_id is None and slot is not None:
+                state_page_pool.release(slot)
             await result(request_id, error=exc)
 
     async def run_nccl_prepare_recv(command: dict[str, Any]) -> None:
@@ -1985,22 +2051,50 @@ async def _run_nccl_model_worker(
         transfer_id = str(command["transfer_id"])
         metadata = command["metadata"]
 
-        def allocate() -> dict[tuple[Any, ...], torch.Tensor]:
+        def allocate() -> tuple[dict[tuple[Any, ...], torch.Tensor], PersistentTensorSlot]:
             torch.cuda.set_device(int(spec.gpu_ids[0]))
-            return allocate_tensor_tree_leaves(
+            return state_page_pool.acquire(
                 metadata["tensor_manifest"], torch.device(f"cuda:{spec.gpu_ids[0]}")
             )
 
         try:
-            leaves = await asyncio.to_thread(allocate)
+            prepared = prepared_slots.pop(transfer_id, None)
+            if prepared is None:
+                leaves, slot = await asyncio.to_thread(allocate)
+            else:
+                leaves, slot = prepared
             incoming[transfer_id] = (
                 metadata,
                 leaves,
                 command["owner_worker_id"],
                 command["ownership_epoch"],
                 int(command.get("model_output_credit_window", _MODEL_OUTPUT_PARENT_QUEUE_SIZE)),
+                slot,
             )
             await result(request_id)
+        except Exception as exc:
+            # Allocation can fail after acquiring a partially populated slot;
+            # the helper returns only a fully assembled slot, so there is no
+            # additional reservation to unwind here.
+            await result(request_id, error=exc)
+
+    async def run_nccl_reserve_recv(command: dict[str, Any]) -> None:
+        """Reserve a reusable target slot while the source is quiescing."""
+
+        request_id = command.get("request_id")
+        transfer_id = str(command["transfer_id"])
+
+        def reserve() -> tuple[dict[tuple[Any, ...], torch.Tensor], PersistentTensorSlot]:
+            torch.cuda.set_device(int(spec.gpu_ids[0]))
+            return state_page_pool.acquire(
+                command["tensor_manifest"], torch.device(f"cuda:{spec.gpu_ids[0]}")
+            )
+
+        try:
+            if transfer_id in prepared_slots or transfer_id in incoming:
+                raise RuntimeError(f"NCCL migration transfer {transfer_id!r} already has a target slot")
+            prepared_slots[transfer_id] = await asyncio.to_thread(reserve)
+            await result(request_id, state_page_pool.snapshot())
         except Exception as exc:
             await result(request_id, error=exc)
 
@@ -2080,6 +2174,7 @@ async def _run_nccl_model_worker(
                 elif kind == "model_close":
                     await stop_pump(command["session_id"], drop_credit_state=True)
                     adapter.close_session(command["session_id"])
+                    release_session_slot(command["session_id"])
                 elif kind == "model_output_credit":
                     credits = output_credits.get(command["session_id"])
                     if credits is not None:
@@ -2155,6 +2250,13 @@ async def _run_nccl_model_worker(
                     transfer_tasks.add(task)
                     task.add_done_callback(transfer_tasks.discard)
                     continue
+                elif kind == "nccl_reserve_recv":
+                    task = asyncio.create_task(
+                        run_nccl_reserve_recv(command), name=f"nccl-reserve-{command['transfer_id']}"
+                    )
+                    transfer_tasks.add(task)
+                    task.add_done_callback(transfer_tasks.discard)
+                    continue
                 elif kind == "nccl_send":
                     # The parent still waits for this request result before
                     # committing ownership, but unrelated commands can run
@@ -2171,14 +2273,21 @@ async def _run_nccl_model_worker(
                 elif kind == "nccl_commit_source":
                     await stop_pump(command["session_id"], drop_credit_state=True)
                     await asyncio.to_thread(service.commit_migration, command["session_id"])
+                    release_session_slot(command["session_id"])
                 elif kind == "nccl_abort_source":
                     service.abort_migration(command["session_id"])
                     outgoing.pop(command.get("transfer_id", ""), None)
                 elif kind == "nccl_discard":
-                    incoming.pop(command["transfer_id"], None)
+                    pending = incoming.pop(command["transfer_id"], None)
+                    reserved = prepared_slots.pop(command["transfer_id"], None)
                     await stop_pump(command["session_id"], drop_credit_state=True)
                     if service.has_session(command["session_id"]):
                         service.close_session(command["session_id"])
+                    release_session_slot(command["session_id"])
+                    if pending is not None:
+                        state_page_pool.release(pending[-1])
+                    if reserved is not None:
+                        state_page_pool.release(reserved[1])
                 elif kind == "nccl_destroy":
                     if dist.is_initialized():
                         dist.destroy_process_group()
@@ -2196,6 +2305,15 @@ async def _run_nccl_model_worker(
             await asyncio.gather(*transfer_tasks, return_exceptions=True)
         for session_id in tuple(outputs):
             await stop_pump(session_id, drop_credit_state=True)
+        for slot in tuple(session_slots.values()):
+            state_page_pool.release(slot)
+        session_slots.clear()
+        for pending in tuple(incoming.values()):
+            state_page_pool.release(pending[-1])
+        incoming.clear()
+        for _, slot in tuple(prepared_slots.values()):
+            state_page_pool.release(slot)
+        prepared_slots.clear()
         if dist.is_initialized():
             with contextlib.suppress(Exception):
                 dist.destroy_process_group()

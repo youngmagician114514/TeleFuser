@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -54,6 +55,131 @@ class TensorTransferReport:
 
 
 TransferGroupCallback = Callable[[TensorTransferGroup, torch.cuda.Event | None], None]
+
+
+@dataclass
+class PersistentTensorSlot:
+    """A reusable collection of page-sized tensor allocations.
+
+    The slot deliberately contains no session metadata.  It is only an
+    ownership token for target-side allocations, so a completed transfer can
+    release the tensors back to the worker-local pool without keeping the
+    Python session object alive.
+    """
+
+    pages: tuple[tuple[tuple[str, tuple[int, ...], str], torch.Tensor], ...]
+    released: bool = False
+
+
+class PersistentTensorPagePool:
+    """Reuse target allocations across migrations without changing tensor ABI.
+
+    NCCL still copies the current state, but allocation and CUDA allocator
+    churn are removed from the migration hot path.  Pages are keyed by
+    ``(dtype, shape, device)`` and can therefore be reused even when two
+    sessions have different manifest paths.  A bounded byte budget prevents
+    the cache from becoming an untracked second session-capacity pool.
+    """
+
+    def __init__(self, *, max_cached_bytes: int = 1 << 30) -> None:
+        if max_cached_bytes < 0:
+            raise ValueError("max_cached_bytes must be non-negative")
+        self.max_cached_bytes = int(max_cached_bytes)
+        self._free: dict[tuple[str, tuple[int, ...], str], deque[torch.Tensor]] = {}
+        self._free_order: deque[tuple[tuple[str, tuple[int, ...], str], torch.Tensor, int]] = deque()
+        self._cached_bytes = 0
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _key(entry: dict[str, Any], device: torch.device) -> tuple[str, tuple[int, ...], str]:
+        return (
+            str(entry["dtype"]),
+            tuple(int(value) for value in entry["shape"]),
+            str(device),
+        )
+
+    def acquire(
+        self,
+        manifest: Sequence[dict[str, Any]],
+        device: torch.device,
+    ) -> tuple[dict[tuple[Any, ...], torch.Tensor], PersistentTensorSlot]:
+        """Acquire one tensor for each manifest path, reusing free pages."""
+
+        leaves: dict[tuple[Any, ...], torch.Tensor] = {}
+        pages: list[tuple[tuple[str, tuple[int, ...], str], torch.Tensor]] = []
+        with self._lock:
+            for entry in manifest:
+                key = self._key(entry, device)
+                bucket = self._free.get(key)
+                tensor = bucket.pop() if bucket else None
+                if tensor is not None:
+                    bytes_used = tensor.numel() * tensor.element_size()
+                    self._cached_bytes -= bytes_used
+                    # Remove the corresponding eviction index now.  Tensor
+                    # equality is element-wise, so compare by identity.
+                    for index, (_, candidate, _) in enumerate(self._free_order):
+                        if candidate is tensor:
+                            del self._free_order[index]
+                            break
+                else:
+                    tensor = torch.empty(tuple(key[1]), dtype=_dtype_from_name(key[0]), device=device)
+                path = tuple(entry["path"])
+                leaves[path] = tensor
+                pages.append((key, tensor))
+        return leaves, PersistentTensorSlot(tuple(pages))
+
+    def release(self, slot: PersistentTensorSlot | None) -> None:
+        """Return a slot to the pool; release is idempotent."""
+
+        if slot is None:
+            return
+        with self._lock:
+            if slot.released:
+                return
+            slot.released = True
+            for key, tensor in slot.pages:
+                bytes_used = tensor.numel() * tensor.element_size()
+                if self.max_cached_bytes == 0:
+                    continue
+                self._free.setdefault(key, deque()).append(tensor)
+                self._free_order.append((key, tensor, bytes_used))
+                self._cached_bytes += bytes_used
+            self._trim_locked()
+
+    def _trim_locked(self) -> None:
+        while self._cached_bytes > self.max_cached_bytes and self._free_order:
+            key, tensor, bytes_used = self._free_order.popleft()
+            bucket = self._free.get(key)
+            if not bucket:
+                continue
+            # A tensor can have been acquired after it was indexed.  Remove
+            # only if this exact object is still free; otherwise leave the
+            # accounting to the newer index entry.
+            index = next((index for index, candidate in enumerate(bucket) if candidate is tensor), None)
+            if index is None:
+                continue
+            del bucket[index]
+            self._cached_bytes -= bytes_used
+            if not bucket:
+                self._free.pop(key, None)
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "cached_bytes": int(self._cached_bytes),
+                "cached_pages": sum(len(bucket) for bucket in self._free.values()),
+                "max_cached_bytes": self.max_cached_bytes,
+            }
+
+
+def _dtype_from_name(name: str) -> torch.dtype:
+    """Resolve the manifest dtype without relying on ``getattr(torch, ...)``."""
+
+    normalized = name.removeprefix("torch.")
+    dtype = getattr(torch, normalized, None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(f"Unsupported NCCL tensor dtype {name!r}")
+    return dtype
 
 
 class LayerTransferProgress:

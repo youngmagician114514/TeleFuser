@@ -79,6 +79,14 @@ class LiveKitServeConfig(BaseSettings):
             "transfer drain overlaps in background"
         ),
     )
+    migration_state_pool_cache_gb: float = Field(
+        default=1.0,
+        ge=0,
+        description=(
+            "Per-worker byte budget for reusable NCCL session-state tensor pages; "
+            "zero disables retention while keeping the same transfer protocol"
+        ),
+    )
     motivation_migration_route_ready_seconds: float = Field(
         default=0.2,
         ge=0,
