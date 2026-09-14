@@ -109,12 +109,14 @@ def run_stream_server(
                 # value explicit makes runtime metadata and tests unambiguous.
                 migration_enabled=motivation_migration and normalized_policy != "fifo",
                 policy_name=normalized_policy,
+                load_balance_capacity_per_worker=config.session_capacity_limit() or 8,
                 turboserve_capacity_per_worker=config.session_capacity_limit() or 8,
                 turboserve_target_utilization=config.autoscaling_target_utilization,
                 turboserve_migration_eta=config.turboserve_migration_eta,
                 turboserve_min_gain_ms=config.turboserve_min_migration_gain_ms,
                 turboserve_rebalance_iteration_limit=config.turboserve_rebalance_iteration_limit,
                 slackserve_capacity_per_worker=config.session_capacity_limit() or 8,
+                slackserve_include_idle_jobs=config.slackserve_include_idle_jobs,
             ),
             # Charge the complete route-ready critical path. Residual layer
             # copy and source cleanup overlap target compute and are excluded.

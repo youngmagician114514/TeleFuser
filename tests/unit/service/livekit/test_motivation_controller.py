@@ -130,6 +130,26 @@ def test_controller_reserves_and_completes_local_dispatch() -> None:
     assert controller.on_completion(lease, completed_at=0.4)[0].session_id == "s"
 
 
+def test_motivation_compute_stage_keeps_balanced_session_local() -> None:
+    scheduler = _make_scheduler()
+    scheduler.add_gpu(GpuSchedulingState("gpu-1", free_at=0.0, memory_free_gb=80.0))
+    scheduler.register_session("s", owner_gpu="gpu-0", now=0.0)
+    scheduler.submit_action("s", ["W"], now=0.0)
+    manager = AsyncMigrationManager()
+    controller = MotivationRuntimeController(
+        scheduler,
+        dispatch=lambda _lease: None,
+        migration_manager=manager,
+        migration_backend_factory=lambda _request: _ReadyBackend(),
+    )
+
+    lease = controller.schedule_once(now=0.0)
+
+    assert lease is not None
+    assert lease.candidate.gpu_id == "gpu-0"
+    assert manager.active() == ()
+
+
 def test_fifo_controller_disables_idle_and_migration_inputs() -> None:
     scheduler = MotivationScheduler(
         StaticMotivationProfileTable(

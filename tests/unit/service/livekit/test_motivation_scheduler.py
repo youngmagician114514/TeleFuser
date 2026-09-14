@@ -213,6 +213,99 @@ def test_candidate_uses_global_slack_and_same_compatibility_key() -> None:
     assert candidate.projected_slack["c"] < 3.0
 
 
+def test_motivation_softly_balances_resident_sessions_across_idle_gpus() -> None:
+    """A comparable remote candidate should use an idle worker.
+
+    Timeline-only placement cannot see this imbalance after a worker has gone
+    idle.  The Motivation load term includes resident sessions, so the first
+    of several otherwise identical jobs is moved to the empty worker.  FIFO
+    and the other baseline policies do not use this objective.
+    """
+    profile = MotivationProfile(1, "fixed", 0.4, 0.8, 20.0)
+    scheduler = MotivationScheduler(
+        StaticMotivationProfileTable([profile]),
+        config=MotivationSchedulerConfig(
+            max_batch_size=1,
+            lambda_quality=0.0,
+            lambda_migration=0.0,
+            lambda_load_balance=1.0,
+        ),
+        migration_estimator=LocalMigrationEstimator(first_layer_ready_seconds=0.0),
+    )
+    scheduler.add_gpu(GpuSchedulingState("gpu-0", memory_free_gb=80.0))
+    scheduler.add_gpu(GpuSchedulingState("gpu-1", memory_free_gb=80.0))
+    for index in range(8):
+        session_id = f"resident-{index}"
+        scheduler.register_session(session_id, owner_gpu="gpu-0", now=0.0)
+        scheduler.submit_action(session_id, ["W"], now=0.0)
+
+    candidate = scheduler.find_best(now=0.0, include_wait=False)
+
+    assert candidate is not None
+    assert candidate.gpu_id == "gpu-1"
+    assert candidate.migration_count == 1
+
+
+def test_two_stage_placement_has_no_compute_profile_and_local_search_stays_local() -> None:
+    scheduler = _scheduler(max_batch_size=4)
+    scheduler.update_gpu("gpu-0", free_at=4.0, now=0.0)
+    for index in range(2):
+        session_id = f"placement-{index}"
+        scheduler.register_session(session_id, owner_gpu="gpu-0", now=0.0)
+        scheduler.submit_action(session_id, ["W"], now=0.0, release=True)
+
+    decision = scheduler.plan_rehoming(now=0.0)
+
+    assert decision is not None
+    assert decision.source_gpu == "gpu-0"
+    assert decision.target_gpu == "gpu-1"
+    migration_candidate = scheduler.placement_candidate(decision)
+    assert migration_candidate.profile is None
+    assert migration_candidate.migration_count == 1
+    assert scheduler.find_best_local("gpu-1", now=0.0) is None
+
+
+def test_placement_does_not_move_a_session_without_late_next_work() -> None:
+    scheduler = _scheduler(max_batch_size=1)
+    scheduler.register_session("resident", owner_gpu="gpu-0", now=0.0)
+
+    assert scheduler.plan_rehoming(now=0.0) is None
+
+
+def test_placement_requires_target_to_finish_next_work_earlier() -> None:
+    scheduler = _scheduler(max_batch_size=1)
+    scheduler.register_session(
+        "urgent", owner_gpu="gpu-0", now=0.0, slack_seconds=0.1
+    )
+    scheduler.submit_action("urgent", ["W"], now=0.0, release=True)
+    scheduler.update_gpu("gpu-0", free_at=0.2, now=0.0)
+    scheduler.update_gpu("gpu-1", free_at=0.5, now=0.0)
+
+    assert scheduler.plan_rehoming(now=0.0) is None
+
+
+def test_placement_counts_pending_target_reservations_against_capacity() -> None:
+    scheduler = _scheduler(max_batch_size=1)
+    scheduler.register_session(
+        "urgent", owner_gpu="gpu-0", now=0.0, slack_seconds=0.1
+    )
+    scheduler.submit_action("urgent", ["W"], now=0.0, release=True)
+    scheduler.update_gpu("gpu-0", free_at=0.2, now=0.0)
+    scheduler.set_migration_ready(
+        "urgent", target_gpu="gpu-1", ready_at=0.2, now=0.0
+    )
+
+    # The target is already reserved by the in-flight move, so a second
+    # session may not be planned into the same worker once it reaches cap.
+    for index in range(7):
+        sid = f"resident-{index}"
+        scheduler.register_session(sid, owner_gpu="gpu-1", now=0.0)
+    scheduler.register_session("another", owner_gpu="gpu-0", now=0.0, slack_seconds=0.1)
+    scheduler.submit_action("another", ["D"], now=0.0, release=True)
+
+    assert scheduler.plan_rehoming(now=0.0) is None
+
+
 def test_runnable_model_work_is_not_replaced_by_a_noop_wait_when_slack_is_negative() -> None:
     """A runnable GPU must keep making progress after the aggregate buffer drains.
 

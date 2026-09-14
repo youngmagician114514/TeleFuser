@@ -13,6 +13,11 @@ cd "${REPO_ROOT}"
 
 PYTHON_BIN="/public/fanyk1/lwb/envs/telefuser_sage291/bin/python"
 LIVEKIT_BIN="/tmp/livekit-bin/livekit-server"
+LIVEKIT_PORT="${ABOT_ACTION_SUITE_LIVEKIT_PORT:-7880}"
+LIVEKIT_RTC_TCP_PORT="${ABOT_ACTION_SUITE_LIVEKIT_RTC_TCP_PORT:-7881}"
+LIVEKIT_RTC_PORT_START="${ABOT_ACTION_SUITE_LIVEKIT_RTC_PORT_START:-50000}"
+LIVEKIT_RTC_PORT_END="${ABOT_ACTION_SUITE_LIVEKIT_RTC_PORT_END:-50100}"
+SERVER_PORT="${ABOT_ACTION_SUITE_SERVER_PORT:-8088}"
 MODEL_ZOO_PATH="/public/fanyk1/lwb/model_zoo"
 PROFILE_PATH="/public/fanyk1/lwb/abot_world_eval_bench/runs/abot_full_profile/profile_evaluated.csv"
 SCENARIO_PATH="tools/validation/workloads/abot_livekit_4gpu_lf3_12fps_wave.json"
@@ -85,6 +90,9 @@ Options:
                                   Set the time-based credit target (default: 3.0).
   ABOT_ACTION_SUITE_MOTIVATION_MIGRATION_ENABLED=0
                                   Disable Motivation session migration for a placement control run.
+  ABOT_ACTION_SUITE_LIVEKIT_PORT=N
+  ABOT_ACTION_SUITE_SERVER_PORT=N
+                                  Override the LiveKit/TeleFuser HTTP ports for concurrent suites.
   --dry-run                       Validate all selected traces without starting services.
   -h, --help                      Show this help.
 
@@ -234,6 +242,12 @@ RUN_ROOT="$(repo_absolute_path "${RUN_ROOT}")"
   || die "ABOT_ACTION_SUITE_MOTIVATION_MIGRATION_ENABLED must be 0 or 1"
 [[ "${MOTIVATION_POLICY}" =~ ^[[:alpha:]][[:alnum:]_-]*$ ]] \
   || die "--motivation-policy must be a simple policy name"
+for port in "${LIVEKIT_PORT}" "${LIVEKIT_RTC_TCP_PORT}" "${LIVEKIT_RTC_PORT_START}" "${LIVEKIT_RTC_PORT_END}" "${SERVER_PORT}"; do
+  [[ "${port}" =~ ^[1-9][0-9]*$ ]] && (( port <= 65535 )) \
+    || die "service and RTC ports must be integers in [1, 65535]"
+done
+(( LIVEKIT_RTC_PORT_START <= LIVEKIT_RTC_PORT_END )) \
+  || die "LiveKit RTC port range start must not exceed its end"
 [[ -x "${PYTHON_BIN}" ]] || die "Python interpreter is not executable: ${PYTHON_BIN}"
 [[ -f "${PROFILE_PATH}" ]] || die "Motivation profile not found: ${PROFILE_PATH}"
 [[ -f "${SCENARIO_PATH}" ]] || die "Replay scenario not found: ${SCENARIO_PATH}"
@@ -288,6 +302,7 @@ echo "  publisher frame credit: ${FRAME_CREDIT_ENABLED}"
 echo "  frame-credit target: ${FRAME_CREDIT_TARGET_FRAMES} frames (${FRAME_CREDIT_TARGET_SECONDS}s), reserve ${FRAME_CREDIT_RESERVE_FRAMES}, guard ${FRAME_CREDIT_GUARD_MS}ms"
 echo "  Motivation migration: ${MOTIVATION_MIGRATION_ENABLED}"
 echo "  Motivation policy: ${MOTIVATION_POLICY}"
+echo "  LiveKit/TeleFuser ports: ${LIVEKIT_PORT}/${SERVER_PORT}"
 echo "  run root: ${RUN_ROOT}"
 
 if [[ "${MOTIVATION_MIGRATION_ENABLED}" -eq 1 ]]; then
@@ -325,7 +340,7 @@ for gpu in "${GPUS[@]}"; do
   fi
 done
 
-for port in 7880 8088; do
+for port in "${LIVEKIT_PORT}" "${LIVEKIT_RTC_TCP_PORT}" "${SERVER_PORT}"; do
   if ss -ltn "( sport = :${port} )" | tail -n +2 | grep -q .; then
     die "TCP port ${port} is already listening"
   fi
@@ -354,6 +369,10 @@ printf '%s\n' \
   "FRAME_CREDIT_RESERVE_FRAMES=${FRAME_CREDIT_RESERVE_FRAMES}" \
   "FRAME_CREDIT_GUARD_MS=${FRAME_CREDIT_GUARD_MS}" \
   "MOTIVATION_POLICY=${MOTIVATION_POLICY}" \
+  "LIVEKIT_PORT=${LIVEKIT_PORT}" \
+  "LIVEKIT_RTC_TCP_PORT=${LIVEKIT_RTC_TCP_PORT}" \
+  "LIVEKIT_RTC_PORT_RANGE=${LIVEKIT_RTC_PORT_START}-${LIVEKIT_RTC_PORT_END}" \
+  "SERVER_PORT=${SERVER_PORT}" \
   "PROFILE_PATH=${PROFILE_PATH}" \
   "SCENARIO_PATH=${SCENARIO_PATH}" \
   "WORKLOADS=${WORKLOADS[*]}" \
@@ -514,7 +533,7 @@ wait_for_port() {
 wait_for_ready() {
   local run_dir="$1"
   for _ in $(seq 1 300); do
-    if curl --noproxy '*' -fsS "http://127.0.0.1:8088/v1/service/ready" >"${run_dir}/ready.json"; then
+    if curl --noproxy '*' -fsS "http://127.0.0.1:${SERVER_PORT}/v1/service/ready" >"${run_dir}/ready.json"; then
       [[ -s "${run_dir}/ready.json" ]] && return 0
     fi
     kill -0 "${SERVER_PID}" 2>/dev/null \
@@ -547,10 +566,12 @@ for workload in "${WORKLOADS[@]}"; do
     "METRICS_DURATION_SECONDS=${METRICS_DURATION}" \
     >"${RUN_DIR}/run-config.env"
 
-  "${LIVEKIT_BIN}" --dev >"${RUN_DIR}/livekit.log" 2>&1 &
+  LIVEKIT_CONFIG_BODY="$(printf 'port: %s\nrtc:\n  tcp_port: %s\n  port_range_start: %s\n  port_range_end: %s\nkeys:\n  devkey: secret\n' \
+    "${LIVEKIT_PORT}" "${LIVEKIT_RTC_TCP_PORT}" "${LIVEKIT_RTC_PORT_START}" "${LIVEKIT_RTC_PORT_END}")"
+  "${LIVEKIT_BIN}" --dev --config-body "${LIVEKIT_CONFIG_BODY}" >"${RUN_DIR}/livekit.log" 2>&1 &
   LIVEKIT_PID=$!
   printf '%s\n' "${LIVEKIT_PID}" >"${RUN_DIR}/livekit.pid"
-  wait_for_port 7880 "${LIVEKIT_PID}" "LiveKit" 60
+  wait_for_port "${LIVEKIT_PORT}" "${LIVEKIT_PID}" "LiveKit" 60
 
   # Start the server in a dedicated session so timeout/failure cleanup also
   # terminates all process-NCCL worker children.
@@ -575,8 +596,8 @@ for workload in "${WORKLOADS[@]}"; do
   "${PYTHON_BIN}" -m telefuser.entrypoints.cli.main stream-serve \
     examples/abot_world/abot_world_livekit_service.py \
     --host 127.0.0.1 \
-    --port 8088 \
-    --livekit-url ws://127.0.0.1:7880 \
+    --port "${SERVER_PORT}" \
+    --livekit-url "ws://127.0.0.1:${LIVEKIT_PORT}" \
     --livekit-api-key devkey \
     --livekit-api-secret secret \
     --num-workers "${NUM_WORKERS}" \
@@ -598,13 +619,13 @@ for workload in "${WORKLOADS[@]}"; do
   # a cold start. Keep this separate from the short LiveKit startup timeout;
   # otherwise the runner kills a healthy server before /v1/service/ready can
   # be reached.
-  wait_for_port 8088 "${SERVER_PID}" "TeleFuser" "${STARTUP_TIMEOUT_SECONDS}"
+  wait_for_port "${SERVER_PORT}" "${SERVER_PID}" "TeleFuser" "${STARTUP_TIMEOUT_SECONDS}"
   wait_for_ready "${RUN_DIR}"
-  curl --noproxy '*' -fsS "http://127.0.0.1:8088/v1/service/metadata" \
+  curl --noproxy '*' -fsS "http://127.0.0.1:${SERVER_PORT}/v1/service/metadata" \
     >"${RUN_DIR}/metadata-before.json"
 
   PYTHONPATH="${REPO_ROOT}" "${PYTHON_BIN}" tools/validation/capture_abot_serving_metrics.py \
-    --server-url http://127.0.0.1:8088 \
+    --server-url "http://127.0.0.1:${SERVER_PORT}" \
     --duration "${METRICS_DURATION}" \
     --interval 1 \
     --output-dir "${RUN_DIR}/serving_metrics" \
@@ -621,13 +642,14 @@ for workload in "${WORKLOADS[@]}"; do
 
   PYTHONPATH="${REPO_ROOT}" "${PYTHON_BIN}" \
     tools/validation/replay_abot_livekit_action_trace.py \
+    --server-url "http://127.0.0.1:${SERVER_PORT}" \
     --trace "${TRACE_PATH}" \
     --scenario "${RUN_SCENARIO_PATH}" \
     --output "${RUN_DIR}/result.json" \
     --drain-seconds 10 \
     2>&1 | tee "${RUN_DIR}/replay.log"
 
-  curl --noproxy '*' -fsS "http://127.0.0.1:8088/v1/service/metadata" \
+  curl --noproxy '*' -fsS "http://127.0.0.1:${SERVER_PORT}/v1/service/metadata" \
     >"${RUN_DIR}/metadata-after.json"
   # Join the client playout ledger with the server dispatch fidelity trace.
   # This only augments the result artifact; it does not participate in

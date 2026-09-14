@@ -292,6 +292,13 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         self._migration_transfer_complete_ms: list[float] = []
         self._migration_drain_ms: list[float] = []
         self._migration_background_cleanup_ms: list[float] = []
+        # Source cleanup is no longer part of the caller-visible migration
+        # critical path.  Keep task handles per session so shutdown and a
+        # later close can still await the old source teardown explicitly.
+        self._migration_cleanup_tasks: dict[str, set[asyncio.Task[None]]] = {}
+        self._migration_activity_counts: dict[str, int] = {}
+        self._migration_gate_locks: dict[str, asyncio.Lock] = {}
+        self._migration_gate_deferred: set[str] = set()
         self._migration_deferred_publisher_frames = 0
         self._migration_cleanup_failures = 0
         self._migration_diagnostics = MigrationDiagnostics()
@@ -403,12 +410,21 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         """Block communicator rebuild until every active migration exits."""
 
         condition = self._migration_topology_condition
-        async with condition:
-            while self._migration_topology_scaling:
-                await condition.wait()
-            self._migration_topology_scaling = True
-            while self._migration_topology_readers:
-                await condition.wait()
+        # A migration schedules source cleanup immediately after ownership
+        # commit and releases its reader only when that task is registered.
+        # Wait for both the reader and the cleanup task before raising the
+        # scaling flag; otherwise a cleanup task could be left waiting on the
+        # shared topology while the communicator is being rebuilt.
+        while True:
+            async with condition:
+                while self._migration_topology_scaling or self._migration_topology_readers:
+                    await condition.wait()
+            await self._wait_for_migration_cleanup()
+            async with condition:
+                if self._migration_topology_scaling or self._migration_topology_readers:
+                    continue
+                self._migration_topology_scaling = True
+                break
         try:
             yield
         finally:
@@ -481,6 +497,7 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         if task is not None:
             with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError):
                 await asyncio.wait_for(asyncio.shield(task), timeout=15.0)
+        await self._wait_for_migration_cleanup(session_id)
 
     def create_model_session(self, worker_id: str, session_id: str, config: dict) -> None:
         if session_id in self._model_session_ready:
@@ -880,6 +897,112 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                 )
             return value
 
+    def _retain_migration_activity(self, session_id: str) -> None:
+        """Keep close_model_session deferred while any migration owns the route."""
+
+        self._migration_activity_counts[session_id] = self._migration_activity_counts.get(session_id, 0) + 1
+        self._active_migrations.add(session_id)
+
+    def _release_migration_activity(self, session_id: str) -> None:
+        """Release the migration hold and finish any deferred route close."""
+
+        remaining = self._migration_activity_counts.get(session_id, 0) - 1
+        if remaining > 0:
+            self._migration_activity_counts[session_id] = remaining
+            return
+        self._migration_activity_counts.pop(session_id, None)
+        self._active_migrations.discard(session_id)
+        if session_id in self._deferred_model_closes:
+            self._deferred_model_closes.discard(session_id)
+            with contextlib.suppress(Exception):
+                self._close_model_session_now(session_id)
+
+    async def _finish_source_cleanup_in_background(
+        self,
+        pipeline_session_id: str,
+        source_worker_id: str,
+        transfer_id: str,
+    ) -> None:
+        """Release the old source route after ownership has already committed.
+
+        Source cleanup cannot change the committed owner.  Keeping it in a
+        background task removes one parent-child IPC round trip from the
+        scheduler's migration critical path while retaining an explicit
+        topology lease and the same phase diagnostics.  The activity hold is
+        released only after this task finishes, so a departing session cannot
+        close model state underneath the cleanup command.
+        """
+
+        started = time.monotonic()
+        try:
+            async with self._shared_migration_topology():
+                await self._run_migration_phase(
+                    transfer_id,
+                    "commit_source",
+                    lambda: self._request(
+                        source_worker_id,
+                        "nccl_commit_source",
+                        session_id=pipeline_session_id,
+                        timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
+                    ),
+                )
+        except asyncio.CancelledError:
+            # Shutdown cancellation is expected after ownership is committed;
+            # do not turn it into a migration failure or an unhandled task.
+            logger.info(
+                "NCCL source cleanup cancelled after committed migration: session=%s source=%s",
+                pipeline_session_id,
+                source_worker_id,
+            )
+        except Exception as exc:
+            self._migration_cleanup_failures += 1
+            logger.warning(
+                "NCCL source cleanup failed after committed migration: "
+                "session=%s source=%s error=%s",
+                pipeline_session_id,
+                source_worker_id,
+                exc,
+            )
+        finally:
+            self._migration_background_cleanup_ms.append((time.monotonic() - started) * 1000.0)
+            current = asyncio.current_task()
+            tasks = self._migration_cleanup_tasks.get(pipeline_session_id)
+            if tasks is not None and current is not None:
+                tasks.discard(current)
+                if not tasks:
+                    self._migration_cleanup_tasks.pop(pipeline_session_id, None)
+            if pipeline_session_id in self._migration_gate_deferred:
+                self._migration_gate_deferred.discard(pipeline_session_id)
+                gate = self._migration_gate_locks.get(pipeline_session_id)
+                if gate is not None and gate.locked():
+                    gate.release()
+            self._release_migration_activity(pipeline_session_id)
+
+    async def _wait_for_migration_cleanup(self, session_id: str | None = None) -> None:
+        """Await background source cleanup before close or communicator rebuild."""
+
+        if session_id is None:
+            tasks = [task for group in self._migration_cleanup_tasks.values() for task in tuple(group)]
+        else:
+            tasks = list(self._migration_cleanup_tasks.get(session_id, ()))
+        if tasks:
+            await asyncio.gather(*(asyncio.shield(task) for task in tasks), return_exceptions=True)
+
+    @contextlib.asynccontextmanager
+    async def _migration_gate(self, session_id: str) -> AsyncIterator[None]:
+        """Serialize a session's next migration with its old-source cleanup."""
+
+        gate = self._migration_gate_locks.setdefault(session_id, asyncio.Lock())
+        await gate.acquire()
+        try:
+            yield
+        finally:
+            # A successful migration transfers release ownership to its
+            # background source-cleanup task. Failed/cancelled migrations and
+            # no-op same-owner calls release the gate here.
+            if session_id not in self._migration_gate_deferred and gate.locked():
+                gate.release()
+
     async def migrate_session(
         self,
         pipeline_session_id: str,
@@ -891,7 +1014,7 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
             pipeline_session_id,
             asyncio.Lock(),
         )
-        async with migration_session_lock, self._shared_migration_topology():
+        async with self._migration_gate(pipeline_session_id), migration_session_lock, self._shared_migration_topology():
             source_worker_id = self._pipeline_routes[pipeline_session_id]
             if source_worker_id == target_worker_id:
                 return self._ownership.owner(pipeline_session_id)
@@ -925,10 +1048,11 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                 f"NCCL migration started: transfer={token.token_id} "
                 f"source={source_worker_id} target={target_worker_id}"
             )
-            self._active_migrations.add(pipeline_session_id)
+            self._retain_migration_activity(pipeline_session_id)
             self._migrating_controls[pipeline_session_id] = []
             started = time.monotonic()
             completed = False
+            background_cleanup_scheduled = False
 
             async def rollback_migration() -> None:
                 """Best-effort cleanup for cancellation or transport failure."""
@@ -1138,26 +1262,6 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                 # to roll back to state that may already have been deleted.
                 completed = True
                 self._provisional_migration_controls.pop(pipeline_session_id, None)
-                cleanup_started = time.monotonic()
-                try:
-                    await self._run_migration_phase(
-                        token.token_id,
-                        "commit_source",
-                        lambda: self._request(
-                            source_worker_id,
-                            "nccl_commit_source",
-                            session_id=pipeline_session_id,
-                            timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
-                        ),
-                    )
-                except Exception as exc:
-                    self._migration_cleanup_failures += 1
-                    logger.warning(
-                        f"NCCL source cleanup failed after committed migration: "
-                        f"session={pipeline_session_id} source={source_worker_id} error={exc}"
-                    )
-                finally:
-                    self._migration_background_cleanup_ms.append((time.monotonic() - cleanup_started) * 1000.0)
                 staged_events = self._provisional_model_events.pop(pipeline_session_id, [])
                 for event in staged_events:
                     self._dispatch_event(event)
@@ -1165,9 +1269,21 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                 self._migration_total_ms.append(total_ms)
                 if isinstance(diagnostics, MigrationDiagnostics):
                     diagnostics.finish(token.token_id, outcome="success")
+                cleanup_task = asyncio.create_task(
+                    self._finish_source_cleanup_in_background(
+                        pipeline_session_id,
+                        source_worker_id,
+                        token.token_id,
+                    ),
+                    name=f"sst-source-cleanup-{token.token_id}",
+                )
+                self._migration_cleanup_tasks.setdefault(pipeline_session_id, set()).add(cleanup_task)
+                self._migration_gate_deferred.add(pipeline_session_id)
+                background_cleanup_scheduled = True
                 logger.info(
                     f"NCCL migration completed: transfer={token.token_id} "
-                    f"source={source_worker_id} target={target_worker_id} duration_ms={total_ms:.3f}"
+                    f"source={source_worker_id} target={target_worker_id} "
+                    f"duration_ms={total_ms:.3f} source_cleanup=background"
                 )
                 return ownership
             except asyncio.CancelledError:
@@ -1194,11 +1310,8 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                 # without allowing a stale active transfer in the snapshot.
                 if not completed and isinstance(diagnostics, MigrationDiagnostics):
                     diagnostics.finish(token.token_id, outcome="aborted", error="migration interrupted")
-                self._active_migrations.discard(pipeline_session_id)
-                if pipeline_session_id in self._deferred_model_closes:
-                    self._deferred_model_closes.discard(pipeline_session_id)
-                    with contextlib.suppress(Exception):
-                        self._close_model_session_now(pipeline_session_id)
+                if not background_cleanup_scheduled:
+                    self._release_migration_activity(pipeline_session_id)
 
     def turboserve_snapshot(self) -> dict[str, object]:
         snapshot = super().turboserve_snapshot()
@@ -1221,8 +1334,9 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                 "session_runtime_metrics": dict(self._session_runtime_metrics),
                 "migration_calibration": {
                     # ``average_total_ms`` is retained for diagnostics only;
-                    # placement uses route readiness below and never learns
-                    # the residual transfer/source-cleanup tail as blocking.
+                    # it ends at ownership commit. Placement uses route
+                    # readiness below and never learns the residual transfer
+                    # or background source-cleanup tail as blocking.
                     "average_total_ms": sum(migration_total_ms) / len(migration_total_ms)
                     if migration_total_ms
                     else 0.0,
@@ -1255,6 +1369,9 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                     ),
                     "deferred_publisher_frames": int(
                         getattr(self, "_migration_deferred_publisher_frames", 0)
+                    ),
+                    "background_cleanup_pending": sum(
+                        len(tasks) for tasks in getattr(self, "_migration_cleanup_tasks", {}).values()
                     ),
                 },
                 "migration_diagnostics": (
@@ -1290,6 +1407,11 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         for session_id in tuple(self._transport_workers):
             with contextlib.suppress(Exception):
                 await self.stop_session(session_id)
+        # A model route can outlive its transport task briefly after a
+        # committed migration.  Drain those source-cleanup tasks before
+        # destroying the NCCL communicator; otherwise the cleanup command
+        # would be cancelled while its peer channel is being torn down.
+        await self._wait_for_migration_cleanup()
         if self._nccl_ranks:
             await asyncio.gather(
                 *(self._request(worker_id, "nccl_destroy") for worker_id in self._nccl_ranks),
@@ -1805,22 +1927,45 @@ async def _run_nccl_model_worker(
                     "progress": progress.snapshot(),
                 }
             )
+            # Continuation chunks can run DiT as soon as the first cache layer
+            # arrives; the pipeline fences later layers through
+            # ``LayerTransferProgress`` and overlaps residual copy with
+            # useful compute. A session that has not emitted its first chunk
+            # still needs the complete initial cache, so retain the old safe
+            # boundary for that case.
+            pump_started = False
+            if int(metadata.get("next_latent_frame", 0)) > 0:
+                try:
+                    publisher_tracking_enabled = bool(adapter.enable_publisher_frame_tracking(session_id))
+                except Exception:
+                    publisher_tracking_enabled = False
+                events.put(
+                    {
+                        "type": "model_publisher_frame_tracking",
+                        "worker_id": spec.worker_id,
+                        "session_id": session_id,
+                        "enabled": publisher_tracking_enabled,
+                    }
+                )
+                start_pump(session_id, credit_window=credit_window)
+                pump_started = True
             report = await transfer_task
             progress.mark_complete()
             report["progress"] = progress.snapshot()
-            try:
-                publisher_tracking_enabled = bool(adapter.enable_publisher_frame_tracking(session_id))
-            except Exception:
-                publisher_tracking_enabled = False
-            events.put(
-                {
-                    "type": "model_publisher_frame_tracking",
-                    "worker_id": spec.worker_id,
-                    "session_id": session_id,
-                    "enabled": publisher_tracking_enabled,
-                }
-            )
-            start_pump(session_id, credit_window=credit_window)
+            if not pump_started:
+                try:
+                    publisher_tracking_enabled = bool(adapter.enable_publisher_frame_tracking(session_id))
+                except Exception:
+                    publisher_tracking_enabled = False
+                events.put(
+                    {
+                        "type": "model_publisher_frame_tracking",
+                        "worker_id": spec.worker_id,
+                        "session_id": session_id,
+                        "enabled": publisher_tracking_enabled,
+                    }
+                )
+                start_pump(session_id, credit_window=credit_window)
             await result(request_id, report)
         except Exception as exc:
             if progress is not None:

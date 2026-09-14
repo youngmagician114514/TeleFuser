@@ -828,13 +828,20 @@ class MotivationExecutionBridge:
             pending_migrations = self.controller.pending_migration_sessions()
             search_at = max(observed_at, scheduler.current_time)
             blocked_migrations = self.controller.blocked_migration_sessions(now=search_at)
-            candidate = scheduler.find_best(
-                now=search_at,
-                include_wait=False,
-                allow_migrations=True,
-                exclude_session_ids=pending_migrations,
-                blocked_migration_session_ids=blocked_migrations,
-            )
+            if self.controller.scheduler.policy_name == "motivation":
+                candidate = self.controller.find_compute_candidate(
+                    now=search_at,
+                    include_wait=False,
+                    exclude_session_ids=pending_migrations,
+                )
+            else:
+                candidate = scheduler.find_best(
+                    now=search_at,
+                    include_wait=False,
+                    allow_migrations=True,
+                    exclude_session_ids=pending_migrations,
+                    blocked_migration_session_ids=blocked_migrations,
+                )
         except (AttributeError, KeyError, ValueError):
             # A transient state/version race is handled by the controller's
             # regular search path; never let the optional gate block service.

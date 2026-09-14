@@ -94,6 +94,13 @@ class LiveKitServeConfig(BaseSettings):
         ge=0,
         description="Minimum residence time after a Motivation-owned session migration",
     )
+    slackserve_include_idle_jobs: bool = Field(
+        default=False,
+        description=(
+            "Generate ABot idle-continuation jobs in the SlackServe controlled variant; "
+            "the paper-faithful SlackServe baseline remains action-only by default"
+        ),
+    )
     control_idle_timeout: float = Field(
         default=10.0,
         gt=0,

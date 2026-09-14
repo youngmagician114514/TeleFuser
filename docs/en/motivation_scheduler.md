@@ -111,15 +111,21 @@ same production execution path:
   `C = P - (R + T)`, with the paper's urgent/normal/relaxed `2T` and `4T`
   thresholds;
 - BMPR computes the measured B1 latency/quality Pareto frontier, uses the
-  median profile quality as its floor, selects the highest-quality point that
-  fits current playout slack, and falls back to the fastest point above the
-  floor in recovery mode;
+  production floor ``Q=0.895`` (``None`` restores the median-profile floor),
+  selects the highest-quality point that fits current playout slack, and falls
+  back to the fastest point above the floor in recovery mode;
 - an urgent queued stream can be re-homed only to an empty or relaxed-only
   worker, only when the measured migration route-ready delay still gives an
   earlier predicted finish, with the paper's 60-second residence cooldown;
 - only explicit trace action/chunk Jobs are eligible.  The paper's stream
   chunk is represented directly by one B1 Job; the shared coordinator's
   Motivation-only idle sentinel is not synthesized for this baseline.
+
+For the controlled ``SlackServe+idle`` comparison, set
+``TELEFUSER_LIVEKIT_SLACKSERVE_INCLUDE_IDLE_JOBS=1``.  This changes only job
+eligibility: service-credit ordering, BMPR, re-homing, and singleton B1
+execution remain SlackServe's implementation.  The default remains the
+paper-facing action-only policy.
 
 The local `slack_serve_sim` tree is a CPU timing simulator, not the paper's
 official GPU code. The ABot runtime also has no primitive for executing one

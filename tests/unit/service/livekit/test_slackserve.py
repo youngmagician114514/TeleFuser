@@ -35,6 +35,7 @@ def _scheduler(
     migration_enabled: bool = True,
     source_free_at: float = 0.0,
     capacity_per_worker: int = 8,
+    include_idle_jobs: bool = False,
 ) -> MotivationScheduler:
     scheduler = MotivationScheduler(
         _profiles(),
@@ -46,6 +47,7 @@ def _scheduler(
             include_idle_jobs=True,
             migration_enabled=migration_enabled,
             slackserve_capacity_per_worker=capacity_per_worker,
+            slackserve_include_idle_jobs=include_idle_jobs,
         ),
         migration_estimator=LocalMigrationEstimator(first_layer_ready_seconds=0.05),
     )
@@ -101,6 +103,20 @@ def test_slackserve_is_a_singleton_action_only_policy() -> None:
     assert candidate.batch_size == 1
     assert candidate.job_ids == (action.job_id,)
     assert candidate.fidelity == "b1_high"
+
+
+def test_slackserve_idle_variant_reuses_singleton_credit_policy() -> None:
+    scheduler = _scheduler(migration_enabled=False, include_idle_jobs=True)
+    scheduler.register_session("stream", owner_gpu="gpu-0", now=0.0)
+    idle = scheduler.create_idle_job("stream", now=0.0)
+
+    candidate = scheduler.find_best(now=0.0, include_wait=False)
+
+    assert scheduler.config.include_idle_jobs is True
+    assert idle is not None and candidate is not None
+    assert candidate.policy_name == "slackserve"
+    assert candidate.batch_size == 1
+    assert candidate.job_ids == (idle.job_id,)
 
 
 def test_slackserve_credit_beats_fifo_age_and_bmpr_enters_recovery() -> None:

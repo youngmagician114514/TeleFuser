@@ -61,6 +61,21 @@ EPSILON = 1e-9
 JobKind = Literal["action", "idle"]
 
 
+def _load_spread(loads: Mapping[str, float]) -> float:
+    """Return the max-minus-min projected load across available GPUs.
+
+    Motivation's search already has a per-GPU completion timeline.  Combining
+    that timeline with resident-session occupancy gives the policy a cheap,
+    scheduler-visible load signal without coupling it to worker internals.
+    The spread is deliberately used as a soft objective: slack, quality, and
+    batching still decide when their advantage is material.
+    """
+    if len(loads) <= 1:
+        return 0.0
+    values = tuple(float(value) for value in loads.values())
+    return max(values) - min(values)
+
+
 @dataclass(frozen=True)
 class MotivationProfile:
     """Measured execution point for one batch size and fidelity.
@@ -708,6 +723,11 @@ class MotivationSchedulerConfig:
     fairness_delta: float = 0.05
     lambda_quality: float = 2.0
     lambda_migration: float = 0.05
+    # Softly reward candidates that reduce the projected spread between GPU
+    # timelines and resident-session occupancy.  This is Motivation-only;
+    # baseline policies normalize their own objectives in ``__init__``.
+    lambda_load_balance: float = 0.5
+    load_balance_capacity_per_worker: int = 8
     initial_slack_seconds: float = 1.0
     initial_quality: float | None = None
     include_idle_jobs: bool = True
@@ -729,9 +749,13 @@ class MotivationSchedulerConfig:
     turboserve_fidelity_family: str = "s4_w18_rho0_bf16"
     # SlackServe is a B1 stream scheduler. BMPR chooses among the measured B1
     # Pareto points, while service credit and re-homing follow the paper's
-    # 2T/4T tiers. ``None`` derives the global quality floor as the median of
-    # the available B1 profile qualities.
-    slackserve_quality_floor: float | None = None
+    # 2T/4T tiers.  The production baseline uses an explicit, mildly relaxed
+    # floor so the fastest useful B1 point (currently ~Q=0.895) is eligible;
+    # callers can set ``None`` to recover the paper-style median floor.
+    slackserve_quality_floor: float | None = 0.895
+    # Keep the paper-facing policy action-only by default, while allowing a
+    # controlled SlackServe+idle baseline to reuse the same credit/BMPR path.
+    slackserve_include_idle_jobs: bool = False
     slackserve_initial_slack_multiplier: float = 4.0
     slackserve_urgent_multiplier: float = 2.0
     slackserve_relaxed_multiplier: float = 4.0
@@ -750,12 +774,19 @@ class MotivationSchedulerConfig:
             "fairness_delta",
             "lambda_quality",
             "lambda_migration",
+            "lambda_load_balance",
         ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and non-negative")
         if self.utility_cap_seconds <= 0 or self.initial_slack_seconds <= 0:
             raise ValueError("utility_cap_seconds and initial_slack_seconds must be positive")
+        if (
+            not isinstance(self.load_balance_capacity_per_worker, int)
+            or isinstance(self.load_balance_capacity_per_worker, bool)
+            or self.load_balance_capacity_per_worker < 1
+        ):
+            raise ValueError("load_balance_capacity_per_worker must be a positive integer")
         if not 0 < self.quality_ema <= 1:
             raise ValueError("quality_ema must be in (0, 1]")
         if self.initial_quality is not None and (
@@ -812,6 +843,8 @@ class MotivationSchedulerConfig:
             )
         if not isinstance(self.slackserve_rehoming_enabled, bool):
             raise ValueError("slackserve_rehoming_enabled must be a bool")
+        if not isinstance(self.slackserve_include_idle_jobs, bool):
+            raise ValueError("slackserve_include_idle_jobs must be a bool")
         if (
             not isinstance(self.slackserve_capacity_per_worker, int)
             or isinstance(self.slackserve_capacity_per_worker, bool)
@@ -861,6 +894,25 @@ class DispatchCandidate:
     @property
     def action_count(self) -> int:
         return sum(1 for job_id in self.job_ids if ":idle" not in job_id)
+
+
+@dataclass(frozen=True)
+class PlacementDecision:
+    """A cheap re-homing decision kept separate from compute selection.
+
+    Placement deliberately carries no batch size or fidelity.  The runtime
+    turns it into a migration-only ``DispatchCandidate`` and then lets the
+    local compute policy choose ``(B, quality)`` after ownership commits.
+    """
+
+    session_id: str
+    source_gpu: str
+    target_gpu: str
+    estimated_ready_at: float
+    migration_seconds: float
+    snapshot_epoch: int
+    session_version: int
+    target_gpu_version: int
 
 
 @dataclass(frozen=True)
@@ -934,12 +986,13 @@ class MotivationScheduler:
             # SlackServe schedules one sequential chunk per stream.  Its
             # BMPR and service-credit logic is policy-local; it does not use
             # Motivation's batch, utility, quality-EMA, or fairness objective.
-            # Idle sentinels are a Motivation-only extension.  SlackServe
-            # consumes only the requested trace action/chunk Jobs.
+            # Idle sentinels are disabled for the paper-facing baseline.  An
+            # explicit controlled variant may enable them without entering
+            # Motivation's search or changing SlackServe's B1 execution path.
             self.config = replace(
                 requested_config,
                 max_batch_size=1,
-                include_idle_jobs=False,
+                include_idle_jobs=requested_config.slackserve_include_idle_jobs,
                 lambda_quality=0.0,
                 fairness_delta=0.0,
             )
@@ -2314,6 +2367,224 @@ class MotivationScheduler:
         )
         return self._policy.select(self, request)
 
+    def plan_rehoming(
+        self,
+        *,
+        now: float | None = None,
+        blocked_session_ids: Iterable[str] = (),
+    ) -> PlacementDecision | None:
+        """Return one deadline-improving re-homing move for Motivation.
+
+        Placement is deliberately separate from compute selection: this phase
+        only decides *which GPU owns a session*.  It must not act as a generic
+        load balancer, because a short-lived ``free_at`` imbalance is not a
+        user-visible reason to move model state.  A move is therefore admitted
+        only for a ready next job whose local finish would consume its current
+        playout slack, and only when the target's predicted finish is earlier.
+
+        The B1 latency used here is a placement-time estimate, not a runtime
+        profile choice.  The following local phase still chooses the actual
+        batch size and fidelity for the target GPU.
+        """
+        if self.policy_name != "motivation" or not self.config.migration_enabled:
+            return None
+        observed_at = self._clock() if now is None else now
+        blocked = {str(value) for value in blocked_session_ids}
+        with self._lock:
+            observed_at = self._advance_to(observed_at)
+            gpus = tuple(gpu for gpu in self._gpus.values() if gpu.available)
+            if len(gpus) < 2:
+                return None
+            gpu_by_id = {gpu.gpu_id: gpu for gpu in gpus}
+            capacity = max(1, self.config.load_balance_capacity_per_worker)
+            resident_counts = {
+                gpu.gpu_id: sum(
+                    1
+                    for state in self._sessions.values()
+                    if not state.departed
+                    and state.migration_target_gpu is None
+                    and state.owner_gpu == gpu.gpu_id
+                )
+                for gpu in gpus
+            }
+            # A migration marks its source session with the target GPU before
+            # the asynchronous transfer commits.  Reserve that target slot in
+            # the placement snapshot as well; otherwise several scheduling
+            # callbacks can independently observe the same free slot and send
+            # more than ``capacity`` sessions to one worker.
+            pending_target_counts = {
+                gpu.gpu_id: sum(
+                    1
+                    for state in self._sessions.values()
+                    if not state.departed
+                    and state.migration_target_gpu == gpu.gpu_id
+                )
+                for gpu in gpus
+            }
+
+            # Placement needs only a neutral service-time estimate.  Do not
+            # choose a quality point or a batch here; the local compute phase
+            # owns that decision after the session has an owner.
+            profile_cache: dict[str, MotivationProfile | None] = {}
+
+            def placement_profile(gpu_id: str) -> MotivationProfile | None:
+                if gpu_id not in profile_cache:
+                    rows = tuple(
+                        self.profile_provider.profiles_for(batch_size=1, gpu_id=gpu_id)
+                    )
+                    profile_cache[gpu_id] = (
+                        min(rows, key=lambda row: (row.latency_seconds, row.fidelity))
+                        if rows
+                        else None
+                    )
+                return profile_cache[gpu_id]
+
+            # Evaluate the next concrete job on its current owner.  A session
+            # with no ready work is not a placement candidate: there is no
+            # deadline that migration could improve.
+            options: list[
+                tuple[
+                    tuple[float, float, int, str, str],
+                    SessionSchedulingState,
+                    GpuSchedulingState,
+                    GpuSchedulingState,
+                    MigrationEstimate,
+                ]
+            ] = []
+            for state in self._sessions.values():
+                if (
+                    state.departed
+                    or state.in_flight is not None
+                    or state.migration_target_gpu is not None
+                    or state.session_id in blocked
+                    or not state.playback_active
+                ):
+                    continue
+                job = state.ready_job(include_idle=self.config.include_idle_jobs)
+                if job is None:
+                    continue
+                source = gpu_by_id.get(state.owner_gpu)
+                if source is None:
+                    continue
+                source_profile = placement_profile(source.gpu_id)
+                if source_profile is None:
+                    continue
+                source_finish = max(observed_at, source.free_at) + source_profile.latency_seconds
+                deadline = observed_at + max(0.0, state.slack_seconds)
+                if source_finish <= deadline + EPSILON:
+                    continue
+
+                for target in gpus:
+                    if target.gpu_id == source.gpu_id:
+                        continue
+                    if (
+                        resident_counts[target.gpu_id]
+                        + pending_target_counts[target.gpu_id]
+                        >= capacity
+                    ):
+                        continue
+                    target_profile = placement_profile(target.gpu_id)
+                    if target_profile is None:
+                        continue
+                    estimate = self.migration_estimator.estimate(
+                        state,
+                        target_gpu=target.gpu_id,
+                        now=observed_at,
+                    )
+                    if not estimate.required:
+                        continue
+                    target_finish = (
+                        max(observed_at, target.free_at, estimate.ready_at)
+                        + target_profile.latency_seconds
+                    )
+                    # This is the only rehoming gain test: moving must make
+                    # this session's next job finish strictly earlier.  A
+                    # lower aggregate GPU load by itself is not sufficient.
+                    if target_finish >= source_finish - EPSILON:
+                        continue
+                    options.append(
+                        (
+                            (
+                                target_finish,
+                                source_finish,
+                                job.sequence,
+                                state.session_id,
+                                target.gpu_id,
+                            ),
+                            state,
+                            source,
+                            target,
+                            estimate,
+                        )
+                    )
+
+            if not options:
+                return None
+            _, moved, source, target, estimate = min(options, key=lambda item: item[0])
+            return PlacementDecision(
+                session_id=moved.session_id,
+                source_gpu=source.gpu_id,
+                target_gpu=target.gpu_id,
+                estimated_ready_at=estimate.ready_at,
+                migration_seconds=estimate.cost_seconds,
+                snapshot_epoch=self._epoch,
+                session_version=moved.state_version,
+                target_gpu_version=target.version,
+            )
+
+    def placement_candidate(self, decision: PlacementDecision) -> DispatchCandidate:
+        """Convert a placement decision to the shared migration path."""
+        return DispatchCandidate(
+            session_ids=(decision.session_id,),
+            job_ids=(),
+            gpu_id=decision.target_gpu,
+            fidelity=None,
+            profile=None,
+            start_at=decision.estimated_ready_at,
+            finish_at=decision.estimated_ready_at,
+            migration_count=1,
+            migration_seconds=decision.migration_seconds,
+            score=0.0,
+            projected_slack={},
+            projected_quality={},
+            snapshot_epoch=decision.snapshot_epoch,
+            session_versions={decision.session_id: decision.session_version},
+            gpu_version=decision.target_gpu_version,
+            policy_name="motivation-placement",
+        )
+
+    def find_best_local(
+        self,
+        gpu_id: str,
+        *,
+        now: float | None = None,
+        include_wait: bool = False,
+        exclude_session_ids: Iterable[str] = (),
+    ) -> DispatchCandidate | None:
+        """Select the best Motivation compute candidate on one GPU only."""
+        with self._lock:
+            gpu = self._gpus.get(gpu_id)
+            if gpu is None:
+                raise KeyError(f"unknown GPU {gpu_id!r}")
+            eligible = {
+                state.session_id
+                for state in self._sessions.values()
+                if not state.departed
+                and state.owner_gpu == gpu_id
+                and state.migration_target_gpu is None
+            }
+        eligible.difference_update(str(value) for value in exclude_session_ids)
+        if not eligible:
+            return None
+        return self._find_best_motivation(
+            now=now,
+            gpu_states=(gpu,),
+            include_wait=include_wait,
+            allow_migrations=False,
+            eligible_session_ids=eligible,
+            policy_name="motivation-local",
+        )
+
     def _find_best_motivation(
         self,
         *,
@@ -2324,6 +2595,7 @@ class MotivationScheduler:
         allow_migrations: bool = True,
         exclude_session_ids: Iterable[str] = (),
         blocked_migration_session_ids: Iterable[str] = (),
+        eligible_session_ids: Iterable[str] | None = None,
         policy_name: str = "motivation",
     ) -> DispatchCandidate | None:
         """Enumerate and score all feasible candidates in a global snapshot.
@@ -2337,6 +2609,7 @@ class MotivationScheduler:
         observed_at = self._clock() if now is None else now
         excluded = set(exclude_session_ids)
         blocked_migrations = set(blocked_migration_session_ids)
+        eligible = None if eligible_session_ids is None else {str(value) for value in eligible_session_ids}
 
         # Advance and copy the policy state while holding the lock, then do the
         # expensive Cartesian-product search without it.  Event callbacks can
@@ -2352,11 +2625,38 @@ class MotivationScheduler:
                 (snapshot_by_id[state.session_id], job)
                 for state, job in self._ready_jobs()
             )
-            ready = tuple(item for item in all_ready if item[0].session_id not in excluded)
+            ready = tuple(
+                item
+                for item in all_ready
+                if item[0].session_id not in excluded
+                and (eligible is None or item[0].session_id in eligible)
+            )
             gpus = tuple(gpu_states) if gpu_states is not None else tuple(self._gpus.values())
             snapshot_epoch = self._epoch
 
         active_states = tuple(state for state in snapshot_states if not state.departed)
+        available_gpus = tuple(gpu for gpu in gpus if gpu.available)
+        # ``free_at`` captures queued compute, while resident-session counts
+        # capture a placement imbalance that is invisible once a worker has
+        # briefly gone idle.  Normalize occupancy by the configured per-worker
+        # capacity so the two scheduler-visible signals have comparable scale.
+        occupancy_capacity = max(1, self.config.load_balance_capacity_per_worker)
+        resident_counts = {
+            gpu.gpu_id: sum(
+                1 for state in active_states if state.owner_gpu == gpu.gpu_id
+            )
+            for gpu in available_gpus
+        }
+        timeline_loads = {
+            gpu.gpu_id: max(0.0, gpu.free_at - observed_at)
+            for gpu in available_gpus
+        }
+        base_loads = {
+            gpu_id: timeline_loads[gpu_id]
+            + resident_counts[gpu_id] / occupancy_capacity
+            for gpu_id in timeline_loads
+        }
+        base_load_spread = _load_spread(base_loads)
         # Keep the hot loop on compact integer indexes.  Constructing state/job
         # tuples and projected dictionaries for every losing candidate was the
         # dominant cost once a trace had 20+ ready sessions.  The original
@@ -2423,6 +2723,7 @@ class MotivationScheduler:
         utility_cap = self.config.utility_cap_seconds
         lambda_quality = self.config.lambda_quality
         lambda_migration = self.config.lambda_migration
+        lambda_load_balance = self.config.lambda_load_balance
         fairness_delta = self.config.fairness_delta
         active_quality_sum = sum(state.quality_ema for state in active_states)
         active_slacks = tuple(state.slack_seconds for state in active_states)
@@ -2449,6 +2750,38 @@ class MotivationScheduler:
                 + (len(playback_slacks) - split) * utility_cap
                 + paused_utility
             )
+
+        def load_balance_reward(
+            *,
+            target_gpu_id: str,
+            selected_indexes: Sequence[int],
+            finish_at: float,
+        ) -> float:
+            """Return the reduction in projected load spread for a candidate."""
+            if len(available_gpus) <= 1:
+                return 0.0
+            projected_counts = dict(resident_counts)
+            for index in selected_indexes:
+                source_gpu_id = ready_states[index].owner_gpu
+                if source_gpu_id == target_gpu_id:
+                    continue
+                if source_gpu_id in projected_counts:
+                    projected_counts[source_gpu_id] = max(
+                        0, projected_counts[source_gpu_id] - 1
+                    )
+                if target_gpu_id in projected_counts:
+                    projected_counts[target_gpu_id] += 1
+            projected_timeline = dict(timeline_loads)
+            projected_timeline[target_gpu_id] = max(
+                projected_timeline.get(target_gpu_id, 0.0),
+                max(0.0, finish_at - observed_at),
+            )
+            projected_loads = {
+                gpu_id: projected_timeline[gpu_id]
+                + projected_counts[gpu_id] / occupancy_capacity
+                for gpu_id in projected_timeline
+            }
+            return base_load_spread - _load_spread(projected_loads)
 
         active_index = {state.session_id: index for index, state in enumerate(active_states)}
         ready_active_index = tuple(active_index[state.session_id] for state in ready_states)
@@ -2549,7 +2882,8 @@ class MotivationScheduler:
                                 profile,
                                 optimistic_baseline
                                 + size * profile.output_seconds
-                                + lambda_quality * best_quality_sum,
+                                + lambda_quality * best_quality_sum
+                                + lambda_load_balance * base_load_spread,
                             )
                         )
                     for indexes in combinations:
@@ -2581,8 +2915,10 @@ class MotivationScheduler:
                             # candidate is already strictly better.  The bound
                             # uses the earliest possible start, grants every
                             # selected member the full output increment, and
-                            # ignores migration/fairness penalties, so pruning
-                            # cannot remove a true winner.  It is especially
+                            # ignores migration/fairness penalties.  The
+                            # maximum possible load-balancing reward is added
+                            # to keep pruning optimistic, so it cannot remove
+                            # a true winner.  It is especially
                             # effective for the 24-session startup burst,
                             # where a fast B1 profile dominates all larger
                             # batches under the initial one-second slack.
@@ -2632,6 +2968,11 @@ class MotivationScheduler:
                             score += lambda_quality * selected_quality_sum
                             # Penalize both transfer count and predicted transfer time.
                             score -= lambda_migration * (migration_count + migration_seconds)
+                            score += lambda_load_balance * load_balance_reward(
+                                target_gpu_id=gpu.gpu_id,
+                                selected_indexes=indexes,
+                                finish_at=finish_at,
+                            )
                             candidate_key = (
                                 score,
                                 action_count,
@@ -2819,7 +3160,12 @@ class MotivationScheduler:
             observed_at = self._advance_to(observed_at)
             if candidate.wait:
                 return candidate.snapshot_epoch == self._epoch
-            if candidate.gpu_id is None or candidate.profile is None:
+            if candidate.gpu_id is None:
+                return False
+            # Placement decisions intentionally have no profile: they only
+            # validate ownership/version and enter the async migration path.
+            # Compute candidates still require a measured profile.
+            if candidate.profile is None and not candidate.migration_count:
                 return False
             # A new ready job can change the globally optimal batch even when
             # none of the candidate's selected sessions changed.
@@ -2828,6 +3174,29 @@ class MotivationScheduler:
             gpu = self._gpus.get(candidate.gpu_id)
             if gpu is None or not gpu.available or gpu.version != candidate.gpu_version:
                 return False
+            if candidate.migration_count:
+                if not candidate.session_ids:
+                    return False
+                for session_id in candidate.session_ids:
+                    state = self._sessions.get(session_id)
+                    expected_version = candidate.session_versions.get(session_id)
+                    if (
+                        state is None
+                        or state.departed
+                        or state.in_flight is not None
+                        or expected_version is None
+                        or state.state_version != expected_version
+                        or state.owner_gpu == candidate.gpu_id
+                        or (
+                            state.migration_target_gpu is not None
+                            and state.migration_target_gpu != candidate.gpu_id
+                        )
+                    ):
+                        return False
+                # A migration-only candidate does not own a compute lease.
+                # Its source/target state is fully checked above.
+                if candidate.profile is None:
+                    return True
             if self.policy_name == "fifo":
                 # A FIFO candidate is always one action on its admitted owner;
                 # reject hand-built/stale candidates that try to smuggle in an

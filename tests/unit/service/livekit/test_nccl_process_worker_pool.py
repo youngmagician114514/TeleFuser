@@ -534,6 +534,7 @@ def test_migration_records_transport_phase_diagnostics(monkeypatch) -> None:
         monkeypatch.setattr(pool, "_request", fake_request)
 
         ownership = await pool.migrate_session("pipeline-1", "worker-1")
+        await pool._wait_for_migration_cleanup()
 
         assert ownership.worker_id == "worker-1"
         diagnostics = pool.turboserve_snapshot()["migration_diagnostics"]
@@ -701,6 +702,7 @@ def test_source_cleanup_failure_preserves_committed_target_owner(monkeypatch) ->
         monkeypatch.setattr(pool, "_request", fake_request)
 
         ownership = await pool.migrate_session("pipeline-1", "worker-1")
+        await pool._wait_for_migration_cleanup()
 
         assert ownership.worker_id == "worker-1"
         assert pool._ownership.owner("pipeline-1").worker_id == "worker-1"
@@ -713,6 +715,91 @@ def test_source_cleanup_failure_preserves_committed_target_owner(monkeypatch) ->
         assert snapshot["migration_diagnostics"]["success_total"] == 1
         assert snapshot["migration_diagnostics"]["phase_timings"]["route_commit"]["success"] == 1
         assert snapshot["migration_diagnostics"]["phase_timings"]["commit_source"]["failures"] == 1
+
+    asyncio.run(run())
+
+
+def test_migration_returns_before_source_cleanup_and_retains_close_hold(monkeypatch) -> None:
+    async def run() -> None:
+        pool = _pool()
+        pool._active_workers = {"worker-0", "worker-1"}
+        pool._nccl_ranks = {"worker-0": 0, "worker-1": 1}
+        pool._pipeline_routes["pipeline-1"] = "worker-0"
+        pool._session_workers["pipeline-1"] = "worker-0"
+        pool._ownership.register("pipeline-1", "worker-0")
+        pool._send = lambda worker_id, command: None
+        cleanup_started = asyncio.Event()
+        cleanup_release = asyncio.Event()
+
+        async def fake_request(worker_id: str, request_type: str, **kwargs: object) -> dict[str, object]:
+            del worker_id, kwargs
+            if request_type == "nccl_export":
+                return {"result": {"tensor_manifest": [], "state_bytes": 128}}
+            if request_type == "nccl_commit_source":
+                cleanup_started.set()
+                await cleanup_release.wait()
+            return {"result": {"groups": []}}
+
+        monkeypatch.setattr(pool, "_request", fake_request)
+
+        ownership = await pool.migrate_session("pipeline-1", "worker-1")
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1.0)
+        assert ownership.worker_id == "worker-1"
+        assert pool._ownership.owner("pipeline-1").worker_id == "worker-1"
+        assert "pipeline-1" in pool._active_migrations
+
+        pool.close_model_session("pipeline-1")
+        assert "pipeline-1" in pool._deferred_model_closes
+        cleanup_release.set()
+        await asyncio.wait_for(pool._wait_for_migration_cleanup(), timeout=1.0)
+
+        assert "pipeline-1" not in pool._active_migrations
+        assert "pipeline-1" not in pool._deferred_model_closes
+
+    asyncio.run(run())
+
+
+def test_same_session_migration_waits_for_previous_background_cleanup(monkeypatch) -> None:
+    async def run() -> None:
+        pool = _pool()
+        pool._active_workers = {"worker-0", "worker-1"}
+        pool._nccl_ranks = {"worker-0": 0, "worker-1": 1}
+        pool._pipeline_routes["pipeline-1"] = "worker-0"
+        pool._session_workers["pipeline-1"] = "worker-0"
+        pool._ownership.register("pipeline-1", "worker-0")
+        pool._send = lambda worker_id, command: None
+        cleanup_started = asyncio.Event()
+        cleanup_release = asyncio.Event()
+        export_count = 0
+
+        async def fake_request(worker_id: str, request_type: str, **kwargs: object) -> dict[str, object]:
+            nonlocal export_count
+            del worker_id, kwargs
+            if request_type == "nccl_export":
+                export_count += 1
+                return {"result": {"tensor_manifest": [], "state_bytes": 128}}
+            if request_type == "nccl_commit_source" and export_count == 1:
+                cleanup_started.set()
+                await cleanup_release.wait()
+            return {"result": {"groups": []}}
+
+        monkeypatch.setattr(pool, "_request", fake_request)
+
+        first_owner = await pool.migrate_session("pipeline-1", "worker-1")
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1.0)
+        assert first_owner.worker_id == "worker-1"
+
+        second = asyncio.create_task(pool.migrate_session("pipeline-1", "worker-0"))
+        await asyncio.sleep(0)
+        assert export_count == 1
+        assert not second.done()
+
+        cleanup_release.set()
+        second_owner = await asyncio.wait_for(second, timeout=1.0)
+        await pool._wait_for_migration_cleanup()
+        assert second_owner.worker_id == "worker-0"
+        assert export_count == 2
+        assert pool._ownership.owner("pipeline-1").worker_id == "worker-0"
 
     asyncio.run(run())
 
