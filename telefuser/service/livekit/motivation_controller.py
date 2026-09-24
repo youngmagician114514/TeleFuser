@@ -29,6 +29,7 @@ from .motivation_scheduler import (
     SessionSchedulingState,
     load_motivation_profiles_csv,
 )
+from .model_contracts import BatchCompatibilityProvider
 from .profile_quality import DEFAULT_QUALITY_REFERENCE_FIDELITY
 from .session_state_transfer import (
     SessionStateTransferBackend,
@@ -139,6 +140,7 @@ class MotivationRuntimeController:
         search_executor: SearchExecutor | None = None,
         diagnostics: MotivationDiagnosticsSink | None = None,
         clock: Callable[[], float] = time.monotonic,
+        batch_compatibility_provider: BatchCompatibilityProvider | None = None,
         normalize_quality: bool = True,
         quality_reference_fidelity: str = DEFAULT_QUALITY_REFERENCE_FIDELITY,
         batch_invariant_quality: bool = True,
@@ -164,6 +166,7 @@ class MotivationRuntimeController:
             migration_estimator=migration_estimator,
             diagnostics=diagnostics,
             clock=clock,
+            batch_compatibility_provider=batch_compatibility_provider,
         )
         registered = 0
         for gpu_state in gpu_states:
@@ -423,8 +426,15 @@ class MotivationRuntimeController:
         *,
         now: float | None = None,
         wait_seconds: float = 0.0,
+        run_placement: bool = True,
     ) -> DispatchLease | None:
-        """Search synchronously and dispatch one current candidate if possible."""
+        """Search synchronously and dispatch one current candidate if possible.
+
+        ``run_placement`` gates Motivation's global stage-one rehoming pass.
+        The default remains enabled for standalone callers and tests; the
+        LiveKit bridge disables it for ordinary action/output callbacks and
+        enables it from its periodic placement tick.
+        """
         observed_at = self._observed(now)
         # A backend may expose readiness without installing a callback (the
         # replay/unit-test path does this).  Commit ready transfers before the
@@ -438,14 +448,16 @@ class MotivationRuntimeController:
         # local compute phase.  Baselines retain their original policy-owned
         # search path below.
         if self.scheduler.policy_name == "motivation":
-            if self.migration_manager is not None and self.migration_backend_factory is not None:
-                placement = self.scheduler.plan_rehoming(
-                    now=observed_at,
-                    blocked_session_ids=(*pending_migrations, *blocked_migrations),
+            if (
+                run_placement
+                and self.migration_manager is not None
+                and self.migration_backend_factory is not None
+            ):
+                self._run_placement(
+                    observed_at,
+                    pending_migrations=pending_migrations,
+                    blocked_migrations=blocked_migrations,
                 )
-                if placement is not None:
-                    migration_candidate = self.scheduler.placement_candidate(placement)
-                    self.dispatch_candidate(migration_candidate, now=observed_at)
             candidate = self.find_compute_candidate(
                 now=observed_at,
                 include_wait=False,
@@ -879,6 +891,47 @@ class MotivationRuntimeController:
                     committed_at=now,
                 )
         return not migration_started_or_committed
+
+    def run_placement_once(self, *, now: float | None = None) -> bool:
+        """Run Motivation's stage-one rehoming pass without selecting compute.
+
+        The LiveKit bridge calls this only from its periodic placement tick;
+        action and output callbacks continue directly to the local compute
+        stage.  Ready transfers are committed first so placement observes the
+        latest owner map.
+        """
+        observed_at = self._observed(now)
+        self._commit_ready_migrations(observed_at)
+        pending_migrations, blocked_migrations = self._migration_filters(now=observed_at)
+        return self._run_placement(
+            observed_at,
+            pending_migrations=pending_migrations,
+            blocked_migrations=blocked_migrations,
+        )
+
+    def _run_placement(
+        self,
+        observed_at: float,
+        *,
+        pending_migrations: Iterable[str],
+        blocked_migrations: Iterable[str],
+    ) -> bool:
+        """Start at most one placement candidate from an existing snapshot."""
+        if (
+            self.scheduler.policy_name != "motivation"
+            or self.migration_manager is None
+            or self.migration_backend_factory is None
+        ):
+            return False
+        placement = self.scheduler.plan_rehoming(
+            now=observed_at,
+            blocked_session_ids=(*pending_migrations, *blocked_migrations),
+        )
+        if placement is None:
+            return False
+        migration_candidate = self.scheduler.placement_candidate(placement)
+        self.dispatch_candidate(migration_candidate, now=observed_at)
+        return True
 
     def _notify_migration_wakeup(self) -> None:
         # The backend callback is the only event guaranteed to run after a

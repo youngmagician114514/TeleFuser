@@ -25,6 +25,13 @@ from .motivation_diagnostics import (
     NullMotivationDiagnostics,
 )
 from .motivation_execution import MotivationExecutionBridge, release_on_control_state
+from .model_contracts import (
+    ABOT_WORLD_CAPABILITIES,
+    BatchCompatibilityProvider,
+    IncrementalSessionStateCodec,
+    ModelServingCapabilities,
+    SessionStateCodec,
+)
 from .motivation_policies import (
     FIFOPolicy,
     MotivationPolicy,
@@ -99,6 +106,11 @@ __all__ = [
     "NullMotivationDiagnostics",
     "MotivationExecutionBridge",
     "release_on_control_state",
+    "ABOT_WORLD_CAPABILITIES",
+    "ModelServingCapabilities",
+    "SessionStateCodec",
+    "IncrementalSessionStateCodec",
+    "BatchCompatibilityProvider",
     "FIFOPolicy",
     "MotivationPolicy",
     "SlackServePolicy",

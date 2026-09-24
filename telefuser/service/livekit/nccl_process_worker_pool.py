@@ -28,10 +28,12 @@ from .dispatch_trace import DispatchTraceWriter as _DispatchTraceWriter
 from .migration_diagnostics import MigrationDiagnostics, classify_migration_error
 from .nccl_transfer import (
     LayerTransferProgress,
+    PersistentNCCLTransferLane,
     PersistentTensorPagePool,
     PersistentTensorSlot,
     TensorTransferGroup,
     build_layer_transfer_groups,
+    select_incremental_tensor_delta,
     transfer_tensor_leaves_nccl_streamed,
 )
 from .pipeline_adapter import LiveKitPipelineAdapter
@@ -289,6 +291,8 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         self._session_runtime_metrics: dict[str, dict[str, float | int | str]] = {}
         self._migration_total_ms: list[float] = []
         self._migration_route_ready_ms: list[float] = []
+        self._migration_precopy_ms: list[float] = []
+        self._migration_critical_total_ms: list[float] = []
         self._migration_first_layer_ms: list[float] = []
         self._migration_transfer_complete_ms: list[float] = []
         self._migration_drain_ms: list[float] = []
@@ -1062,6 +1066,9 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
             ownership_committed = False
             ownership: TurboServeOwnership | None = None
             background_cleanup_scheduled = False
+            incremental_base_transfer_id = f"{token.token_id}:base"
+            incremental_enabled = bool(getattr(self._config, "migration_incremental_enabled", True))
+            critical_started = started
 
             async def rollback_migration() -> None:
                 """Best-effort cleanup for cancellation or transport failure."""
@@ -1072,6 +1079,13 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                         "nccl_discard",
                         transfer_id=token.token_id,
                         session_id=pipeline_session_id,
+                    )
+                with contextlib.suppress(BaseException):
+                    await self._request(
+                        target_worker_id,
+                        "nccl_discard_precopy",
+                        session_id=pipeline_session_id,
+                        transfer_id=incremental_base_transfer_id,
                     )
                 with contextlib.suppress(BaseException):
                     await self._request(
@@ -1134,43 +1148,90 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                             acknowledge=False,
                         )
             try:
-                # Once a session has completed an export, its current tensor
-                # manifest is cached and target pages can be reserved while
-                # the source is quiescing.  Do not infer the manifest from
-                # model creation: ABot-World may add cache/state leaves after
-                # the initial session shell is created.
-                cached_manifest = self._migration_manifests.get(pipeline_session_id)
-                if cached_manifest is not None:
-                    await self._run_migration_phase(
+                if incremental_enabled:
+                    # Start a full pre-copy while the source session is
+                    # allowed to resume. The final export below only sends
+                    # leaves that changed since this base.
+                    base_exported = await self._run_migration_phase(
                         token.token_id,
-                        "reserve_recv",
+                        "incremental_precopy_export",
                         lambda: self._request(
-                            target_worker_id,
-                            "nccl_reserve_recv",
-                            transfer_id=token.token_id,
-                            tensor_manifest=cached_manifest,
+                            source_worker_id,
+                            "nccl_precopy_export",
+                            session_id=pipeline_session_id,
+                            transfer_id=incremental_base_transfer_id,
                             timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
                         ),
                     )
+                    base_metadata = dict(base_exported["result"])
+                    await self._run_migration_phase(
+                        token.token_id,
+                        "incremental_precopy_prepare",
+                        lambda: self._request(
+                            target_worker_id,
+                            "nccl_precopy_prepare_recv",
+                            session_id=pipeline_session_id,
+                            transfer_id=incremental_base_transfer_id,
+                            metadata=base_metadata,
+                            owner_worker_id=target_worker_id,
+                            ownership_epoch=token.source_epoch + 1,
+                            source_rank=self._nccl_ranks[source_worker_id],
+                            timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
+                        ),
+                    )
+                    pair_key = tuple(sorted((source_worker_id, target_worker_id)))
+                    pair_lock = self._nccl_pair_transfer_locks.setdefault(pair_key, asyncio.Lock())
+
+                    async def transfer_precopy() -> list[dict[str, Any]]:
+                        async with pair_lock:
+                            return await asyncio.gather(
+                                self._request(
+                                    source_worker_id,
+                                    "nccl_precopy_send",
+                                    transfer_id=incremental_base_transfer_id,
+                                    target_rank=self._nccl_ranks[target_worker_id],
+                                    timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
+                                ),
+                                self._request(
+                                    target_worker_id,
+                                    "nccl_precopy_recv",
+                                    session_id=pipeline_session_id,
+                                    transfer_id=incremental_base_transfer_id,
+                                    source_rank=self._nccl_ranks[source_worker_id],
+                                    timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
+                                ),
+                            )
+
+                    await self._run_migration_phase(
+                        token.token_id,
+                        "incremental_precopy_transfer",
+                        transfer_precopy,
+                    )
+                    self._migration_precopy_ms.append((time.monotonic() - started) * 1000.0)
+                    # Pre-copy is outside the user-visible route critical
+                    # path; only final quiesce/delta/ownership is charged.
+                    critical_started = time.monotonic()
                 # The child stops its output pump and takes the authoritative
                 # model-state boundary in one command. This removes a pause
                 # status round trip from the migration critical path.
+                export_request = {
+                    "session_id": pipeline_session_id,
+                    "transfer_id": token.token_id,
+                    "timeout": _MIGRATION_COMMAND_TIMEOUT_SECONDS,
+                }
+                if incremental_enabled:
+                    export_request["base_transfer_id"] = incremental_base_transfer_id
                 exported = await self._run_migration_phase(
                     token.token_id,
                     "export",
-                    lambda: self._request(
-                        source_worker_id,
-                        "nccl_export",
-                        session_id=pipeline_session_id,
-                        transfer_id=token.token_id,
-                        timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
-                    ),
+                    lambda: self._request(source_worker_id, "nccl_export", **export_request),
                 )
                 metadata = dict(exported["result"])
                 manifest = metadata.get("tensor_manifest")
-                if isinstance(manifest, list):
+                full_manifest = metadata.get("full_tensor_manifest", manifest)
+                if isinstance(full_manifest, list):
                     self._migration_manifests[pipeline_session_id] = [
-                        dict(entry) for entry in manifest if isinstance(entry, dict)
+                        dict(entry) for entry in full_manifest if isinstance(entry, dict)
                     ]
                 state_bytes = metadata.get("state_bytes", 0)
                 if isinstance(diagnostics, MigrationDiagnostics):
@@ -1184,6 +1245,7 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                         "nccl_prepare_recv",
                         transfer_id=token.token_id,
                         metadata=metadata,
+                        session_id=pipeline_session_id,
                         source_rank=self._nccl_ranks[source_worker_id],
                         owner_worker_id=target_worker_id,
                         ownership_epoch=token.source_epoch + 1,
@@ -1272,7 +1334,7 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                 # not merely the raw first-layer DMA reported by the child.
                 # The residual layer copy and source cleanup happen after this
                 # boundary and remain diagnostic/background costs.
-                self._migration_route_ready_ms.append((time.monotonic() - started) * 1000.0)
+                self._migration_route_ready_ms.append((time.monotonic() - critical_started) * 1000.0)
 
                 # Continue receiving the remaining layers in the background.
                 # The route is already usable, but the transaction cannot be
@@ -1311,6 +1373,7 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                 for event in staged_events:
                     self._dispatch_event(event)
                 total_ms = (time.monotonic() - started) * 1000.0
+                self._migration_critical_total_ms.append((time.monotonic() - critical_started) * 1000.0)
                 self._migration_total_ms.append(total_ms)
                 if isinstance(diagnostics, MigrationDiagnostics):
                     diagnostics.finish(token.token_id, outcome="success")
@@ -1362,6 +1425,8 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         snapshot = super().turboserve_snapshot()
         migration_total_ms = tuple(getattr(self, "_migration_total_ms", ()))
         migration_route_ready_ms = tuple(getattr(self, "_migration_route_ready_ms", ()))
+        migration_precopy_ms = tuple(getattr(self, "_migration_precopy_ms", ()))
+        migration_critical_total_ms = tuple(getattr(self, "_migration_critical_total_ms", ()))
         migration_first_layer_ms = tuple(getattr(self, "_migration_first_layer_ms", ()))
         migration_transfer_complete_ms = tuple(getattr(self, "_migration_transfer_complete_ms", ()))
         migration_drain_ms = tuple(getattr(self, "_migration_drain_ms", ()))
@@ -1379,15 +1444,26 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                 "session_runtime_metrics": dict(self._session_runtime_metrics),
                 "migration_calibration": {
                     # ``average_total_ms`` is retained for diagnostics only;
-                    # it ends at ownership commit. Placement uses route
-                    # readiness below and never learns the residual transfer
-                    # or background source-cleanup tail as blocking.
+                    # it includes the background-overlapped pre-copy and ends
+                    # at ownership commit. Placement uses route readiness
+                    # below and never learns the residual cleanup tail as
+                    # blocking.
                     "average_total_ms": sum(migration_total_ms) / len(migration_total_ms)
                     if migration_total_ms
                     else 0.0,
                     "average_route_ready_ms": (
                         sum(migration_route_ready_ms) / len(migration_route_ready_ms)
                         if migration_route_ready_ms
+                        else 0.0
+                    ),
+                    "average_precopy_ms": (
+                        sum(migration_precopy_ms) / len(migration_precopy_ms)
+                        if migration_precopy_ms
+                        else 0.0
+                    ),
+                    "average_critical_total_ms": (
+                        sum(migration_critical_total_ms) / len(migration_critical_total_ms)
+                        if migration_critical_total_ms
                         else 0.0
                     ),
                     "p50_route_ready_ms": _nearest_rank_percentile(migration_route_ready_ms, 0.50),
@@ -1782,6 +1858,15 @@ async def _run_nccl_model_worker(
         str,
         tuple[dict[tuple[Any, ...], torch.Tensor], tuple[TensorTransferGroup, ...]],
     ] = {}
+    # Incremental migration keeps the pre-copy base on the source until the
+    # final delta export completes.  The base is released on commit/abort.
+    outgoing_bases: dict[
+        str,
+        tuple[
+            dict[str, Any],
+            dict[tuple[Any, ...], torch.Tensor],
+        ],
+    ] = {}
     incoming: dict[
         str,
         tuple[
@@ -1800,6 +1885,34 @@ async def _run_nccl_model_worker(
         str,
         tuple[dict[tuple[Any, ...], torch.Tensor], PersistentTensorSlot],
     ] = {}
+    # A pre-copy target is deliberately not visible as a model session.  It
+    # becomes the base tensor set for the final delta only after ownership is
+    # committed.
+    precopied_sessions: dict[
+        str,
+        tuple[
+            dict[str, Any],
+            dict[tuple[Any, ...], torch.Tensor],
+            PersistentTensorSlot,
+        ],
+    ] = {}
+    precopied_pending: dict[
+        str,
+        tuple[
+            str,
+            dict[str, Any],
+            dict[tuple[Any, ...], torch.Tensor],
+            PersistentTensorSlot,
+        ],
+    ] = {}
+    incremental_incoming: dict[
+        str,
+        tuple[
+            dict[str, Any],
+            dict[tuple[Any, ...], torch.Tensor],
+            PersistentTensorSlot,
+        ],
+    ] = {}
     # The pool keeps recently released tensor pages resident on this worker.
     # It is deliberately independent of model-session capacity: a page can be
     # reused by the next migration, but the bounded byte budget prevents it
@@ -1809,10 +1922,12 @@ async def _run_nccl_model_worker(
     )
     session_slots: dict[str, PersistentTensorSlot] = {}
     transfer_tasks: set[asyncio.Task[None]] = set()
+    transfer_lane = PersistentNCCLTransferLane(torch.device(f"cuda:{spec.gpu_ids[0]}"))
     warmup_stream = torch.cuda.Stream(device=torch.device("cuda", int(spec.gpu_ids[0])))
     # batch_isend_irecv has process-local coalescing state. Protect only its
-    # submission call; each migration gets its own CUDA stream so copies on
-    # independent worker pairs can overlap after submission.
+    # submission call; the persistent lane gives each independent worker pair
+    # its own reusable CUDA stream so transfers overlap without per-migration
+    # stream allocation.
     nccl_submission_lock = threading.Lock()
 
     def warmup_nccl_collective() -> None:
@@ -1850,7 +1965,7 @@ async def _run_nccl_model_worker(
     ) -> dict[str, Any]:
         """Run NCCL transfer on a worker thread with the child CUDA device selected."""
         torch.cuda.set_device(int(spec.gpu_ids[0]))
-        transfer_stream = torch.cuda.Stream(device=torch.device("cuda", int(spec.gpu_ids[0])))
+        transfer_stream = transfer_lane.stream_for(peer_rank)
 
         def group_complete(group: TensorTransferGroup, event: torch.cuda.Event | None) -> None:
             if progress is not None and group.layer_index is not None:
@@ -1944,6 +2059,122 @@ async def _run_nccl_model_worker(
         except Exception as exc:
             await result(request_id, error=exc)
 
+    async def run_nccl_precopy_recv(command: dict[str, Any]) -> None:
+        """Receive a hidden base snapshot without installing a model session."""
+        request_id = command.get("request_id")
+        transfer_task: asyncio.Task[dict[str, Any]] | None = None
+        try:
+            transfer_id = str(command["transfer_id"])
+            session_id, metadata, leaves, slot = precopied_pending.pop(transfer_id)
+
+            def receive_transfer() -> dict[str, Any]:
+                return transfer_on_worker_device(
+                    leaves,
+                    build_layer_transfer_groups(metadata["tensor_manifest"]),
+                    peer_rank=int(command["source_rank"]),
+                    send=False,
+                )
+
+            transfer_task = asyncio.create_task(
+                asyncio.to_thread(receive_transfer),
+                name=f"nccl-precopy-recv-{transfer_id}",
+            )
+            report = await transfer_task
+            precopied_sessions[session_id] = (metadata, leaves, slot)
+            await result(request_id, report)
+        except Exception as exc:
+            if transfer_task is not None and not transfer_task.done():
+                await asyncio.gather(transfer_task, return_exceptions=True)
+            pending = precopied_pending.pop(str(command.get("transfer_id", "")), None)
+            if pending is not None:
+                state_page_pool.release(pending[3])
+            await result(request_id, error=exc)
+
+    async def run_nccl_incremental_recv(command: dict[str, Any]) -> None:
+        """Apply a final delta to a hidden pre-copy base and install it."""
+        request_id = command.get("request_id")
+        transfer_id = str(command["transfer_id"])
+        delta_slot: PersistentTensorSlot | None = None
+        base_slot: PersistentTensorSlot | None = None
+        installed_session_id: str | None = None
+        try:
+            metadata, delta_leaves, owner, epoch, credit_window, delta_slot = incoming.pop(transfer_id)
+            base_metadata, base_leaves, base_slot = incremental_incoming.pop(transfer_id)
+            delta_manifest = metadata.get("delta_tensor_manifest", metadata.get("tensor_manifest", []))
+            groups = build_layer_transfer_groups(delta_manifest)
+            report = await asyncio.to_thread(
+                transfer_on_worker_device,
+                delta_leaves,
+                groups,
+                peer_rank=int(command["source_rank"]),
+                send=False,
+            )
+            merged_leaves = dict(base_leaves)
+            merged_leaves.update(delta_leaves)
+            merged_metadata = dict(metadata)
+            merged_metadata["tensor_manifest"] = metadata.get("full_tensor_manifest", base_metadata["tensor_manifest"])
+            for key in (
+                "incremental",
+                "delta_tensor_manifest",
+                "full_tensor_manifest",
+                "full_state_bytes",
+                "incremental_base",
+                "incremental_base_state_bytes",
+            ):
+                merged_metadata.pop(key, None)
+            session_id = await asyncio.to_thread(
+                import_session_on_worker_device,
+                merged_metadata,
+                merged_leaves,
+                owner_worker_id=owner,
+                ownership_epoch=epoch,
+                migration_layer_readiness=None,
+            )
+            installed_session_id = session_id
+            # The imported session owns both the pre-copy pages and the delta
+            # pages.  Combine their ownership tokens instead of returning
+            # either set to the reusable pool prematurely.
+            combined_slot = PersistentTensorSlot(tuple(base_slot.pages) + tuple(delta_slot.pages))
+            base_slot.released = True
+            delta_slot.released = True
+            session_slots[session_id] = combined_slot
+            try:
+                publisher_tracking_enabled = bool(adapter.enable_publisher_frame_tracking(session_id))
+            except Exception:
+                publisher_tracking_enabled = False
+            events.put(
+                {
+                    "type": "model_publisher_frame_tracking",
+                    "worker_id": spec.worker_id,
+                    "session_id": session_id,
+                    "enabled": publisher_tracking_enabled,
+                }
+            )
+            start_pump(session_id, credit_window=credit_window)
+            events.put(
+                {
+                    "type": "nccl_first_layer_ready",
+                    "worker_id": spec.worker_id,
+                    "transfer_id": transfer_id,
+                    "session_id": session_id,
+                    "progress": {
+                        "incremental": True,
+                        "complete": True,
+                        "first_layer_ready_ms": None,
+                        "transfer_complete_ms": report.get("total_duration_ms", 0.0),
+                    },
+                }
+            )
+            await result(request_id, report)
+        except Exception as exc:
+            if installed_session_id is None:
+                incremental_incoming.pop(transfer_id, None)
+                if base_slot is not None:
+                    state_page_pool.release(base_slot)
+                if delta_slot is not None:
+                    state_page_pool.release(delta_slot)
+            await result(request_id, error=exc)
+
     async def run_nccl_recv(command: dict[str, Any]) -> None:
         """Receive and install one session while unrelated commands are served."""
         request_id = command.get("request_id")
@@ -1954,6 +2185,8 @@ async def _run_nccl_model_worker(
         installed_session_id: str | None = None
         try:
             transfer_id = str(command["transfer_id"])
+            if transfer_id in incremental_incoming:
+                return await run_nccl_incremental_recv(command)
             metadata, leaves, owner, epoch, credit_window, slot = incoming.pop(transfer_id)
             groups = build_layer_transfer_groups(metadata["tensor_manifest"])
             layer_count = max(
@@ -2106,6 +2339,46 @@ async def _run_nccl_model_worker(
         transfer_id = str(command["transfer_id"])
         metadata = command["metadata"]
 
+        if bool(metadata.get("incremental")):
+            delta_slot: PersistentTensorSlot | None = None
+            try:
+                session_id = str(command["session_id"])
+                base = precopied_sessions.pop(session_id)
+                base_metadata, base_leaves, base_slot = base
+                full_manifest = metadata.get("full_tensor_manifest")
+                if not _slot_matches_manifest(base_leaves, full_manifest):
+                    state_page_pool.release(base_slot)
+                    raise RuntimeError("incremental migration base manifest does not match final state")
+                delta_manifest = metadata.get("delta_tensor_manifest", metadata.get("tensor_manifest", []))
+                if not isinstance(delta_manifest, list):
+                    raise ValueError("incremental migration delta manifest must be a list")
+                delta_leaves, delta_slot = await asyncio.to_thread(
+                    state_page_pool.acquire,
+                    delta_manifest,
+                    torch.device(f"cuda:{spec.gpu_ids[0]}"),
+                )
+                incoming[transfer_id] = (
+                    metadata,
+                    delta_leaves,
+                    command["owner_worker_id"],
+                    command["ownership_epoch"],
+                    int(command.get("model_output_credit_window", _MODEL_OUTPUT_PARENT_QUEUE_SIZE)),
+                    delta_slot,
+                )
+                incremental_incoming[transfer_id] = (base_metadata, base_leaves, base_slot)
+                await result(request_id)
+            except Exception as exc:
+                if delta_slot is not None:
+                    state_page_pool.release(delta_slot)
+                await result(request_id, error=exc)
+            return
+
+        stale_session_id = command.get("session_id")
+        if stale_session_id is not None:
+            stale = precopied_sessions.pop(str(stale_session_id), None)
+            if stale is not None:
+                state_page_pool.release(stale[2])
+
         def allocate() -> tuple[dict[tuple[Any, ...], torch.Tensor], PersistentTensorSlot]:
             torch.cuda.set_device(int(spec.gpu_ids[0]))
             return state_page_pool.acquire(
@@ -2156,6 +2429,25 @@ async def _run_nccl_model_worker(
                 raise RuntimeError(f"NCCL migration transfer {transfer_id!r} already has a target slot")
             prepared_slots[transfer_id] = await asyncio.to_thread(reserve)
             await result(request_id, state_page_pool.snapshot())
+        except Exception as exc:
+            await result(request_id, error=exc)
+
+    async def run_nccl_precopy_prepare_recv(command: dict[str, Any]) -> None:
+        """Reserve the hidden target base before the source resumes."""
+        request_id = command.get("request_id")
+        transfer_id = str(command["transfer_id"])
+        session_id = str(command["session_id"])
+        metadata = command["metadata"]
+        try:
+            if transfer_id in precopied_pending or session_id in precopied_sessions:
+                raise RuntimeError(f"incremental pre-copy already exists for session {session_id!r}")
+            leaves, slot = await asyncio.to_thread(
+                state_page_pool.acquire,
+                metadata["tensor_manifest"],
+                torch.device(f"cuda:{spec.gpu_ids[0]}"),
+            )
+            precopied_pending[transfer_id] = (session_id, metadata, leaves, slot)
+            await result(request_id)
         except Exception as exc:
             await result(request_id, error=exc)
 
@@ -2297,6 +2589,30 @@ async def _run_nccl_model_worker(
                     if callable(discard_pending):
                         await asyncio.to_thread(discard_pending, command["session_id"])
                     tensor_leaves = metadata.pop("_nccl_tensor_leaves")
+                    base = outgoing_bases.pop(command["session_id"], None)
+                    if base is not None and command.get("base_transfer_id"):
+                        base_metadata, base_leaves = base
+                        base_manifest = base_metadata.get("tensor_manifest")
+                        current_manifest = metadata.get("tensor_manifest")
+                        if _slot_matches_manifest(base_leaves, current_manifest) and base_manifest == current_manifest:
+                            delta_manifest, delta_leaves = select_incremental_tensor_delta(
+                                base_leaves,
+                                tensor_leaves,
+                                current_manifest,
+                            )
+                            metadata["incremental"] = True
+                            metadata["full_tensor_manifest"] = [dict(entry) for entry in current_manifest]
+                            metadata["delta_tensor_manifest"] = delta_manifest
+                            metadata["full_state_bytes"] = sum(
+                                value.numel() * value.element_size() for value in tensor_leaves.values()
+                            )
+                            metadata["state_bytes"] = sum(
+                                value.numel() * value.element_size() for value in delta_leaves.values()
+                            )
+                            tensor_leaves = delta_leaves
+                            metadata["tensor_manifest"] = delta_manifest
+                        else:
+                            metadata["incremental"] = False
                     _validate_nccl_source_leaves(tensor_leaves)
                     outgoing[command["transfer_id"]] = (
                         tensor_leaves,
@@ -2304,9 +2620,31 @@ async def _run_nccl_model_worker(
                     )
                     await result(request_id, metadata)
                     continue
+                elif kind == "nccl_precopy_export":
+                    metadata = await asyncio.to_thread(
+                        service.prepare_incremental_migration_nccl_metadata,
+                        command["session_id"],
+                    )
+                    tensor_leaves = metadata.pop("_nccl_tensor_leaves")
+                    _validate_nccl_source_leaves(tensor_leaves)
+                    outgoing[command["transfer_id"]] = (
+                        tensor_leaves,
+                        build_layer_transfer_groups(metadata["tensor_manifest"]),
+                    )
+                    outgoing_bases[command["session_id"]] = (dict(metadata), tensor_leaves)
+                    await result(request_id, metadata)
+                    continue
                 elif kind == "nccl_prepare_recv":
                     task = asyncio.create_task(
                         run_nccl_prepare_recv(command), name=f"nccl-prepare-{command['transfer_id']}"
+                    )
+                    transfer_tasks.add(task)
+                    task.add_done_callback(transfer_tasks.discard)
+                    continue
+                elif kind == "nccl_precopy_prepare_recv":
+                    task = asyncio.create_task(
+                        run_nccl_precopy_prepare_recv(command),
+                        name=f"nccl-precopy-prepare-{command['transfer_id']}",
                     )
                     transfer_tasks.add(task)
                     task.add_done_callback(transfer_tasks.discard)
@@ -2326,8 +2664,22 @@ async def _run_nccl_model_worker(
                     transfer_tasks.add(task)
                     task.add_done_callback(transfer_tasks.discard)
                     continue
+                elif kind == "nccl_precopy_send":
+                    task = asyncio.create_task(
+                        run_nccl_send(command), name=f"nccl-precopy-send-{command['transfer_id']}"
+                    )
+                    transfer_tasks.add(task)
+                    task.add_done_callback(transfer_tasks.discard)
+                    continue
                 elif kind == "nccl_recv":
                     task = asyncio.create_task(run_nccl_recv(command), name=f"nccl-recv-{command['transfer_id']}")
+                    transfer_tasks.add(task)
+                    task.add_done_callback(transfer_tasks.discard)
+                    continue
+                elif kind == "nccl_precopy_recv":
+                    task = asyncio.create_task(
+                        run_nccl_precopy_recv(command), name=f"nccl-precopy-recv-{command['transfer_id']}"
+                    )
                     transfer_tasks.add(task)
                     task.add_done_callback(transfer_tasks.discard)
                     continue
@@ -2338,8 +2690,10 @@ async def _run_nccl_model_worker(
                 elif kind == "nccl_abort_source":
                     service.abort_migration(command["session_id"])
                     outgoing.pop(command.get("transfer_id", ""), None)
+                    outgoing_bases.pop(command.get("session_id", ""), None)
                 elif kind == "nccl_discard":
                     pending = incoming.pop(command["transfer_id"], None)
+                    incremental = incremental_incoming.pop(command["transfer_id"], None)
                     reserved = prepared_slots.pop(command["transfer_id"], None)
                     await stop_pump(command["session_id"], drop_credit_state=True)
                     if service.has_session(command["session_id"]):
@@ -2347,8 +2701,18 @@ async def _run_nccl_model_worker(
                     release_session_slot(command["session_id"])
                     if pending is not None:
                         state_page_pool.release(pending[-1])
+                    if incremental is not None:
+                        state_page_pool.release(incremental[2])
                     if reserved is not None:
                         state_page_pool.release(reserved[1])
+                elif kind == "nccl_discard_precopy":
+                    session_id = str(command.get("session_id", ""))
+                    precopied = precopied_sessions.pop(session_id, None)
+                    if precopied is not None:
+                        state_page_pool.release(precopied[2])
+                    pending_precopy = precopied_pending.pop(str(command.get("transfer_id", "")), None)
+                    if pending_precopy is not None:
+                        state_page_pool.release(pending_precopy[3])
                 elif kind == "nccl_destroy":
                     if dist.is_initialized():
                         dist.destroy_process_group()
@@ -2372,9 +2736,20 @@ async def _run_nccl_model_worker(
         for pending in tuple(incoming.values()):
             state_page_pool.release(pending[-1])
         incoming.clear()
+        for base in tuple(incremental_incoming.values()):
+            state_page_pool.release(base[2])
+        incremental_incoming.clear()
+        for base in tuple(precopied_sessions.values()):
+            state_page_pool.release(base[2])
+        precopied_sessions.clear()
+        for pending in tuple(precopied_pending.values()):
+            state_page_pool.release(pending[3])
+        precopied_pending.clear()
         for _, slot in tuple(prepared_slots.values()):
             state_page_pool.release(slot)
         prepared_slots.clear()
+        outgoing.clear()
+        outgoing_bases.clear()
         if dist.is_initialized():
             with contextlib.suppress(Exception):
                 dist.destroy_process_group()

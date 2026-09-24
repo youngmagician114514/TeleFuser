@@ -9,8 +9,11 @@ from telefuser.service.livekit.nccl_transfer import (
     PersistentTensorPagePool,
     TensorTransferGroup,
     build_layer_transfer_groups,
+    build_tensor_tree_layout,
     flatten_tensor_tree,
+    flatten_tensor_tree_with_layout,
     rebuild_tensor_tree,
+    select_incremental_tensor_delta,
     transfer_tensor_leaves_nccl_streamed,
 )
 
@@ -57,6 +60,41 @@ def test_tensor_manifest_round_trip_preserves_nested_structure() -> None:
     assert restored["cache"][0]["cursor"] == 3
     assert restored["flags"] == (True, None)
     assert torch.equal(restored["cache"][0]["k"], source["cache"][0]["k"])
+
+
+def test_tensor_layout_reuses_manifest_and_refreshes_scalar_metadata() -> None:
+    source = {"cache": [{"k": torch.ones((1, 2)), "cursor": 3}], "flags": (True, None)}
+    layout, _, _, _ = build_tensor_tree_layout(source)
+    updated = {"cache": [{"k": torch.zeros((1, 2)), "cursor": 7}], "flags": (False, None)}
+
+    skeleton, manifest, leaves = flatten_tensor_tree_with_layout(updated, layout)
+    restored = rebuild_tensor_tree(skeleton, leaves)
+
+    assert manifest == [{"path": ["cache", 0, "k"], "shape": [1, 2], "dtype": "float32"}]
+    assert restored["cache"][0]["cursor"] == 7
+    assert restored["flags"] == (False, None)
+    assert torch.equal(restored["cache"][0]["k"], updated["cache"][0]["k"])
+
+
+def test_incremental_tensor_delta_only_keeps_changed_leaves() -> None:
+    base = {
+        ("cache", 0, "k"): torch.zeros((2, 2)),
+        ("cache", 0, "v"): torch.ones((2, 2)),
+    }
+    current = {
+        ("cache", 0, "k"): torch.zeros((2, 2)),
+        ("cache", 0, "v"): torch.full((2, 2), 2.0),
+    }
+    manifest = [
+        {"path": ["cache", 0, "k"], "shape": [2, 2], "dtype": "float32"},
+        {"path": ["cache", 0, "v"], "shape": [2, 2], "dtype": "float32"},
+    ]
+
+    delta_manifest, delta_leaves = select_incremental_tensor_delta(base, current, manifest)
+
+    assert [tuple(entry["path"]) for entry in delta_manifest] == [("cache", 0, "v")]
+    assert set(delta_leaves) == {("cache", 0, "v")}
+    assert torch.equal(delta_leaves[("cache", 0, "v")], current[("cache", 0, "v")])
 
 
 def test_process_nccl_requires_fixed_two_gpu_group() -> None:

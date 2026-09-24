@@ -2,8 +2,8 @@
 # Replay the five ABot action-only workloads on a configurable GPU set.
 #
 # The default prefix8 mode is a short stability preflight. Full mode replays
-# the original 24-session action_world_v2 suite and raises per-worker retained
-# session capacity from four to six.
+# the full action_world_v2 suite and uses the 12-session-per-worker retained
+# capacity contract (48 retained sessions across four workers).
 
 set -euo pipefail
 
@@ -26,12 +26,13 @@ GPU_IDS="0,1,2,3"
 RUN_ROOT=""
 TRACE_ROOT=""
 MAX_SESSIONS_PER_WORKER=""
+QUEUE_SIZE="${ABOT_ACTION_SUITE_QUEUE_SIZE:-48}"
 DRY_RUN=0
 STARTUP_TIMEOUT_SECONDS=900
 # The end-to-end replay historically enabled publisher credit unconditionally.
 # Keep that default for compatibility, but allow a model-production control
 # run to disable the LiveKit handoff gate without editing the launch script.
-FRAME_CREDIT_ENABLED="${ABOT_ACTION_SUITE_FRAME_CREDIT_ENABLED:-1}"
+FRAME_CREDIT_ENABLED="${ABOT_ACTION_SUITE_FRAME_CREDIT_ENABLED:-0}"
 # The paper suite measures scheduling/model production. Keep LiveKit as an
 # asynchronous transport sink without feeding its queue state back into model
 # admission. Set this to 1 only for a transport-coupled deployment run.
@@ -73,7 +74,8 @@ Options:
   --gpu-ids A,B,...                Physical GPU IDs (default: 0,1,2,3).
   --run-root PATH                 Artifact root; must not already exist.
   --trace-root PATH               Override the selected mode's trace root.
-  --max-sessions-per-worker N     Override 4 (prefix8) or 6 (full).
+  --max-sessions-per-worker N     Override the 12-session/worker default.
+  --queue-size N                  Admission FIFO beyond retained capacity (default: 48; 0 rejects).
   --python-bin PATH               Python interpreter.
   --livekit-bin PATH              LiveKit server binary.
   --profile PATH                  Evaluated motivation profile CSV.
@@ -146,6 +148,11 @@ while [[ $# -gt 0 ]]; do
       MAX_SESSIONS_PER_WORKER="$2"
       shift 2
       ;;
+    --queue-size)
+      need_value "$1" "${2:-}"
+      QUEUE_SIZE="$2"
+      shift 2
+      ;;
     --python-bin)
       need_value "$1" "${2:-}"
       PYTHON_BIN="$2"
@@ -193,11 +200,11 @@ done
 case "${MODE}" in
   prefix8)
     DEFAULT_TRACE_ROOT="results/experiments/motivation_diag_prefix8_20260901T000000Z/traces"
-    DEFAULT_MAX_SESSIONS=4
+    DEFAULT_MAX_SESSIONS=12
     ;;
   full)
     DEFAULT_TRACE_ROOT="/public/fanyk1/lwb/abot_world_data_harness/outputs/action_world_v2"
-    DEFAULT_MAX_SESSIONS=6
+    DEFAULT_MAX_SESSIONS=12
     ;;
   *)
     die "--mode must be prefix8 or full; got: ${MODE}"
@@ -224,6 +231,8 @@ RUN_ROOT="$(repo_absolute_path "${RUN_ROOT}")"
 
 [[ "${MAX_SESSIONS_PER_WORKER}" =~ ^[1-9][0-9]*$ ]] \
   || die "--max-sessions-per-worker must be a positive integer"
+[[ "${QUEUE_SIZE}" =~ ^[0-9]+$ ]] \
+  || die "--queue-size must be a non-negative integer"
 [[ "${STARTUP_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ ]] \
   || die "--startup-timeout-seconds must be a positive integer"
 [[ "${FRAME_CREDIT_ENABLED}" == 0 || "${FRAME_CREDIT_ENABLED}" == 1 ]] \
@@ -297,6 +306,7 @@ echo "  workloads: ${WORKLOADS[*]}"
 echo "  GPU IDs: ${GPU_IDS}"
 echo "  workers: ${NUM_WORKERS}"
 echo "  max sessions/worker: ${MAX_SESSIONS_PER_WORKER}"
+echo "  admission queue size: ${QUEUE_SIZE}"
 echo "  output gate: ${OUTPUT_GATE_ENABLED} (0=model-completed paper boundary)"
 echo "  publisher frame credit: ${FRAME_CREDIT_ENABLED}"
 echo "  frame-credit target: ${FRAME_CREDIT_TARGET_FRAMES} frames (${FRAME_CREDIT_TARGET_SECONDS}s), reserve ${FRAME_CREDIT_RESERVE_FRAMES}, guard ${FRAME_CREDIT_GUARD_MS}ms"
@@ -361,6 +371,7 @@ printf '%s\n' \
   "GPU_IDS=${GPU_IDS}" \
   "NUM_WORKERS=${NUM_WORKERS}" \
   "MAX_SESSIONS_PER_WORKER=${MAX_SESSIONS_PER_WORKER}" \
+  "QUEUE_SIZE=${QUEUE_SIZE}" \
   "STARTUP_TIMEOUT_SECONDS=${STARTUP_TIMEOUT_SECONDS}" \
   "FRAME_CREDIT_ENABLED=${FRAME_CREDIT_ENABLED}" \
   "OUTPUT_GATE_ENABLED=${OUTPUT_GATE_ENABLED}" \
@@ -604,7 +615,7 @@ for workload in "${WORKLOADS[@]}"; do
     --worker-gpu-map "${WORKER_GPU_MAP}" \
     --worker-mode process-nccl \
     --max-sessions-per-worker "${MAX_SESSIONS_PER_WORKER}" \
-    --queue-size 0 \
+    --queue-size "${QUEUE_SIZE}" \
     --motivation-profile "${RUN_PROFILE_PATH}" \
     --motivation-max-batch-size 4 \
     --motivation-policy "${MOTIVATION_POLICY}" \

@@ -28,7 +28,6 @@ SessionStateTransferState = Literal[
     "failed",
 ]
 
-
 @dataclass(frozen=True)
 class SessionStateTransferRequest:
     """Immutable request submitted by the global scheduler."""
@@ -319,13 +318,23 @@ class ThreadedRouterSessionStateTransferBackend:
     """Adapt a blocking router to the Session State Transfer contract.
 
     This compatibility backend is intentionally isolated from the policy.  A
-    true paged/layered backend can replace it without changing callers.
+    true paged/layered backend can replace it without changing callers.  The
+    private executor admits independent session transfers concurrently; the
+    router remains responsible for serializing any shared peer/channel state.
     """
 
-    def __init__(self, router: Any, *, executor: concurrent.futures.Executor | None = None) -> None:
+    def __init__(
+        self,
+        router: Any,
+        *,
+        executor: concurrent.futures.Executor | None = None,
+        max_workers: int = 4,
+    ) -> None:
+        if isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers < 1:
+            raise ValueError("max_workers must be a positive integer")
         self.router = router
         self._executor = executor or concurrent.futures.ThreadPoolExecutor(
-            max_workers=1,
+            max_workers=max_workers,
             thread_name_prefix="telefuser-session-transfer",
         )
         self._owns_executor = executor is None

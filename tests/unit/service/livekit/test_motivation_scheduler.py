@@ -20,7 +20,7 @@ from telefuser.service.livekit.motivation_scheduler import (
 )
 
 
-def _scheduler(*, max_batch_size: int = 4) -> MotivationScheduler:
+def _scheduler(*, max_batch_size: int = 4, load_balance_capacity_per_worker: int = 12) -> MotivationScheduler:
     profiles = [
         MotivationProfile(1, "high", 0.40, 0.68, 20.0),
         MotivationProfile(2, "high", 0.72, 0.68, 30.0),
@@ -31,7 +31,10 @@ def _scheduler(*, max_batch_size: int = 4) -> MotivationScheduler:
     ]
     scheduler = MotivationScheduler(
         StaticMotivationProfileTable(profiles),
-        config=MotivationSchedulerConfig(max_batch_size=max_batch_size),
+        config=MotivationSchedulerConfig(
+            max_batch_size=max_batch_size,
+            load_balance_capacity_per_worker=load_balance_capacity_per_worker,
+        ),
     )
     scheduler.add_gpu(GpuSchedulingState("gpu-0", memory_free_gb=80.0))
     scheduler.add_gpu(GpuSchedulingState("gpu-1", memory_free_gb=80.0))
@@ -62,6 +65,25 @@ def test_action_updates_replace_pending_without_releasing_a_second_job() -> None
             "supersedes an action that is already in flight"
         ),
     }
+
+
+def test_profile_frontier_discards_strictly_dominated_points() -> None:
+    profiles = StaticMotivationProfileTable(
+        [
+            MotivationProfile(1, "slow", 1.0, 0.90, 4.0),
+            MotivationProfile(1, "dominated", 1.1, 0.89, 4.5),
+            MotivationProfile(1, "fast", 0.8, 0.80, 4.0),
+        ]
+    )
+    scheduler = MotivationScheduler(profiles, config=MotivationSchedulerConfig(max_batch_size=1))
+    scheduler.add_gpu(GpuSchedulingState("gpu-0", memory_free_gb=80.0))
+    scheduler.register_session("s", owner_gpu="gpu-0", now=0.0)
+    scheduler.submit_action("s", ["W"], now=0.0)
+
+    candidate = scheduler.find_best(now=0.0, include_wait=False)
+
+    assert candidate is not None
+    assert candidate.fidelity != "dominated"
 
 
 def test_action_arriving_while_running_waits_for_next_slot() -> None:
@@ -285,7 +307,9 @@ def test_placement_requires_target_to_finish_next_work_earlier() -> None:
 
 
 def test_placement_counts_pending_target_reservations_against_capacity() -> None:
-    scheduler = _scheduler(max_batch_size=1)
+    # This regression intentionally models the historical eight-session
+    # target cap; production defaults are twelve retained sessions per worker.
+    scheduler = _scheduler(max_batch_size=1, load_balance_capacity_per_worker=8)
     scheduler.register_session(
         "urgent", owner_gpu="gpu-0", now=0.0, slack_seconds=0.1
     )

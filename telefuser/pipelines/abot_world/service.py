@@ -29,7 +29,19 @@ from telefuser.pipelines.abot_world.interactive import (
     ABotWorldSessionLifecycle,
     ABotWorldSessionSnapshot,
 )
-from telefuser.service.livekit.nccl_transfer import flatten_tensor_tree, rebuild_tensor_tree
+from telefuser.service.livekit.model_contracts import (
+    ABOT_WORLD_CAPABILITIES,
+    BatchCompatibilityProvider,
+    ModelServingCapabilities,
+    SessionStateCodec,
+)
+from telefuser.service.livekit.nccl_transfer import (
+    TensorTreeLayout,
+    build_tensor_tree_layout,
+    flatten_tensor_tree,
+    flatten_tensor_tree_with_layout,
+    rebuild_tensor_tree,
+)
 from telefuser.service.livekit.turboserve import TurboServeWorkloadDetector
 from telefuser.utils.logging import logger
 
@@ -180,6 +192,30 @@ class ABotWorldMigrationBundle:
     next_playout_deadline: float
 
 
+class ABotWorldBatchCompatibilityProvider:
+    """Expose ABot's existing physical-batch key through the generic contract."""
+
+    def __init__(self, service: "ABotWorldLiveKitService") -> None:
+        self._service = service
+
+    def batch_compatibility_key(
+        self,
+        session_id: str,
+        *,
+        fidelity: str | None = None,
+    ) -> tuple[object, ...]:
+        state = self._service._session(session_id)
+        if state is None:
+            raise KeyError(session_id)
+        key = self._service._batch_key_for_fidelity(
+            state,
+            state.motivation_fidelity if fidelity is None else fidelity,
+        )
+        # Fidelity is selected by the policy and is not a physical layout
+        # constraint.  Preserve the historical structural key exactly.
+        return tuple(key[:-1])
+
+
 class ABotWorldLiveKitService:
     """One-GPU retained-session owner with coalesced causal-block scheduling.
 
@@ -194,7 +230,9 @@ class ABotWorldLiveKitService:
         self,
         pipeline: ABotWorldInteractivePipeline,
         *,
-        default_fps: int = 12,
+        default_fps: int | None = None,
+        model_capabilities: ModelServingCapabilities = ABOT_WORLD_CAPABILITIES,
+        batch_compatibility_provider: BatchCompatibilityProvider | None = None,
         default_session_config: Mapping[str, object] | None = None,
         output_queue_size: int = _DEFAULT_OUTPUT_QUEUE_SIZE,
         output_gate_enabled: bool = True,
@@ -214,7 +252,13 @@ class ABotWorldLiveKitService:
         idle_suspension_seconds: float = 5.0,
         scheduler_mode: str = "batched",
     ) -> None:
-        if default_fps < 1:
+        if not isinstance(model_capabilities, ModelServingCapabilities):
+            raise TypeError("model_capabilities must be a ModelServingCapabilities instance")
+        if batch_compatibility_provider is not None and not isinstance(
+            batch_compatibility_provider, BatchCompatibilityProvider
+        ):
+            raise TypeError("batch_compatibility_provider must implement BatchCompatibilityProvider")
+        if default_fps is not None and default_fps < 1:
             raise ValueError(f"default_fps must be positive, got {default_fps}")
         if output_queue_size < 1:
             raise ValueError(f"output_queue_size must be positive, got {output_queue_size}")
@@ -268,7 +312,11 @@ class ABotWorldLiveKitService:
         if not math.isfinite(normalized_batch_compute_safety_factor) or normalized_batch_compute_safety_factor < 1.0:
             raise ValueError("batch_compute_safety_factor must be a finite number greater than or equal to 1")
         self.pipeline = pipeline
-        self.default_fps = int(default_fps)
+        self.model_capabilities = model_capabilities
+        self.default_fps = int(
+            model_capabilities.output_fps if default_fps is None else default_fps
+        )
+        self.batch_compatibility_provider = batch_compatibility_provider or ABotWorldBatchCompatibilityProvider(self)
         self.default_session_config = dict(default_session_config or {})
         self.output_queue_size = int(output_queue_size)
         # Production can make compute admission follow the downstream video
@@ -341,6 +389,17 @@ class ABotWorldLiveKitService:
         # record per actual model dispatch to the parent process.
         self._dispatch_trace_callback: Callable[[dict[str, Any]], None] | None = None
         self._dispatch_trace_sequence = 0
+        # The tensor layout is stable for a retained session across chunk
+        # boundaries. Reusing it avoids rebuilding the nested manifest and
+        # path metadata for every migration; a shape change invalidates it.
+        self._migration_tensor_layouts: dict[str, TensorTreeLayout] = {}
+
+    @property
+    def session_state_codec(self) -> SessionStateCodec | None:
+        """Expose the concrete pipeline codec without coupling the service to it."""
+
+        codec = getattr(self.pipeline, "session_state_codec", None)
+        return codec if isinstance(codec, SessionStateCodec) else None
 
     def start(self) -> None:
         """Preload weights and start the sole GPU scheduling thread."""
@@ -814,6 +873,7 @@ class ABotWorldLiveKitService:
                     return
                 self._scheduler_condition.wait(remaining)
             self._sessions.pop(session_id, None)
+            self._migration_tensor_layouts.pop(session_id, None)
             self._discard_from_round_robin(session_id)
         self._workload_detector.record_departure(session_id)
         self.pipeline.close_interactive_session(state.pipeline_session)
@@ -826,7 +886,12 @@ class ABotWorldLiveKitService:
         """Quiesce one session at a chunk boundary and return a CPU snapshot."""
         state = self._quiesce_migration(session_id, timeout)
         with self._scheduler_condition:
-            snapshot = self.pipeline.snapshot_interactive_session(state.pipeline_session)
+            codec = self.session_state_codec
+            snapshot = (
+                codec.export_state(state.pipeline_session)
+                if codec is not None
+                else self.pipeline.snapshot_interactive_session(state.pipeline_session)
+            )
             return ABotWorldMigrationBundle(
                 snapshot=snapshot,
                 config=dict(state.config),
@@ -924,7 +989,27 @@ class ABotWorldLiveKitService:
                     session.taew_decode_state
                 ),
             }
-            skeleton, manifest, leaves = flatten_tensor_tree(payload)
+            layouts = getattr(self, "_migration_tensor_layouts", None)
+            if layouts is None:
+                # A few lightweight CPU fixtures construct the service via
+                # ``__new__`` to exercise migration metadata in isolation.
+                # Keep that supported while production instances use the
+                # persistent per-session layout cache.
+                layouts = {}
+                self._migration_tensor_layouts = layouts
+            layout = layouts.get(session_id)
+            if layout is None:
+                layout, skeleton, manifest, leaves = build_tensor_tree_layout(payload)
+                layouts[session_id] = layout
+            else:
+                try:
+                    skeleton, manifest, leaves = flatten_tensor_tree_with_layout(payload, layout)
+                except ValueError:
+                    # A fidelity/layout change can add or resize state leaves.
+                    # Rebuild once and keep the next migration on the fast
+                    # cached-layout path.
+                    layout, skeleton, manifest, leaves = build_tensor_tree_layout(payload)
+                    layouts[session_id] = layout
         # Minimal CPU pipeline doubles are also used by the snapshot unit
         # tests.  The child NCCL command path performs the unconditional
         # device preflight; keep this service-side check active whenever the
@@ -957,6 +1042,68 @@ class ABotWorldLiveKitService:
             "state_bytes": sum(value.numel() * value.element_size() for value in leaves.values()),
             "_nccl_tensor_leaves": leaves,
         }
+
+    def prepare_incremental_migration_nccl_metadata(
+        self,
+        session_id: str,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Capture a stable pre-copy base, then let the source resume.
+
+        The NCCL worker uses this snapshot as the base of an incremental
+        migration.  The source is only held at a completed chunk boundary
+        while the device tensors are cloned; the clone is transferred while
+        the source session continues to serve.  The later ``nccl_export``
+        command computes a delta against this base and freezes the session
+        only for that final delta boundary.
+
+        A full snapshot is still used as the pre-copy base.  This is
+        intentional: it preserves the existing model-state ABI while moving
+        the full copy off the final ownership-critical path.  Backends with
+        model-native dirty-page tracking can replace this method through the
+        incremental codec contract.
+        """
+
+        metadata = self.prepare_migration_nccl_metadata(session_id, timeout)
+        state = self._session(session_id)
+        if state is None:
+            raise KeyError(f"Unknown ABot session {session_id!r}")
+        leaves = metadata.pop("_nccl_tensor_leaves")
+        session = state.pipeline_session
+        session_lock = getattr(session, "lock", None)
+        lock_context = session_lock if session_lock is not None else contextlib.nullcontext()
+        with lock_context:
+            # ``prepare_migration_nccl_metadata`` already established the
+            # chunk boundary and marked the source session MIGRATING.  Clone
+            # on the same CUDA stream before releasing that marker so the
+            # source cannot mutate the base while the clone is being made.
+            base_leaves = {
+                path: tensor.detach().clone()
+                for path, tensor in leaves.items()
+            }
+            device = getattr(self.pipeline, "device", None)
+            if device is not None and torch.device(device).type == "cuda" and torch.cuda.is_available():
+                torch.cuda.synchronize(torch.device(device))
+        self.resume_migration_precopy(session_id)
+        metadata["_nccl_tensor_leaves"] = base_leaves
+        metadata["incremental_base"] = True
+        metadata["incremental_base_state_bytes"] = sum(
+            tensor.numel() * tensor.element_size() for tensor in base_leaves.values()
+        )
+        return metadata
+
+    def resume_migration_precopy(self, session_id: str) -> None:
+        """Resume a source after a pre-copy base has been captured."""
+
+        with self._scheduler_condition:
+            state = self._sessions.get(session_id)
+            if state is None:
+                return
+            state.migrating = False
+            if state.pipeline_session.lifecycle == ABotWorldSessionLifecycle.MIGRATING:
+                state.pipeline_session.lifecycle = ABotWorldSessionLifecycle.READY
+            state.ready_since = time.monotonic() if state.controls else None
+            self._scheduler_condition.notify_all()
 
     def migration_tensor_manifest(self, session_id: str) -> list[dict[str, Any]]:
         """Return the stable tensor shape manifest without quiescing the session.
@@ -1051,12 +1198,22 @@ class ABotWorldLiveKitService:
                 raise RuntimeError(f"ABot retained-session capacity is exhausted (capacity={capacity})")
             if snapshot.session_id in self._sessions:
                 raise ValueError(f"ABot session {snapshot.session_id!r} already exists")
-        pipeline_session = self.pipeline.restore_interactive_device_snapshot(
-            bundle.snapshot,
-            owner_worker_id=owner_worker_id,
-            ownership_epoch=ownership_epoch,
-            migration_layer_readiness=migration_layer_readiness,
-        )
+        codec = self.session_state_codec
+        import_device_state = getattr(codec, "import_device_state", None) if codec is not None else None
+        if callable(import_device_state):
+            pipeline_session = import_device_state(
+                bundle.snapshot,
+                owner_worker_id=owner_worker_id,
+                ownership_epoch=ownership_epoch,
+                migration_layer_readiness=migration_layer_readiness,
+            )
+        else:
+            pipeline_session = self.pipeline.restore_interactive_device_snapshot(
+                bundle.snapshot,
+                owner_worker_id=owner_worker_id,
+                ownership_epoch=ownership_epoch,
+                migration_layer_readiness=migration_layer_readiness,
+            )
         state = _ABotWorldLiveKitSession(
             session_id=snapshot.session_id,
             pipeline_session=pipeline_session,
@@ -1165,10 +1322,19 @@ class ABotWorldLiveKitService:
                 raise RuntimeError(f"ABot retained-session capacity is exhausted (capacity={capacity})")
             if bundle.snapshot.session_id in self._sessions:
                 raise ValueError(f"ABot session {bundle.snapshot.session_id!r} already exists")
-        pipeline_session = self.pipeline.restore_interactive_snapshot(
-            bundle.snapshot,
-            owner_worker_id=owner_worker_id,
-            ownership_epoch=ownership_epoch,
+        codec = self.session_state_codec
+        pipeline_session = (
+            codec.import_state(
+                bundle.snapshot,
+                owner_worker_id=owner_worker_id,
+                ownership_epoch=ownership_epoch,
+            )
+            if codec is not None
+            else self.pipeline.restore_interactive_snapshot(
+                bundle.snapshot,
+                owner_worker_id=owner_worker_id,
+                ownership_epoch=ownership_epoch,
+            )
         )
         state = _ABotWorldLiveKitSession(
             session_id=bundle.snapshot.session_id,
@@ -1201,6 +1367,7 @@ class ABotWorldLiveKitService:
             if not state.migrating or state.in_flight:
                 raise RuntimeError("ABot source session is not quiescent for migration commit")
             self._sessions.pop(session_id)
+            self._migration_tensor_layouts.pop(session_id, None)
             # Wake an existing pull_chunks() generator. The router will then
             # observe its source iterator close and continue on the target.
             state.active = False
@@ -1408,6 +1575,8 @@ class ABotWorldLiveKitService:
         trace: dict[str, Any],
         state: _ABotWorldLiveKitSession,
         frames: Sequence[Image.Image],
+        *,
+        compatibility_key: tuple[object, ...] | None = None,
     ) -> None:
         """Fill output facts after the corresponding session's chunk commits."""
         session = state.pipeline_session
@@ -1422,8 +1591,12 @@ class ABotWorldLiveKitService:
         # the model-completion boundary.  Waiting for the later parent output
         # event lets a newly scheduled batch observe stale cursors after the
         # compute-side lease has already been committed.
-        batch_key = self._batch_key(state)
-        trace["batch_compatibility_key"] = repr(batch_key[:-1])
+        if compatibility_key is None:
+            compatibility_key = self.batch_compatibility_provider.batch_compatibility_key(
+                state.session_id,
+                fidelity=state.motivation_fidelity,
+            )
+        trace["batch_compatibility_key"] = repr(compatibility_key)
 
     def _emit_dispatch_trace(
         self,
@@ -2242,6 +2415,14 @@ class ABotWorldLiveKitService:
             for trace, state, frames, applied_controls, executed_job_id in zip(
                 session_traces, batch, results, controls, executed_motivation_job_ids, strict=True
             ):
+                # Resolve the provider key before taking the per-session lock.
+                # The default provider looks the session up under
+                # ``_sessions_lock``; doing that while holding ``state.lock``
+                # would invert the lock order used by pull_chunks().
+                compatibility_key = self.batch_compatibility_provider.batch_compatibility_key(
+                    state.session_id,
+                    fidelity=state.motivation_fidelity,
+                )
                 with state.lock:
                     queue_wait = float(trace.get("queue_wait_seconds", 0.0))
                     state.total_queue_wait_seconds += queue_wait
@@ -2298,7 +2479,12 @@ class ABotWorldLiveKitService:
                     else:
                         state.pacing_ready_at = completed_at
                     state.ready_since = completed_at if state.controls else None
-                    self._finish_dispatch_session_trace(trace, state, frames)
+                    self._finish_dispatch_session_trace(
+                        trace,
+                        state,
+                        frames,
+                        compatibility_key=compatibility_key,
+                    )
                 # A policy lease represents one model invocation. Clear the
                 # service-local held controls before exposing output to the
                 # bridge, so a next heartbeat cannot be accidentally erased.

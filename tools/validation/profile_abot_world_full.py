@@ -56,10 +56,10 @@ LATENT_SHAPE = [1, 48, 3, 30, 52]
 TOKENS_PER_LATENT_FRAME = 390
 FRAMES_PER_BLOCK = 12
 CONTROL_LATENT_FRAMES = 3
-# Keep the historical default matrix unchanged, but allow a targeted B=3
-# capture when an online scheduler needs a measured three-session profile.
-DEFAULT_BATCH_SIZES = (1, 2, 4, 8)
-SUPPORTED_BATCH_SIZES = frozenset((*DEFAULT_BATCH_SIZES, 3))
+# Match the four-GPU runtime profile used by the realistic interaction trace.
+# B8 remains available only as an explicit opt-in, not as a default capture.
+DEFAULT_BATCH_SIZES = (1, 2, 3, 4)
+SUPPORTED_BATCH_SIZES = frozenset((*DEFAULT_BATCH_SIZES, 8))
 DEFAULT_WINDOWS = (6, 12, 18)
 DEFAULT_STEP_POSITIONS: dict[int, tuple[int, ...]] = {
     4: (0, 1, 2, 3),

@@ -24,6 +24,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, Protocol
 
+from .model_contracts import (
+    ABOT_WORLD_CAPABILITIES,
+    BatchCompatibilityProvider,
+    ModelServingCapabilities,
+)
 from .motivation_diagnostics import (
     MotivationDiagnosticsSink,
     MotivationDispatchSummary,
@@ -45,7 +50,11 @@ from .slackserve import (
     SlackServeTier,
     choose_bmpr_profile,
     median_quality_floor,
+)
+from .slackserve import (
     service_credit as slackserve_service_credit,
+)
+from .slackserve import (
     urgency_tier as slackserve_urgency_tier,
 )
 from .turboserve import (
@@ -120,6 +129,47 @@ class MotivationProfile:
             not math.isfinite(self.p95_seconds) or self.p95_seconds <= 0
         ):
             raise ValueError("p95_seconds must be positive and finite when supplied")
+
+
+def _pareto_profile_frontier(profiles: Sequence[MotivationProfile]) -> tuple[MotivationProfile, ...]:
+    """Remove execution points dominated by another point on the same GPU.
+
+    The policy only observes latency, memory, quality, and output credit when
+    scoring a profile.  A point that is no faster, no smaller, no better in
+    quality, and produces no more output can therefore never win a candidate
+    comparison.  Keeping the original order makes tie-breaking deterministic
+    and preserves the profile table as the source of truth for non-dominated
+    points.
+    """
+
+    rows = tuple(profiles)
+    if len(rows) < 2:
+        return rows
+
+    def dominates(left: MotivationProfile, right: MotivationProfile) -> bool:
+        left_p95 = left.p95_seconds if left.p95_seconds is not None else left.latency_seconds
+        right_p95 = right.p95_seconds if right.p95_seconds is not None else right.latency_seconds
+        no_worse = (
+            left.latency_seconds <= right.latency_seconds
+            and left_p95 <= right_p95
+            and left.memory_gb <= right.memory_gb
+            and left.quality >= right.quality
+            and left.output_seconds >= right.output_seconds
+        )
+        strictly_better = (
+            left.latency_seconds < right.latency_seconds
+            or left_p95 < right_p95
+            or left.memory_gb < right.memory_gb
+            or left.quality > right.quality
+            or left.output_seconds > right.output_seconds
+        )
+        return no_worse and strictly_better
+
+    return tuple(
+        row
+        for row in rows
+        if not any(other is not row and dominates(other, row) for other in rows)
+    )
 
 
 def load_motivation_profiles_csv(
@@ -727,7 +777,7 @@ class MotivationSchedulerConfig:
     # timelines and resident-session occupancy.  This is Motivation-only;
     # baseline policies normalize their own objectives in ``__init__``.
     lambda_load_balance: float = 0.5
-    load_balance_capacity_per_worker: int = 8
+    load_balance_capacity_per_worker: int = 12
     initial_slack_seconds: float = 1.0
     initial_quality: float | None = None
     include_idle_jobs: bool = True
@@ -741,7 +791,7 @@ class MotivationSchedulerConfig:
     # TurboServe is a separate policy path.  These knobs mirror the
     # source-compatible closed-loop placement controller while keeping its
     # fixed execution family independent from Motivation quality selection.
-    turboserve_capacity_per_worker: int = 8
+    turboserve_capacity_per_worker: int = 12
     turboserve_target_utilization: float = 0.9
     turboserve_migration_eta: float = 0.01
     turboserve_min_gain_ms: float = 40.0
@@ -760,12 +810,19 @@ class MotivationSchedulerConfig:
     slackserve_urgent_multiplier: float = 2.0
     slackserve_relaxed_multiplier: float = 4.0
     slackserve_rehoming_enabled: bool = True
-    slackserve_capacity_per_worker: int = 8
+    slackserve_capacity_per_worker: int = 12
     slackserve_rehoming_control_interval_seconds: float = 3.0
     slackserve_max_rehomes_per_sender: int = 2
     slackserve_max_rehomes_per_receiver: int = 1
+    # Model-facing metadata is deliberately separate from policy constants.
+    # The ABot default preserves the historical 12 FPS / 12-frame job
+    # contract; another backend can provide its own values without changing
+    # the scheduler implementation.
+    model_capabilities: ModelServingCapabilities = ABOT_WORLD_CAPABILITIES
 
     def __post_init__(self) -> None:
+        if not isinstance(self.model_capabilities, ModelServingCapabilities):
+            raise TypeError("model_capabilities must be a ModelServingCapabilities instance")
         if not 1 <= self.max_batch_size <= 4:
             raise ValueError("max_batch_size must be in [1, 4]")
         for name in (
@@ -952,8 +1009,14 @@ class MotivationScheduler:
         diagnostics: MotivationDiagnosticsSink | None = None,
         clock: Callable[[], float] = time.monotonic,
         policy: SchedulingPolicy | None = None,
+        batch_compatibility_provider: BatchCompatibilityProvider | None = None,
     ) -> None:
         self.profile_provider = profile_provider
+        if batch_compatibility_provider is not None and not isinstance(
+            batch_compatibility_provider, BatchCompatibilityProvider
+        ):
+            raise TypeError("batch_compatibility_provider must implement BatchCompatibilityProvider")
+        self.batch_compatibility_provider = batch_compatibility_provider
         requested_config = config or MotivationSchedulerConfig()
         self._policy = policy or create_scheduling_policy(requested_config.policy_name)
         # FIFO is a policy-level baseline, not Motivation with a one-session
@@ -1019,9 +1082,20 @@ class MotivationScheduler:
         # and one receive per target in one SlackServe control window.
         self._slackserve_rehome_sends: dict[tuple[int, str], int] = {}
         self._slackserve_rehome_receives: dict[tuple[int, str], int] = {}
+        # Offline profile tables are immutable for the lifetime of a serving
+        # runtime.  Cache their Pareto frontiers so every action-triggered
+        # search does not repeat dominance checks.  Callers that replace a
+        # profile provider can explicitly invalidate this cache.
+        self._profile_frontier_cache: dict[tuple[str, int], tuple[MotivationProfile, ...]] = {}
         self._epoch = 0
         self._now = 0.0
         self._lock = threading.RLock()
+
+    @property
+    def model_capabilities(self) -> ModelServingCapabilities:
+        """Return the backend contract carried by the scheduler config."""
+
+        return self.config.model_capabilities
 
     @property
     def epoch(self) -> int:
@@ -1034,6 +1108,12 @@ class MotivationScheduler:
         """Return the latest monotonic policy time observed by the scheduler."""
         with self._lock:
             return self._now
+
+    def invalidate_profile_cache(self) -> None:
+        """Invalidate cached profile frontiers after a profile-table update."""
+
+        with self._lock:
+            self._profile_frontier_cache.clear()
 
     @property
     def policy_name(self) -> str:
@@ -1163,6 +1243,17 @@ class MotivationScheduler:
                         self.config.slackserve_initial_slack_multiplier
                         * highest_quality.latency_seconds
                     )
+            normalized_compatibility_key = tuple(compatibility_key)
+            if not normalized_compatibility_key and self.batch_compatibility_provider is not None:
+                try:
+                    normalized_compatibility_key = tuple(
+                        self.batch_compatibility_provider.batch_compatibility_key(session_id)
+                    )
+                except (KeyError, LookupError):
+                    # A worker may not have published model state at admission
+                    # yet.  Keep the historical empty key until its first
+                    # compute-complete event reports one.
+                    normalized_compatibility_key = ()
             state = SessionSchedulingState(
                 session_id=session_id,
                 owner_gpu=owner_gpu,
@@ -1171,7 +1262,7 @@ class MotivationScheduler:
                     initial_slack if slack_seconds is None else slack_seconds
                 ),
                 quality_ema=initial_quality,
-                compatibility_key=tuple(compatibility_key),
+                compatibility_key=normalized_compatibility_key,
                 active=active,
                 last_updated_at=observed_at,
             )
@@ -1325,7 +1416,7 @@ class MotivationScheduler:
     def update_session_compatibility(
         self,
         session_id: str,
-        compatibility_key: Iterable[object],
+        compatibility_key: Iterable[object] | None = None,
         *,
         now: float | None = None,
     ) -> None:
@@ -1340,6 +1431,13 @@ class MotivationScheduler:
         with self._lock:
             observed_at = self._advance_to(observed_at)
             state = self._sessions[session_id]
+            if compatibility_key is None:
+                if self.batch_compatibility_provider is None:
+                    return
+                try:
+                    compatibility_key = self.batch_compatibility_provider.batch_compatibility_key(session_id)
+                except (KeyError, LookupError):
+                    return
             updated = tuple(compatibility_key)
             if state.compatibility_key == updated:
                 return
@@ -1959,7 +2057,16 @@ class MotivationScheduler:
             if len(session_items) != 1:
                 reject("turboserve_singleton_only")
                 return None
-            ordered = tuple(sorted(session_items, key=lambda item: (item[1].sequence, item[1].created_at, item[1].job_id)))
+            ordered = tuple(
+                sorted(
+                    session_items,
+                    key=lambda item: (
+                        item[1].sequence,
+                        item[1].created_at,
+                        item[1].job_id,
+                    ),
+                )
+            )
             size = 1
             profile = fixed_profile(gpu.gpu_id, size)
             if profile is None:
@@ -2670,11 +2777,18 @@ class MotivationScheduler:
         )
         compatible_combinations: dict[int, tuple[tuple[int, ...], ...]] = {}
         for size in range(1, min(self.config.max_batch_size, len(ready)) + 1):
-            compatible_combinations[size] = tuple(
+            # Generate candidates inside each compatibility group.  The old
+            # implementation materialized C(n, size) global combinations and
+            # then discarded incompatible tuples, which became the dominant
+            # control-plane cost for high-concurrency traces.  Sorting keeps
+            # the old lexicographic tie order without recreating that product.
+            group_combinations = [
                 indexes
-                for indexes in itertools.combinations(range(len(ready)), size)
-                if all(ready_keys[index] == ready_keys[indexes[0]] for index in indexes[1:])
-            )
+                for group in compatibility_groups
+                if len(group) >= size
+                for indexes in itertools.combinations(group, size)
+            ]
+            compatible_combinations[size] = tuple(sorted(group_combinations))
 
         # ``best_record`` is a lightweight descriptor.  Full candidate maps
         # are materialized once, after the exhaustive score search has ended.
@@ -2707,7 +2821,15 @@ class MotivationScheduler:
             cache_key = (gpu.gpu_id, size)
             profiles = profile_cache.get(cache_key)
             if profiles is None:
-                profiles = tuple(self.profile_provider.profiles_for(batch_size=size, gpu_id=gpu.gpu_id))
+                with self._lock:
+                    profiles = self._profile_frontier_cache.get(cache_key)
+                if profiles is None:
+                    raw_profiles = tuple(
+                        self.profile_provider.profiles_for(batch_size=size, gpu_id=gpu.gpu_id)
+                    )
+                    profiles = _pareto_profile_frontier(raw_profiles)
+                    with self._lock:
+                        self._profile_frontier_cache[cache_key] = profiles
                 profile_cache[cache_key] = profiles
             return profiles
 

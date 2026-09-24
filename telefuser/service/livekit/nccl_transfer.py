@@ -39,6 +39,19 @@ class TensorTransferGroupStat:
 
 
 @dataclass(frozen=True)
+class TensorTreeLayout:
+    """Reusable tensor/scalar layout for repeated session snapshots.
+
+    The layout contains no tensor values.  It can therefore be retained per
+    session while the model mutates its KV tensors, and reused to rebuild only
+    the current leaf mapping and scalar metadata at the next chunk boundary.
+    """
+
+    template: Any
+    manifest: tuple[dict[str, Any], ...]
+
+
+@dataclass(frozen=True)
 class TensorTransferReport:
     """Result of one complete ordered point-to-point transfer."""
 
@@ -170,6 +183,39 @@ class PersistentTensorPagePool:
                 "cached_pages": sum(len(bucket) for bucket in self._free.values()),
                 "max_cached_bytes": self.max_cached_bytes,
             }
+
+
+class PersistentNCCLTransferLane:
+    """Reuse one CUDA transfer stream per peer on a worker.
+
+    NCCL P2P operations on an unordered worker pair still require the parent
+    pair lock because the process group has no reliable application tag.  The
+    lock protects ordering, while this lane removes the unrelated stream
+    allocation/destruction cost from every migration.  Different peers retain
+    independent streams and can overlap normally.
+    """
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = torch.device(device)
+        self._streams: dict[int, torch.cuda.Stream] = {}
+        self._lock = threading.Lock()
+
+    def stream_for(self, peer_rank: int) -> torch.cuda.Stream:
+        """Return a persistent stream for one NCCL peer."""
+
+        peer = int(peer_rank)
+        with self._lock:
+            stream = self._streams.get(peer)
+            if stream is None:
+                stream = torch.cuda.Stream(device=self.device)
+                self._streams[peer] = stream
+            return stream
+
+    def snapshot(self) -> dict[str, int | str]:
+        """Expose bounded diagnostics without synchronizing any stream."""
+
+        with self._lock:
+            return {"device": str(self.device), "peer_streams": len(self._streams)}
 
 
 def _dtype_from_name(name: str) -> torch.dtype:
@@ -341,6 +387,123 @@ def flatten_tensor_tree(
     return visit(value, path), manifest, leaves
 
 
+def build_tensor_tree_layout(
+    value: Any, *, path: tuple[Any, ...] = ()
+) -> tuple[TensorTreeLayout, Any, list[dict[str, Any]], dict[tuple[Any, ...], torch.Tensor]]:
+    """Build a reusable layout and flatten the current value in one traversal."""
+
+    manifest: list[dict[str, Any]] = []
+    leaves: dict[tuple[Any, ...], torch.Tensor] = {}
+
+    def visit(item: Any, item_path: tuple[Any, ...]) -> tuple[Any, Any]:
+        if isinstance(item, torch.Tensor):
+            manifest_entry = {
+                "path": list(item_path),
+                "shape": list(item.shape),
+                "dtype": str(item.dtype).removeprefix("torch."),
+            }
+            manifest.append(manifest_entry)
+            leaves[item_path] = item.detach()
+            marker = {"__tensor__": list(item_path)}
+            return marker, marker
+        if isinstance(item, dict):
+            template: dict[Any, Any] = {}
+            skeleton: dict[Any, Any] = {}
+            for key, child in item.items():
+                child_template, child_skeleton = visit(child, item_path + (key,))
+                template[key] = child_template
+                skeleton[key] = child_skeleton
+            return {"__dict__": template}, {"__dict__": skeleton}
+        if isinstance(item, list):
+            template = []
+            skeleton = []
+            for index, child in enumerate(item):
+                child_template, child_skeleton = visit(child, item_path + (index,))
+                template.append(child_template)
+                skeleton.append(child_skeleton)
+            return {"__list__": template}, {"__list__": skeleton}
+        if isinstance(item, tuple):
+            template = []
+            skeleton = []
+            for index, child in enumerate(item):
+                child_template, child_skeleton = visit(child, item_path + (index,))
+                template.append(child_template)
+                skeleton.append(child_skeleton)
+            return {"__tuple__": template}, {"__tuple__": skeleton}
+        return {"__scalar__": list(item_path)}, {"__value__": item}
+
+    template, skeleton = visit(value, path)
+    layout = TensorTreeLayout(template=template, manifest=tuple(dict(entry) for entry in manifest))
+    return layout, skeleton, manifest, leaves
+
+
+def flatten_tensor_tree_with_layout(
+    value: Any,
+    layout: TensorTreeLayout,
+    *,
+    path: tuple[Any, ...] = (),
+) -> tuple[Any, list[dict[str, Any]], dict[tuple[Any, ...], torch.Tensor]]:
+    """Flatten a current state using a previously validated tensor layout.
+
+    A shape/layout change raises ``ValueError`` so callers can rebuild the
+    layout once.  This makes incremental metadata reuse fail closed instead of
+    silently pairing a stale target manifest with a changed model state.
+    """
+
+    leaves: dict[tuple[Any, ...], torch.Tensor] = {}
+    manifest_by_path = {tuple(entry["path"]): entry for entry in layout.manifest}
+
+    def visit(item: Any, template: Any, item_path: tuple[Any, ...]) -> Any:
+        if isinstance(template, dict) and "__tensor__" in template:
+            if not isinstance(item, torch.Tensor):
+                raise ValueError(f"tensor layout changed at {item_path!r}")
+            expected_path = tuple(template["__tensor__"])
+            if expected_path != item_path:
+                raise ValueError(f"tensor path changed at {item_path!r}")
+            expected = manifest_by_path.get(item_path)
+            if expected is None:
+                raise ValueError(f"tensor manifest is missing path {item_path!r}")
+            if tuple(int(value) for value in expected["shape"]) != tuple(item.shape):
+                raise ValueError(f"tensor shape changed at {item_path!r}")
+            if str(item.dtype).removeprefix("torch.") != str(expected["dtype"]):
+                raise ValueError(f"tensor dtype changed at {item_path!r}")
+            leaves[item_path] = item.detach()
+            return {"__tensor__": list(item_path)}
+        if isinstance(template, dict) and "__scalar__" in template:
+            return {"__value__": item}
+        if isinstance(template, dict) and "__dict__" in template:
+            if not isinstance(item, dict) or set(item) != set(template["__dict__"]):
+                raise ValueError(f"mapping layout changed at {item_path!r}")
+            return {
+                "__dict__": {
+                    key: visit(item[key], child, item_path + (key,))
+                    for key, child in template["__dict__"].items()
+                }
+            }
+        if isinstance(template, dict) and "__list__" in template:
+            if not isinstance(item, list) or len(item) != len(template["__list__"]):
+                raise ValueError(f"list layout changed at {item_path!r}")
+            return {
+                "__list__": [
+                    visit(child, child_template, item_path + (index,))
+                    for index, (child, child_template) in enumerate(zip(item, template["__list__"]))
+                ]
+            }
+        if isinstance(template, dict) and "__tuple__" in template:
+            if not isinstance(item, tuple) or len(item) != len(template["__tuple__"]):
+                raise ValueError(f"tuple layout changed at {item_path!r}")
+            return {
+                "__tuple__": [
+                    visit(child, child_template, item_path + (index,))
+                    for index, (child, child_template) in enumerate(zip(item, template["__tuple__"]))
+                ]
+            }
+        raise ValueError(f"invalid tensor layout at {item_path!r}")
+
+    skeleton = visit(value, layout.template, path)
+    return skeleton, [dict(entry) for entry in layout.manifest], leaves
+
+
 def allocate_tensor_tree_leaves(
     manifest: list[dict[str, Any]], device: torch.device
 ) -> dict[tuple[Any, ...], torch.Tensor]:
@@ -389,6 +552,39 @@ def build_layer_transfer_groups(manifest: Sequence[dict[str, Any]]) -> tuple[Ten
     if decoder_tail:
         groups.append(TensorTransferGroup("decoder_tail", tuple(decoder_tail)))
     return tuple(groups)
+
+
+def select_incremental_tensor_delta(
+    base_leaves: dict[tuple[Any, ...], torch.Tensor],
+    current_leaves: dict[tuple[Any, ...], torch.Tensor],
+    manifest: Sequence[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[tuple[Any, ...], torch.Tensor]]:
+    """Return changed tensor leaves while preserving the current manifest order.
+
+    The target already owns ``base_leaves`` from the pre-copy.  A changed leaf
+    is sent as a complete leaf, which keeps the existing NCCL tensor ABI and
+    gives model backends a safe fallback when they cannot expose page-level
+    dirty tracking.  Shape or dtype changes are treated as changes and are
+    validated by the receiver against the full manifest.
+    """
+
+    changed: set[tuple[Any, ...]] = set()
+    for path, tensor in current_leaves.items():
+        previous = base_leaves.get(path)
+        if previous is None:
+            changed.add(path)
+            continue
+        if tuple(previous.shape) != tuple(tensor.shape) or previous.dtype != tensor.dtype:
+            changed.add(path)
+            continue
+        if not torch.equal(previous, tensor):
+            changed.add(path)
+    delta_manifest = [
+        dict(entry)
+        for entry in manifest
+        if tuple(entry.get("path", ())) in changed
+    ]
+    return delta_manifest, {path: tensor for path, tensor in current_leaves.items() if path in changed}
 
 
 def rebuild_tensor_tree(skeleton: Any, leaves: dict[tuple[Any, ...], torch.Tensor]) -> Any:

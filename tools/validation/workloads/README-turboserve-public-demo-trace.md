@@ -1,6 +1,6 @@
 # TurboServe public-demo-derived ABot workloads
 
-These two scenarios are deterministic, 30-minute ABot LiveKit workload
+These scenarios are deterministic, 30-minute ABot LiveKit workload
 projections of TurboServe's public simulator trace:
 `../../../TurboServe/traces/example_8gpu.json`.
 
@@ -18,17 +18,20 @@ not real ABot keyboard actions. The adapter maps its selected events as:
 - `session_departure` → stop and delete the session.
 
 The source wall clock is retained exactly (1,800 seconds; no time compression).
-Its observed retained-session peak is 186. The capacity transform uses
-half-up proportional scaling to an ABot peak of `workers × 4`, then keeps a
-selected source session sticky until source departure or scaled capacity
-decrease. Scale-up selection uses a stable SHA-256 rank with seed `20260815`.
-The full transform, source SHA-256, and event provenance are embedded in each
-JSON's `trace_contract`.
+The original capacity-normalized trace uses half-up proportional scaling to an
+ABot peak of `workers × 4`, then keeps a selected source session sticky until
+source departure or scaled capacity decrease. The final world-model trace
+instead projects that aggregate active-session curve onto 16 persistent virtual
+sessions: each is created once at offset 0, alternates between active and idle,
+and is deleted once at offset 1,800. This avoids treating simulator capacity
+resampling as repeated real-world room creation. The full transform, source
+SHA-256, and event provenance are embedded in each JSON's `trace_contract`.
 
 | Scenario | ABot workers | Peak retained sessions | Duration | Arrivals / departures | Active / idle transitions |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | `abot_livekit_1gpu_lf3_12fps_turboserve_public_demo_trace_peak4.json` | 1 | 4 | 1,800 s | 61 / 61 | 66 / 69 |
 | `abot_livekit_4gpu_lf3_12fps_turboserve_public_demo_trace_peak16.json` | 4 | 16 | 1,800 s | 300 / 300 | 282 / 323 |
+| `abot_livekit_4gpu_lf3_12fps_turboserve_public_demo_persistent_world16.json` | 4 | 16 (12 active) | 1,800 s | 16 / 16 | 435 / 435 |
 
 Regenerate and verify deterministic files:
 
@@ -42,11 +45,11 @@ Validate, then replay through the normal public serving interfaces:
 
 ```bash
 $TF_PY tools/validation/replay_abot_livekit_lifecycle_trace.py \
-  --scenario tools/validation/workloads/abot_livekit_4gpu_lf3_12fps_turboserve_public_demo_trace_peak16.json \
+  --scenario tools/validation/workloads/abot_livekit_4gpu_lf3_12fps_turboserve_public_demo_persistent_world16.json \
   --dry-run
 
 $TF_PY tools/validation/replay_abot_livekit_lifecycle_trace.py \
-  --scenario tools/validation/workloads/abot_livekit_4gpu_lf3_12fps_turboserve_public_demo_trace_peak16.json \
+  --scenario tools/validation/workloads/abot_livekit_4gpu_lf3_12fps_turboserve_public_demo_persistent_world16.json \
   --output results/experiments/abot_turboserve_public_demo_4gpu/result.json
 ```
 

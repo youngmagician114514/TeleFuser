@@ -435,6 +435,66 @@ def test_bridge_caps_default_profile_window_at_heartbeat_interval(monkeypatch) -
     bridge.close()
 
 
+def test_bridge_runs_motivation_placement_only_on_periodic_tick(monkeypatch) -> None:
+    _FakeTimer.instances.clear()
+    monkeypatch.setattr("telefuser.service.livekit.motivation_execution.threading.Timer", _FakeTimer)
+    now = [0.0]
+    scheduler = MotivationScheduler(
+        StaticMotivationProfileTable(
+            (MotivationProfile(1, "b1_s4_w18", 0.4, 0.68, 20.0),)
+        ),
+        config=MotivationSchedulerConfig(include_idle_jobs=False),
+    )
+    scheduler.add_gpu(GpuSchedulingState("gpu-0", memory_free_gb=80.0))
+    controller = MotivationRuntimeController(scheduler, dispatch=lambda lease: None, clock=lambda: now[0])
+    placement_flags: list[bool] = []
+    schedule_flags: list[bool] = []
+    schedule_once = controller.schedule_once
+    run_placement_once = controller.run_placement_once
+
+    def tracked_schedule_once(**kwargs):
+        schedule_flags.append(bool(kwargs.get("run_placement", True)))
+        return schedule_once(**kwargs)
+
+    monkeypatch.setattr(controller, "schedule_once", tracked_schedule_once)
+    monkeypatch.setattr(
+        controller,
+        "run_placement_once",
+        lambda **kwargs: placement_flags.append(True) or run_placement_once(**kwargs),
+    )
+    bridge = MotivationExecutionBridge(
+        controller,
+        dispatch=lambda lease, payloads: None,
+        clock=lambda: now[0],
+        placement_interval_seconds=10.0,
+    )
+    bridge.register_session("session-1", owner_gpu="gpu-0", now=0.0)
+
+    assert len(_FakeTimer.instances) == 1
+    first_tick = _FakeTimer.instances[0]
+    assert first_tick.interval == pytest.approx(10.0)
+
+    bridge.schedule_wakeup()
+    assert placement_flags == []
+    assert schedule_flags == [False]
+
+    now[0] = 10.0
+    first_tick.fire()
+    assert placement_flags == [True]
+    assert schedule_flags == [False, False]
+    assert len(_FakeTimer.instances) == 2
+    assert bridge.snapshot()["placement"] == {
+        "enabled": True,
+        "interval_seconds": 10.0,
+        "tick_count": 1,
+        "armed": True,
+    }
+
+    next_tick = _FakeTimer.instances[1]
+    bridge.close()
+    assert next_tick.cancelled is True
+
+
 def test_bridge_uses_profile_window_for_singleton_and_dispatches_on_expiry(monkeypatch) -> None:
     _FakeTimer.instances.clear()
     monkeypatch.setattr("telefuser.service.livekit.motivation_execution.threading.Timer", _FakeTimer)

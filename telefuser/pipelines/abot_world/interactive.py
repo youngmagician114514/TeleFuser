@@ -16,6 +16,7 @@ from PIL import Image
 
 from telefuser.core.config import WeightOffloadType
 from telefuser.models.wan22_video_vae import Wan22VideoVAEStreamingDecodeState
+from telefuser.service.livekit.model_contracts import SessionStateCodec
 
 from .fidelity import ABotWorldFidelity
 from .pipeline import ABotWorldPipeline
@@ -87,6 +88,51 @@ class ABotWorldSessionSnapshot:
     ownership_epoch: int
 
 
+class ABotWorldSessionStateCodec:
+    """ABot implementation of the backend-neutral session-state codec.
+
+    The existing snapshot/restore methods remain the source of truth.  This
+    adapter only gives future model backends a stable interface and therefore
+    introduces no new copy, synchronization, or migration step.
+    """
+
+    def __init__(self, pipeline: "ABotWorldInteractivePipeline") -> None:
+        self._pipeline = pipeline
+
+    def export_state(self, session: ABotWorldInteractiveSession) -> ABotWorldSessionSnapshot:
+        return self._pipeline.snapshot_interactive_session(session)
+
+    def import_state(
+        self,
+        state: ABotWorldSessionSnapshot,
+        *,
+        owner_worker_id: str | None = None,
+        ownership_epoch: int | None = None,
+    ) -> ABotWorldInteractiveSession:
+        return self._pipeline.restore_interactive_snapshot(
+            state,
+            owner_worker_id=owner_worker_id,
+            ownership_epoch=ownership_epoch,
+        )
+
+    def import_device_state(
+        self,
+        state: ABotWorldSessionSnapshot,
+        *,
+        owner_worker_id: str | None = None,
+        ownership_epoch: int | None = None,
+        migration_layer_readiness: Any | None = None,
+    ) -> ABotWorldInteractiveSession:
+        """Restore a snapshot whose tensors already reside on the target GPU."""
+
+        return self._pipeline.restore_interactive_device_snapshot(
+            state,
+            owner_worker_id=owner_worker_id,
+            ownership_epoch=ownership_epoch,
+            migration_layer_readiness=migration_layer_readiness,
+        )
+
+
 class ABotWorldInteractivePipeline(ABotWorldPipeline):
     """ABot pipeline with shared weights and isolated retained sessions."""
 
@@ -97,6 +143,13 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
         self._interactive_sessions: dict[str, ABotWorldInteractiveSession] = {}
         self._models_preloaded = False
         self._last_stage_metrics: dict[str, float | int] = {}
+        self._session_state_codec: SessionStateCodec = ABotWorldSessionStateCodec(self)
+
+    @property
+    def session_state_codec(self) -> SessionStateCodec:
+        """Return the model-owned state codec used by migration backends."""
+
+        return self._session_state_codec
 
     def preload_models(self) -> None:
         """Place VAE, T5, and DiT on the configured GPU before accepting controls."""

@@ -30,6 +30,8 @@ _WORKSPACE_ROOT = _REPO_ROOT.parent
 _DEFAULT_SOURCE = _WORKSPACE_ROOT / "TurboServe" / "traces" / "example_8gpu.json"
 _DEFAULT_OUTPUT_DIR = _REPO_ROOT / "tools" / "validation" / "workloads"
 _DERIVATION_VERSION = "turboserve-public-demo-capacity-normalized-v1"
+_PERSISTENT_WORLD_DERIVATION_VERSION = "turboserve-public-demo-persistent-world-v1"
+_PERSISTENT_WORLD_SCENARIO_NAME = "abot_livekit_4gpu_lf3_12fps_turboserve_public_demo_persistent_world16"
 _SELECTION_SEED = 20260815
 
 
@@ -409,6 +411,148 @@ def derive_trace(
     )
 
 
+def derive_persistent_world_trace(
+    source_events: Iterable[SourceEvent],
+    *,
+    target_peak: int,
+    source_sha256: str,
+) -> DerivedTrace:
+    """Project the normalized aggregate load onto a persistent session pool.
+
+    TurboServe's public demo trace contains process-style lifecycle churn. A
+    world-model interaction is normally a retained room whose user alternates
+    between active input and an idle continuation state. First derive the
+    existing capacity-normalized trace, then preserve its aggregate active
+    session trajectory using ``target_peak`` long-lived virtual sessions.
+
+    Events at the same wall-clock offset are coalesced before the aggregate
+    target is projected. This avoids introducing active/idle oscillations that
+    were only an artifact of same-timestamp source arrivals and departures.
+    """
+    normalized = derive_trace(
+        source_events,
+        target_peak=target_peak,
+        source_sha256=source_sha256,
+    )
+    virtual_ids = tuple(f"world-{index:02d}" for index in range(target_peak))
+    normalized_states: dict[str, bool] = {}
+    active_virtual_ids: set[str] = set()
+    derived_events: list[dict[str, Any]] = []
+    derived_event_counts: Counter[str] = Counter()
+    sequence = 0
+
+    def emit(
+        *,
+        offset_seconds: float,
+        event: str,
+        trace_session_id: str,
+        input_enabled: bool | None = None,
+        **extra: Any,
+    ) -> None:
+        nonlocal sequence
+        payload: dict[str, Any] = {
+            "offset_seconds": round(offset_seconds, 6),
+            "sequence": sequence,
+            "event": event,
+            "trace_session_id": trace_session_id,
+            "source_session_id": None,
+            "source_user_id": None,
+            "virtual_session_slot": int(trace_session_id.rsplit("-", maxsplit=1)[-1]),
+            **extra,
+        }
+        if input_enabled is not None:
+            payload["input_enabled"] = input_enabled
+        derived_events.append(payload)
+        derived_event_counts[event] += 1
+        sequence += 1
+
+    # The persistent pool exists for the whole measurement. Individual users
+    # start idle and receive active/idle transitions from the aggregate curve.
+    for trace_session_id in virtual_ids:
+        emit(
+            offset_seconds=0.0,
+            event="session_arrival",
+            trace_session_id=trace_session_id,
+            input_enabled=False,
+            arrival_reason="persistent_world_session_pool",
+        )
+
+    index = 0
+    normalized_events = normalized.events
+    while index < len(normalized_events):
+        offset_seconds = float(normalized_events[index]["offset_seconds"])
+        group_end = index
+        while (
+            group_end < len(normalized_events)
+            and float(normalized_events[group_end]["offset_seconds"]) == offset_seconds
+        ):
+            source_event = normalized_events[group_end]
+            event_name = str(source_event["event"])
+            source_trace_session_id = str(source_event["trace_session_id"])
+            if event_name == "session_arrival":
+                normalized_states[source_trace_session_id] = bool(source_event["input_enabled"])
+            elif event_name == "session_departure":
+                normalized_states.pop(source_trace_session_id, None)
+            else:
+                normalized_states[source_trace_session_id] = bool(source_event["input_enabled"])
+            group_end += 1
+
+        desired_active = sum(normalized_states.values())
+        active_delta = desired_active - len(active_virtual_ids)
+        provenance_sequence = int(normalized_events[group_end - 1]["sequence"])
+        if active_delta > 0:
+            candidates = [session_id for session_id in virtual_ids if session_id not in active_virtual_ids]
+            for trace_session_id in candidates[:active_delta]:
+                active_virtual_ids.add(trace_session_id)
+                emit(
+                    offset_seconds=offset_seconds,
+                    event="user_active",
+                    trace_session_id=trace_session_id,
+                    input_enabled=True,
+                    aggregate_active_target=desired_active,
+                    source_normalized_event_sequence=provenance_sequence,
+                )
+        elif active_delta < 0:
+            # Prefer the most recently allocated (highest slot) when shrinking,
+            # keeping a stable core active across short load fluctuations.
+            for trace_session_id in sorted(active_virtual_ids, reverse=True)[:-active_delta]:
+                active_virtual_ids.remove(trace_session_id)
+                emit(
+                    offset_seconds=offset_seconds,
+                    event="user_idle",
+                    trace_session_id=trace_session_id,
+                    input_enabled=False,
+                    aggregate_active_target=desired_active,
+                    source_normalized_event_sequence=provenance_sequence,
+                )
+        index = group_end
+
+    if active_virtual_ids:
+        raise TraceAdapterError("Persistent world projection ended with active virtual sessions")
+    for trace_session_id in virtual_ids:
+        emit(
+            offset_seconds=normalized.derived_duration_seconds,
+            event="session_departure",
+            trace_session_id=trace_session_id,
+            departure_reason="measurement_window_complete",
+        )
+
+    return DerivedTrace(
+        events=tuple(derived_events),
+        source_duration_seconds=normalized.source_duration_seconds,
+        derived_duration_seconds=normalized.derived_duration_seconds,
+        source_peak_retained_sessions=normalized.source_peak_retained_sessions,
+        source_peak_active_sessions=normalized.source_peak_active_sessions,
+        derived_peak_retained_sessions=target_peak,
+        derived_peak_active_sessions=normalized.derived_peak_active_sessions,
+        source_event_counts=normalized.source_event_counts,
+        derived_event_counts=dict(sorted(derived_event_counts.items())),
+        source_sha256=source_sha256,
+        selected_source_session_count=normalized.selected_source_session_count,
+        derived_connection_count=target_peak,
+    )
+
+
 def _scenario_payload(*, name: str, workers: int, target_peak: int, trace: DerivedTrace) -> dict[str, Any]:
     """Build the existing ABot workload format plus explicit lifecycle events."""
     expected_worker_mode = "process-nccl" if workers > 1 else "process"
@@ -519,6 +663,47 @@ def _scenario_payload(*, name: str, workers: int, target_peak: int, trace: Deriv
     }
 
 
+def _persistent_world_scenario_payload(*, trace: DerivedTrace) -> dict[str, Any]:
+    """Build the canonical four-GPU persistent-world scenario."""
+    payload = _scenario_payload(
+        name=_PERSISTENT_WORLD_SCENARIO_NAME,
+        workers=4,
+        target_peak=16,
+        trace=trace,
+    )
+    contract = payload["trace_contract"]
+    contract["kind"] = "turboserve_public_demo_aggregate_activity_derived_abot_world_lifecycle"
+    contract["derivation_version"] = _PERSISTENT_WORLD_DERIVATION_VERSION
+    contract["capacity_transform"] = {
+        "kind": "persistent_world_session_pool",
+        "source_observed_peak_retained_sessions": trace.source_peak_retained_sessions,
+        "intermediate_normalized_peak_retained_sessions": 16,
+        "target_workers": 4,
+        "target_sessions_per_worker": 12,
+        "persistent_virtual_sessions": 16,
+        "derived_peak_retained_sessions": trace.derived_peak_retained_sessions,
+        "derived_peak_active_sessions": trace.derived_peak_active_sessions,
+        "derived_connection_count": trace.derived_connection_count,
+        "scaling_rule": (
+            "First compute the deterministic peak-16 capacity-normalized trace, then project its aggregate "
+            "active-session count at each wall-clock offset onto 16 persistent virtual world-model sessions."
+        ),
+    }
+    contract["event_mapping"] = {
+        "session_arrival": "create each of 16 persistent ABot sessions once at measurement start in idle state",
+        "user_active": "activate persistent sessions to match the normalized aggregate active-session target",
+        "user_idle": "idle persistent sessions to match the normalized aggregate active-session target",
+        "session_departure": "delete all persistent sessions once at measurement end",
+    }
+    contract["identity_contract"] = (
+        "Source identities are intentionally not reused: this workload preserves aggregate active-load timing, "
+        "not TurboServe process/session identity churn. Each virtual identity denotes one retained world session."
+    )
+    payload["admission"]["expected_max_sessions_per_worker"] = 12
+    payload["phases"][0]["name"] = "persistent_world_session_replay"
+    return payload
+
+
 def build_scenarios(source_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     """Build the canonical single-GPU and four-GPU scenario documents."""
     source_events, _source_config, source_sha256 = _load_source_trace(source_path)
@@ -538,6 +723,17 @@ def build_scenarios(source_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
             trace=trace_4gpu,
         ),
     )
+
+
+def build_persistent_world_scenario(source_path: Path) -> dict[str, Any]:
+    """Build the four-GPU world-model trace with persistent session identity."""
+    source_events, _source_config, source_sha256 = _load_source_trace(source_path)
+    trace = derive_persistent_world_trace(
+        source_events,
+        target_peak=16,
+        source_sha256=source_sha256,
+    )
+    return _persistent_world_scenario_payload(trace=trace)
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -564,9 +760,11 @@ def main() -> None:
     source = args.source.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
     scenario_1gpu, scenario_4gpu = build_scenarios(source)
+    persistent_world_scenario = build_persistent_world_scenario(source)
     outputs = {
         output_dir / "abot_livekit_1gpu_lf3_12fps_turboserve_public_demo_trace_peak4.json": scenario_1gpu,
         output_dir / "abot_livekit_4gpu_lf3_12fps_turboserve_public_demo_trace_peak16.json": scenario_4gpu,
+        output_dir / f"{_PERSISTENT_WORLD_SCENARIO_NAME}.json": persistent_world_scenario,
     }
     mismatches: list[Path] = []
     for path, payload in outputs.items():

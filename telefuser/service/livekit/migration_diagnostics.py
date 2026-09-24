@@ -24,6 +24,9 @@ from threading import RLock
 from typing import Any, Callable
 
 _MIGRATION_PHASES = (
+    "incremental_precopy_export",
+    "incremental_precopy_prepare",
+    "incremental_precopy_transfer",
     "drain",
     "pause",
     "export",

@@ -32,6 +32,24 @@ def _peak_retained(events: list[Mapping[str, object]]) -> int:
     return peak
 
 
+def _peak_active(events: list[Mapping[str, object]]) -> int:
+    active: dict[str, bool] = {}
+    peak = 0
+    for event in events:
+        trace_session_id = event["trace_session_id"]
+        assert isinstance(trace_session_id, str)
+        event_name = event["event"]
+        if event_name == "session_arrival":
+            active[trace_session_id] = bool(event["input_enabled"])
+        elif event_name == "session_departure":
+            active.pop(trace_session_id)
+        else:
+            active[trace_session_id] = bool(event["input_enabled"])
+        peak = max(peak, sum(active.values()))
+    assert not active
+    return peak
+
+
 def test_checked_in_turboserve_public_demo_scenarios_are_self_contained_and_runnable() -> None:
     for filename, peak in (
         ("abot_livekit_1gpu_lf3_12fps_turboserve_public_demo_trace_peak4.json", 4),
@@ -90,6 +108,34 @@ def test_checked_in_public_demo_scenarios_retain_real_pause_resume_events() -> N
         assert actual_counts["user_idle"] > 0
 
 
+def test_checked_in_persistent_world_scenario_has_no_identity_churn() -> None:
+    filename = "abot_livekit_4gpu_lf3_12fps_turboserve_public_demo_persistent_world16.json"
+    scenario_path = _WORKLOADS / filename
+    scenario = json.loads(scenario_path.read_text(encoding="utf-8"))
+    contract = scenario["trace_contract"]
+    assert contract["kind"] == "turboserve_public_demo_aggregate_activity_derived_abot_world_lifecycle"
+    assert contract["capacity_transform"]["kind"] == "persistent_world_session_pool"
+    assert contract["capacity_transform"]["persistent_virtual_sessions"] == 16
+    assert contract["capacity_transform"]["target_sessions_per_worker"] == 12
+    assert scenario["admission"]["expected_max_sessions_per_worker"] == 12
+
+    events = scenario["lifecycle_trace"]["events"]
+    assert isinstance(events, list)
+    arrivals = [event for event in events if event["event"] == "session_arrival"]
+    departures = [event for event in events if event["event"] == "session_departure"]
+    assert len(arrivals) == len(departures) == 16
+    assert {event["trace_session_id"] for event in arrivals} == {event["trace_session_id"] for event in departures}
+    assert {event["offset_seconds"] for event in arrivals} == {0.0}
+    assert {event["offset_seconds"] for event in departures} == {1800.0}
+    assert _peak_retained(events) == 16
+    assert _peak_active(events) == 12
+
+    parsed_scenario = wave.load_scenario(scenario_path)
+    parsed = replay.load_explicit_lifecycle_trace(parsed_scenario)
+    assert parsed.duration_seconds == 1800.0
+    assert len(parsed.events) == len(events)
+
+
 def test_lifecycle_replay_waits_for_inflight_departure_at_capacity() -> None:
     """A same-timestamp replacement cannot POST before DELETE completes."""
 
@@ -126,6 +172,11 @@ def test_checked_in_turboserve_public_demo_scenarios_match_external_source() -> 
         filename = f"{expected['name']}.json"
         actual = json.loads((_WORKLOADS / filename).read_text(encoding="utf-8"))
         assert actual == expected
+
+    expected_persistent = adapter.build_persistent_world_scenario(_SOURCE)
+    persistent_filename = f"{expected_persistent['name']}.json"
+    actual_persistent = json.loads((_WORKLOADS / persistent_filename).read_text(encoding="utf-8"))
+    assert actual_persistent == expected_persistent
 
 
 def test_public_demo_capacity_normalization_is_deterministic_for_peak_186_source() -> None:

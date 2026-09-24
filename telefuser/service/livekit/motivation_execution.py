@@ -120,6 +120,7 @@ class MotivationExecutionBridge:
         batch_gate: MotivationBatchGate | None = None,
         enable_batch_gate: bool = True,
         defer_scheduling: bool = False,
+        placement_interval_seconds: float | None = None,
     ) -> None:
         self.controller = controller
         self.dispatch = dispatch
@@ -132,7 +133,20 @@ class MotivationExecutionBridge:
             raise TypeError("enable_batch_gate must be a bool")
         if not isinstance(defer_scheduling, bool):
             raise TypeError("defer_scheduling must be a bool")
+        if placement_interval_seconds is not None and (
+            placement_interval_seconds <= 0 or not math.isfinite(placement_interval_seconds)
+        ):
+            raise ValueError("placement_interval_seconds must be positive and finite")
         self._defer_scheduling = defer_scheduling
+        # Only Motivation owns a two-stage placement policy. Baselines keep
+        # their existing event-driven bridge behavior even if a caller passes
+        # the shared runtime configuration value.
+        self._placement_interval_seconds = (
+            float(placement_interval_seconds)
+            if placement_interval_seconds is not None
+            and getattr(controller.scheduler, "policy_name", "motivation") == "motivation"
+            else None
+        )
         # The batch gate is only meaningful for Motivation's profile-aware
         # aggregation. FIFO, TurboServe, and SlackServe are singleton execution
         # paths, so force the gate off for all baselines. SlackServe Elastic SP
@@ -182,6 +196,7 @@ class MotivationExecutionBridge:
         self._schedule_task_pending = False
         self._schedule_thread_ident: int | None = None
         self._schedule_closed = False
+        self._schedule_force_placement_requested = False
         self._drain_last_rounds = 0
         self._lock = threading.RLock()
         self._controls: dict[str, set[str]] = {}
@@ -190,6 +205,9 @@ class MotivationExecutionBridge:
         self._leases: dict[str, _LeaseProgress] = {}
         self._job_to_lease: dict[str, str] = {}
         self._idle_wakeup_timers: dict[str, threading.Timer] = {}
+        self._placement_timer: threading.Timer | None = None
+        self._placement_generation = 0
+        self._placement_tick_count = 0
         self._lease_sequence = 0
         self.controller.set_dispatch_callback(self._dispatch_lease)
 
@@ -203,6 +221,7 @@ class MotivationExecutionBridge:
         )
         with self._lock:
             self._controls.setdefault(session_id, set())
+        self._ensure_placement_timer()
 
     def register_pipeline_session(self, session_id: str, pipeline_session_id: str) -> None:
         """Bind worker output identifiers back to an HTTP session."""
@@ -589,6 +608,7 @@ class MotivationExecutionBridge:
             self._schedule_closed = True
             schedule_executor = self._schedule_executor
             self._schedule_executor = None
+        self._cancel_placement_timer()
         if schedule_executor is not None:
             # ``close`` normally runs on the LiveKit/event-loop thread.  Be
             # defensive for a dispatch callback that closes the bridge from
@@ -651,7 +671,12 @@ class MotivationExecutionBridge:
         """Retry the policy after an external event completes."""
         self._schedule()
 
-    def _schedule(self, *, force_batch_gate: bool = False) -> None:
+    def _schedule(
+        self,
+        *,
+        force_batch_gate: bool = False,
+        force_placement: bool = False,
+    ) -> None:
         """Request a scheduling drain, optionally outside the event loop."""
         if self._defer_scheduling:
             with self._schedule_guard:
@@ -659,6 +684,7 @@ class MotivationExecutionBridge:
                     return
                 self._schedule_requested = True
                 self._schedule_force_requested |= force_batch_gate
+                self._schedule_force_placement_requested |= force_placement
                 if self._schedule_task_pending:
                     return
                 if self._schedule_executor is None:
@@ -679,7 +705,10 @@ class MotivationExecutionBridge:
                     self._schedule_task_pending = False
                 return
             return
-        self._drain_schedule(force_batch_gate=force_batch_gate)
+        self._drain_schedule(
+            force_batch_gate=force_batch_gate,
+            force_placement=force_placement,
+        )
 
     def _run_deferred_schedule(self) -> None:
         """Drain coalesced requests on the bridge's single worker thread."""
@@ -692,10 +721,15 @@ class MotivationExecutionBridge:
                         self._schedule_task_pending = False
                         return
                     force = self._schedule_force_requested
+                    force_placement = self._schedule_force_placement_requested
                     self._schedule_requested = False
                     self._schedule_force_requested = False
+                    self._schedule_force_placement_requested = False
                 try:
-                    self._drain_schedule(force_batch_gate=force)
+                    self._drain_schedule(
+                        force_batch_gate=force,
+                        force_placement=force_placement,
+                    )
                 except Exception:
                     # Scheduling callbacks are best effort; the next worker
                     # event can retry after a transient transport/state race.
@@ -704,7 +738,11 @@ class MotivationExecutionBridge:
                     if self._schedule_closed:
                         self._schedule_task_pending = False
                         return
-                    if self._schedule_requested or self._schedule_force_requested:
+                    if (
+                        self._schedule_requested
+                        or self._schedule_force_requested
+                        or self._schedule_force_placement_requested
+                    ):
                         continue
                     self._schedule_task_pending = False
                     return
@@ -713,7 +751,12 @@ class MotivationExecutionBridge:
                 if self._schedule_thread_ident == threading.get_ident():
                     self._schedule_thread_ident = None
 
-    def _drain_schedule(self, *, force_batch_gate: bool = False) -> None:
+    def _drain_schedule(
+        self,
+        *,
+        force_batch_gate: bool = False,
+        force_placement: bool = False,
+    ) -> None:
         """Drain immediately runnable leases without allowing reentrant storms.
 
         A controller call reserves at most one GPU slot.  On a worker/action
@@ -728,23 +771,31 @@ class MotivationExecutionBridge:
             if self._schedule_running:
                 self._schedule_requested = True
                 self._schedule_force_requested |= force_batch_gate
+                self._schedule_force_placement_requested |= force_placement
                 self._drain_reentrant_events += 1
                 return
             self._schedule_running = True
 
         rounds = 0
         force = force_batch_gate
+        placement = force_placement
         try:
             limit = self._immediate_drain_limit()
             while rounds < limit:
                 rounds += 1
-                lease = self._schedule_round(force_batch_gate=force)
+                lease = self._schedule_round(
+                    force_batch_gate=force,
+                    force_placement=placement,
+                )
                 force = False
+                placement = False
                 with self._schedule_guard:
                     requested = self._schedule_requested
                     force = self._schedule_force_requested
+                    placement = self._schedule_force_placement_requested
                     self._schedule_requested = False
                     self._schedule_force_requested = False
+                    self._schedule_force_placement_requested = False
                 # A successful lease reserves one GPU timeline, so another
                 # round can only fill a different currently-free slot.  If no
                 # lease was produced, retry once only when a reentrant event
@@ -765,15 +816,30 @@ class MotivationExecutionBridge:
                 # pathological synchronous callback cannot spin indefinitely.
                 self._schedule_requested = False
                 self._schedule_force_requested = False
+                self._schedule_force_placement_requested = False
                 self._schedule_running = False
 
-    def _schedule_round(self, *, force_batch_gate: bool) -> DispatchLease | None:
+    def _schedule_round(
+        self,
+        *,
+        force_batch_gate: bool,
+        force_placement: bool,
+    ) -> DispatchLease | None:
         """Run one policy search/dispatch round and return its lease, if any."""
         observed_at = self._clock()
         try:
+            # Keep stage one independent from the action batching gate. A
+            # periodic placement tick must still evaluate rehoming when a
+            # singleton action is waiting for a compatible peer; only the
+            # stage-two compute dispatch is gated.
+            if force_placement:
+                self.controller.run_placement_once(now=observed_at)
             if not force_batch_gate and self._defer_singleton_action(observed_at):
                 return None
-            lease = self.controller.schedule_once(now=observed_at)
+            lease = self.controller.schedule_once(
+                now=observed_at,
+                run_placement=False,
+            )
         except Exception:
             logger.exception("Motivation scheduling callback failed")
             return None
@@ -977,6 +1043,33 @@ class MotivationExecutionBridge:
             self._batch_gate_expiry_count += 1
         self._schedule(force_batch_gate=True)
 
+    def _ensure_placement_timer(self) -> None:
+        """Start the periodic stage-one placement tick once per bridge."""
+        interval = self._placement_interval_seconds
+        if interval is None:
+            return
+        with self._lock:
+            if self._placement_timer is not None or self._schedule_closed:
+                return
+            self._placement_generation += 1
+            generation = self._placement_generation
+            timer = threading.Timer(interval, self._placement_tick, args=(generation,))
+            timer.daemon = True
+            self._placement_timer = timer
+        timer.start()
+
+    def _placement_tick(self, generation: int) -> None:
+        """Run one rehoming pass, then arm the next pass without blocking compute."""
+        with self._lock:
+            if generation != self._placement_generation or self._schedule_closed:
+                return
+            self._placement_timer = None
+            self._placement_tick_count += 1
+        # Production uses deferred scheduling, so no action/model callback
+        # waits for this global placement pass.
+        self._schedule(force_placement=True)
+        self._ensure_placement_timer()
+
     def _batch_gate_is_armed(self, observed_at: float) -> bool:
         with self._lock:
             return (
@@ -994,6 +1087,15 @@ class MotivationExecutionBridge:
             self._batch_gate_deadline = None
             if timer is not None:
                 self._batch_gate_cancel_count += 1
+        if timer is not None:
+            timer.cancel()
+
+    def _cancel_placement_timer(self) -> None:
+        """Stop the periodic placement callback during bridge teardown."""
+        with self._lock:
+            self._placement_generation += 1
+            timer = self._placement_timer
+            self._placement_timer = None
         if timer is not None:
             timer.cancel()
 
@@ -1022,6 +1124,12 @@ class MotivationExecutionBridge:
                 "wait_count": self._batch_gate_wait_count,
                 "expiry_count": self._batch_gate_expiry_count,
                 "cancel_count": self._batch_gate_cancel_count,
+            }
+            placement_stats = {
+                "enabled": self._placement_interval_seconds is not None,
+                "interval_seconds": self._placement_interval_seconds,
+                "tick_count": self._placement_tick_count,
+                "armed": self._placement_timer is not None,
             }
         with self._schedule_guard:
             immediate_drain_stats = {
@@ -1071,6 +1179,7 @@ class MotivationExecutionBridge:
             "controls": controls,
             "next_release_at": next_release_at,
             "batch_gate": batch_gate_stats,
+            "placement": placement_stats,
             "immediate_drain": immediate_drain_stats,
             "diagnostics": self.controller.diagnostics_snapshot(),
             "active_migrations": [

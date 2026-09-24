@@ -87,6 +87,13 @@ class LiveKitServeConfig(BaseSettings):
             "zero disables retention while keeping the same transfer protocol"
         ),
     )
+    migration_incremental_enabled: bool = Field(
+        default=True,
+        description=(
+            "Use source pre-copy plus final tensor delta for process-NCCL session migration; "
+            "disable to retain the full-snapshot path"
+        ),
+    )
     motivation_migration_route_ready_seconds: float = Field(
         default=0.2,
         ge=0,
@@ -101,6 +108,14 @@ class LiveKitServeConfig(BaseSettings):
         default=60.0,
         ge=0,
         description="Minimum residence time after a Motivation-owned session migration",
+    )
+    motivation_placement_interval_seconds: float = Field(
+        default=10.0,
+        gt=0,
+        description=(
+            "Periodic Motivation stage-one placement/rehoming control interval; "
+            "stage-two GPU-local dispatch remains event driven"
+        ),
     )
     slackserve_include_idle_jobs: bool = Field(
         default=False,

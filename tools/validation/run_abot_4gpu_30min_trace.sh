@@ -19,20 +19,47 @@ PORT="${PORT:-8088}"
 LIVEKIT_URL="${LIVEKIT_URL:-ws://127.0.0.1:7880}"
 LIVEKIT_API_KEY="${LIVEKIT_API_KEY:-devkey}"
 LIVEKIT_API_SECRET="${LIVEKIT_API_SECRET:-secret}"
-SCENARIO="${SCENARIO:-tools/validation/workloads/abot_livekit_4gpu_lf3_12fps_turboserve_public_demo_trace_peak16.json}"
+SCENARIO="${SCENARIO:-tools/validation/workloads/abot_livekit_4gpu_lf3_12fps_realistic_interaction_burst16.json}"
 TRACE_DURATION_SECONDS="${TRACE_DURATION_SECONDS:-1800}"
 METRICS_DURATION_SECONDS="${METRICS_DURATION_SECONDS:-1860}"
 CUDA_GRAPH_ENABLED="${CUDA_GRAPH_ENABLED:-1}"
-MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-3}"
+# The 4-GPU realistic trace uses the measured B1/B2/B3/B4 profile family.
+# Keep the runtime cap at B4 so every default profile point is available.
+MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-4}"
 MAX_DEADLINE_WAIT_MS="${MAX_DEADLINE_WAIT_MS:-1000}"
 FRAME_CREDIT_TARGET_FRAMES="${FRAME_CREDIT_TARGET_FRAMES:-36}"
 BATCH_SAFETY_FACTOR="${BATCH_SAFETY_FACTOR:-1.05}"
+MAX_SESSIONS_PER_WORKER="${MAX_SESSIONS_PER_WORKER:-12}"
+FRAME_CREDIT_ENABLED="${FRAME_CREDIT_ENABLED:-0}"
+OUTPUT_GATE_ENABLED="${OUTPUT_GATE_ENABLED:-0}"
 MOTIVATION_PROFILE="${MOTIVATION_PROFILE:-}"
+MOTIVATION_POLICY="${MOTIVATION_POLICY:-motivation}"
+SLACKSERVE_INCLUDE_IDLE_JOBS="${SLACKSERVE_INCLUDE_IDLE_JOBS:-0}"
 RUN="${RUN:-results/experiments/abot_4gpu_lf3_12fps_publicdemo_b${MAX_BATCH_SIZE}_f${FRAME_CREDIT_TARGET_FRAMES}_30min_$(date -u +%Y%m%dT%H%M%SZ)}"
 
 IFS=',' read -r -a GPUS <<<"${GPU_IDS}"
 if [[ "${#GPUS[@]}" -ne 4 ]]; then
   echo "GPU_IDS must contain exactly four comma-separated physical GPU IDs; got: ${GPU_IDS}" >&2
+  exit 2
+fi
+if ! [[ "${MAX_SESSIONS_PER_WORKER}" =~ ^([1-9]|[1-5][0-9]|6[0-4])$ ]]; then
+  echo "MAX_SESSIONS_PER_WORKER must be an integer in [1, 64]; got: ${MAX_SESSIONS_PER_WORKER}" >&2
+  exit 2
+fi
+if [[ "${FRAME_CREDIT_ENABLED}" != 0 && "${FRAME_CREDIT_ENABLED}" != 1 ]]; then
+  echo "FRAME_CREDIT_ENABLED must be 0 or 1; got: ${FRAME_CREDIT_ENABLED}" >&2
+  exit 2
+fi
+if [[ "${OUTPUT_GATE_ENABLED}" != 0 && "${OUTPUT_GATE_ENABLED}" != 1 ]]; then
+  echo "OUTPUT_GATE_ENABLED must be 0 or 1; got: ${OUTPUT_GATE_ENABLED}" >&2
+  exit 2
+fi
+if [[ ! "${MOTIVATION_POLICY}" =~ ^(motivation|fifo|turboserve|slackserve|slackserver)$ ]]; then
+  echo "MOTIVATION_POLICY must be motivation, fifo, turboserve, or slackserve; got: ${MOTIVATION_POLICY}" >&2
+  exit 2
+fi
+if [[ "${SLACKSERVE_INCLUDE_IDLE_JOBS}" != 0 && "${SLACKSERVE_INCLUDE_IDLE_JOBS}" != 1 ]]; then
+  echo "SLACKSERVE_INCLUDE_IDLE_JOBS must be 0 or 1; got: ${SLACKSERVE_INCLUDE_IDLE_JOBS}" >&2
   exit 2
 fi
 for gpu in "${GPUS[@]}"; do
@@ -62,6 +89,7 @@ if [[ -e "${RUN}" ]]; then
 fi
 
 mkdir -p "${RUN}"
+RUN_PATH="$(realpath -m "${RUN}")"
 cp "${SCENARIO}" "${RUN}/scenario.json"
 printf '%s\n' \
   "GPU_IDS=${GPU_IDS}" \
@@ -70,6 +98,11 @@ printf '%s\n' \
   "MAX_DEADLINE_WAIT_MS=${MAX_DEADLINE_WAIT_MS}" \
   "FRAME_CREDIT_TARGET_FRAMES=${FRAME_CREDIT_TARGET_FRAMES}" \
   "BATCH_SAFETY_FACTOR=${BATCH_SAFETY_FACTOR}" \
+  "MAX_SESSIONS_PER_WORKER=${MAX_SESSIONS_PER_WORKER}" \
+  "FRAME_CREDIT_ENABLED=${FRAME_CREDIT_ENABLED}" \
+  "OUTPUT_GATE_ENABLED=${OUTPUT_GATE_ENABLED}" \
+  "MOTIVATION_POLICY=${MOTIVATION_POLICY}" \
+  "SLACKSERVE_INCLUDE_IDLE_JOBS=${SLACKSERVE_INCLUDE_IDLE_JOBS}" \
   "MOTIVATION_PROFILE=${MOTIVATION_PROFILE}" \
   "SCENARIO=${SCENARIO}" \
   >"${RUN}/run-config.env"
@@ -115,14 +148,16 @@ TELEFUSER_ABOT_SCHEDULER_MODE=batched \
 TELEFUSER_ABOT_MAX_BATCH_SIZE="${MAX_BATCH_SIZE}" \
 TELEFUSER_ABOT_BATCHING_WINDOW_MS=2 \
 TELEFUSER_ABOT_MAX_DEADLINE_BATCH_WAIT_MS="${MAX_DEADLINE_WAIT_MS}" \
-TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_ENABLED=1 \
+TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_ENABLED="${FRAME_CREDIT_ENABLED}" \
+TELEFUSER_ABOT_OUTPUT_GATE_ENABLED="${OUTPUT_GATE_ENABLED}" \
+TELEFUSER_LIVEKIT_SLACKSERVE_INCLUDE_IDLE_JOBS="${SLACKSERVE_INCLUDE_IDLE_JOBS}" \
 TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_TARGET_SECONDS=3.0 \
 TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_TARGET_FRAMES="${FRAME_CREDIT_TARGET_FRAMES}" \
 TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_RESERVE_FRAMES=4 \
 TELEFUSER_ABOT_PUBLISHER_FRAME_CREDIT_GUARD_MS=50 \
 TELEFUSER_ABOT_BATCH_COMPUTE_PROFILE=h100_lf3_eager_full_pipeline_v1 \
 TELEFUSER_ABOT_BATCH_COMPUTE_SAFETY_FACTOR="${BATCH_SAFETY_FACTOR}" \
-TELEFUSER_LIVEKIT_DISPATCH_TRACE_PATH="${REPO_ROOT}/${RUN}/dispatch-trace.jsonl" \
+TELEFUSER_LIVEKIT_DISPATCH_TRACE_PATH="${RUN_PATH}/dispatch-trace.jsonl" \
 TELEFUSER_LIVEKIT_DISPATCH_TRACE_MAX_EVENTS=100000 \
 "${PYTHON_BIN}" -m telefuser.entrypoints.cli.main stream-serve \
   examples/abot_world/abot_world_livekit_service.py \
@@ -134,8 +169,9 @@ TELEFUSER_LIVEKIT_DISPATCH_TRACE_MAX_EVENTS=100000 \
   --num-workers 4 \
   --worker-gpu-map '0;1;2;3' \
   --worker-mode process-nccl \
-  --max-sessions-per-worker 4 \
+  --max-sessions-per-worker "${MAX_SESSIONS_PER_WORKER}" \
   --queue-size 0 \
+  --motivation-policy "${MOTIVATION_POLICY}" \
   "${MOTIVATION_ARGS[@]}" \
   --skip-validation \
   >"${RUN}/server.log" 2>&1 &

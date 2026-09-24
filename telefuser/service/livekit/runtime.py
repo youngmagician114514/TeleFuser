@@ -199,6 +199,11 @@ class LiveKitServeRuntime:
                 motivation_controller,
                 dispatch=self._dispatch_motivation_batch,
                 release_policy=motivation_release_policy or release_on_control_state,
+                placement_interval_seconds=(
+                    config.motivation_placement_interval_seconds
+                    if motivation_controller.scheduler.policy_name == "motivation"
+                    else None
+                ),
                 # Worker callbacks and the HTTP app share the LiveKit event
                 # loop.  Keep the potentially expensive global policy search
                 # on the bridge's serialized background thread so a burst of
