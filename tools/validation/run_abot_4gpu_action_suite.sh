@@ -2,7 +2,7 @@
 # Replay the five ABot action-only workloads on a configurable GPU set.
 #
 # The default prefix8 mode is a short stability preflight. Full mode replays
-# the full action_world_v2 suite and uses the 12-session-per-worker retained
+# the full high-intensity action suite and uses the 12-session-per-worker retained
 # capacity contract (48 retained sessions across four workers).
 
 set -euo pipefail
@@ -203,7 +203,7 @@ case "${MODE}" in
     DEFAULT_MAX_SESSIONS=12
     ;;
   full)
-    DEFAULT_TRACE_ROOT="/public/fanyk1/lwb/abot_world_data_harness/outputs/action_world_v2"
+    DEFAULT_TRACE_ROOT="/public/fanyk1/lwb/abot_world_data_harness/outputs/action_world_v3_half_second"
     DEFAULT_MAX_SESSIONS=12
     ;;
   *)

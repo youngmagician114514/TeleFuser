@@ -104,6 +104,13 @@ class _ABotWorldLiveKitSession:
     output_queue: queue.Queue[dict[str, Any]]
     control_event: threading.Event
     config: dict[str, Any]
+    # Idle chunks are prefetched while the user is away, but remain outside
+    # the visible FIFO until a new action resumes the stream.
+    held_idle_payloads: deque[dict[str, Any]] = field(default_factory=deque)
+    # Keep a late idle publication ahead of the resumed action when the
+    # compute-complete callback races the child output thread.
+    idle_resume_pending: bool = False
+    hold_idle_output: bool = False
     output_available_event: threading.Event = field(default_factory=threading.Event)
     control_idle_timeout: float = 10.0
     controls: set[str] = field(default_factory=set)
@@ -679,6 +686,9 @@ class ABotWorldLiveKitService:
             state.control_event.set()
             if state.controls:
                 self._workload_detector.record_active(session_id, now)
+                if state.held_idle_payloads:
+                    state.idle_resume_pending = True
+                    self._promote_held_idle(state)
             else:
                 self._workload_detector.record_idle(session_id, now)
             self._scheduler_condition.notify_all()
@@ -816,6 +826,14 @@ class ABotWorldLiveKitService:
         state.motivation_fidelity = str(motivation["fidelity"])
         state.last_control_at = now
         idle_one_shot = state.motivation_kind == "idle"
+        if idle_one_shot:
+            state.hold_idle_output = True
+        else:
+            state.idle_resume_pending = True
+            # Resume prefetch before the fresh action output. The existing
+            # output queue remains FIFO; this only makes held idle work part
+            # of that queue at the action-resume boundary.
+            self._promote_held_idle(state)
         state.ready_since = now if state.controls or idle_one_shot else None
         state.pacing_ready_at = now
         state.control_event.set()
@@ -824,6 +842,16 @@ class ABotWorldLiveKitService:
             self._workload_detector.record_active(state.session_id, now)
         else:
             self._workload_detector.record_idle(state.session_id, now)
+
+    def _promote_held_idle(self, state: _ABotWorldLiveKitSession) -> None:
+        """Move prefetched idle payloads into the visible output FIFO."""
+        while state.held_idle_payloads:
+            payload = state.held_idle_payloads.popleft()
+            if not self._put_output(state, payload, _hold_idle=False):
+                # Lossless queues can be full. Preserve the held payload for a
+                # later action boundary instead of silently losing it.
+                state.held_idle_payloads.appendleft(payload)
+                break
 
     async def pull_chunks(self, session_id: str) -> AsyncGenerator[dict, None]:
         """Yield preview and generated frames in per-session sequence order."""
@@ -1465,6 +1493,7 @@ class ABotWorldLiveKitService:
                 # fields that the native collate path actually requires.
                 structural_key = batch_key[:-1]
                 queued_video_frames = self._queued_video_frames(state)
+                held_idle_frames = sum(self._payload_frame_count(payload) for payload in state.held_idle_payloads)
                 frame_credit_frames = queued_video_frames + state.publisher_unsubmitted_frames
                 return {
                     "scheduler_mode": self.scheduler_mode,
@@ -1484,6 +1513,10 @@ class ABotWorldLiveKitService:
                         max(0.0, (state.deadline_batch_wait_until or 0.0) - time.monotonic()), 6
                     ),
                     "pacing_buffered_video_payloads": self._queued_video_payloads(state),
+                    "held_idle_video_payloads": len(state.held_idle_payloads),
+                    "held_idle_video_frames": held_idle_frames,
+                    "idle_resume_pending": int(state.idle_resume_pending),
+                    "hold_idle_output": int(state.hold_idle_output),
                     "publisher_frame_tracking_enabled": int(state.publisher_frame_tracking_enabled),
                     "queued_video_frames": queued_video_frames,
                     "frame_credit_target_frames": self._frame_credit_target_frames(state),
@@ -2535,12 +2568,45 @@ class ABotWorldLiveKitService:
                         state.in_flight = False
                 self._scheduler_condition.notify_all()
 
-    def _put_output(self, state: _ABotWorldLiveKitSession, payload: dict[str, Any]) -> bool:
-        """Enqueue one payload without letting a slow latest-mode client retain stale video."""
+    def _put_output(
+        self,
+        state: _ABotWorldLiveKitSession,
+        payload: dict[str, Any],
+        *,
+        _hold_idle: bool = True,
+    ) -> bool:
+        """Enqueue one payload while keeping idle prefetch off the visible FIFO."""
         payload_type = str(payload.get("type", ""))
         with state.lock:
             if not state.active and payload_type not in _TERMINAL_OUTPUT_TYPES:
                 return False
+            scheduler_metadata = payload.get("scheduler")
+            motivation_kind = (
+                str(scheduler_metadata.get("motivation_kind", ""))
+                if isinstance(scheduler_metadata, Mapping)
+                else ""
+            )
+            is_idle_chunk = (
+                payload_type == "chunk"
+                and motivation_kind == "idle"
+            )
+            is_action_chunk = payload_type == "chunk" and motivation_kind == "action"
+            if _hold_idle and is_idle_chunk and (state.hold_idle_output or state.idle_resume_pending):
+                # The scheduler allows only one outstanding idle chunk per
+                # session, so this deque remains bounded in normal operation.
+                # Keep a latest-mode replacement defensive for delayed output.
+                if state.held_idle_payloads:
+                    state.held_idle_payloads.popleft()
+                    state.dropped_video_payloads += 1
+                state.held_idle_payloads.append(payload)
+                return True
+            if is_action_chunk and state.idle_resume_pending:
+                # The scheduler may activate this action from the compute
+                # callback before the previous idle thread publishes its
+                # payload. Promote that payload first to preserve task order.
+                self._promote_held_idle(state)
+                state.idle_resume_pending = False
+                state.hold_idle_output = False
             if not state.output_queue.full():
                 state.output_queue.put_nowait(payload)
                 state.output_available_event.set()
@@ -2732,6 +2798,7 @@ class ABotWorldLiveKitService:
             return {
                 "in_flight": bool(state.in_flight),
                 "output_queue_empty": state.output_queue.empty(),
+                "held_idle_payloads": len(state.held_idle_payloads),
                 "output_queue_discardable": state.config.get("delivery_mode", "latest") != "lossless",
                 "publisher_unsubmitted_frames": int(state.publisher_unsubmitted_frames),
             }

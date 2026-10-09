@@ -213,6 +213,20 @@ def serve(
     help="Maximum Motivation candidate batch size",
 )
 @click.option(
+    "--motivation-lambda-quality",
+    default=2.0,
+    type=click.FloatRange(min=0.0),
+    show_default=True,
+    help="Weight of normalized quality in Motivation candidate scoring",
+)
+@click.option(
+    "--motivation-pending-action-slots",
+    default=4,
+    type=click.IntRange(min=1, max=16),
+    show_default=True,
+    help="Bounded FIFO action slots retained per session for Motivation",
+)
+@click.option(
     "--motivation-migration/--no-motivation-migration",
     default=True,
     show_default=True,
@@ -253,6 +267,8 @@ def stream_serve(
     motivation_profile: str | None,
     motivation_memory_free_gb: float,
     motivation_max_batch_size: int,
+    motivation_lambda_quality: float,
+    motivation_pending_action_slots: int,
     motivation_migration: bool,
     motivation_policy: str,
 ) -> None:
@@ -302,6 +318,8 @@ def stream_serve(
         motivation_profile=motivation_profile,
         motivation_memory_free_gb=motivation_memory_free_gb,
         motivation_max_batch_size=motivation_max_batch_size,
+        motivation_lambda_quality=motivation_lambda_quality,
+        motivation_pending_action_slots=motivation_pending_action_slots,
         motivation_migration=motivation_migration,
         motivation_policy=motivation_policy,
     )

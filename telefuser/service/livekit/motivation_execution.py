@@ -27,6 +27,10 @@ ReleasePolicy = Callable[[dict[str, Any]], bool]
 logger = logging.getLogger(__name__)
 _EPSILON = 1e-9
 _SESSION_DEPARTED_ERROR = "session departed before physical completion"
+# Keep the collection delay bounded by a small control-plane window.  Larger
+# profile-derived waits improve geometric throughput on paper but make a
+# singleton action visibly late when a compatible peer does not arrive.
+_DEFAULT_BATCH_COALESCE_MAX_WAIT_SECONDS = 0.020
 
 
 @dataclass
@@ -115,7 +119,7 @@ class MotivationExecutionBridge:
         *,
         dispatch: ControlDispatch,
         release_policy: ReleasePolicy = release_on_control_state,
-        heartbeat_interval_seconds: float = 1.0,
+        heartbeat_interval_seconds: float = 0.5,
         clock: Callable[[], float] = time.monotonic,
         batch_gate: MotivationBatchGate | None = None,
         enable_batch_gate: bool = True,
@@ -164,7 +168,10 @@ class MotivationExecutionBridge:
                 if batch_gate is not None
                 else MotivationBatchGate(
                     controller.scheduler.profile_provider,
-                    max_wait_seconds=self._heartbeat_interval_seconds,
+                    max_wait_seconds=min(
+                        self._heartbeat_interval_seconds,
+                        _DEFAULT_BATCH_COALESCE_MAX_WAIT_SECONDS,
+                    ),
                 )
             )
             if enable_batch_gate
@@ -266,6 +273,19 @@ class MotivationExecutionBridge:
             # new model work; it never creates an action job.
             release=release and bool(controls),
         )
+        if (
+            release
+            and controls
+            and getattr(self.controller.scheduler, "policy_name", "motivation") == "motivation"
+        ):
+            # The release opens one complete heartbeat window for the latest
+            # action.  A prefetched idle chunk is released only when this
+            # action becomes the user's next visible work item.
+            self.controller.release_idle_video(session_id, now=observed_at)
+            self.controller.defer_idle_until(
+                session_id,
+                observed_at + self._heartbeat_interval_seconds,
+            )
         if not controls:
             with self._lock:
                 self._next_release_at.pop(session_id, None)
@@ -1149,12 +1169,21 @@ class MotivationExecutionBridge:
                 "owner_gpu": state.owner_gpu,
                 "departed": state.departed,
                 "pending_action": state.pending_action.job_id if state.pending_action else None,
+                "pending_action_queue": [
+                    job.job_id for job in state.pending_action_queue
+                ],
+                "pending_action_count": state.pending_action_count,
+                "pending_action_slots": state.pending_action_slots,
                 "pending_idle": state.pending_idle.job_id if state.pending_idle else None,
                 "in_flight": state.in_flight.job_id if state.in_flight else None,
                 "latest_controls": list(state.latest_controls),
                 "state_version": state.state_version,
                 "slack_seconds": state.slack_seconds,
                 "quality_ema": state.quality_ema,
+                "action_seen": state.action_seen,
+                "idle_not_before": state.idle_not_before,
+                "idle_video_held": state.idle_video_held,
+                "idle_video_release_requested": state.idle_video_release_requested,
                 "migration_target_gpu": state.migration_target_gpu,
             }
         migration_manager = self.controller.migration_manager

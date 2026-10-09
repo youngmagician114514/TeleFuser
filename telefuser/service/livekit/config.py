@@ -50,6 +50,14 @@ class LiveKitServeConfig(BaseSettings):
     )
 
     queue_size: int = Field(default=0, ge=0, le=10000, description="Maximum queued sessions")
+    action_collection_window_seconds: float = Field(
+        default=0.5,
+        gt=0,
+        description=(
+            "Maximum local latest-action collection window before releasing a browser control state; "
+            "this does not change the one-second model output/playback block"
+        ),
+    )
     autoscaling_enabled: bool = Field(default=False, description="Dynamically load configured GPU workers")
     autoscaling_min_workers: int = Field(default=1, ge=1, le=64)
     autoscaling_target_utilization: float = Field(default=0.75, gt=0, le=1)

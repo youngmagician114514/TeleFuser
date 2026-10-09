@@ -20,7 +20,12 @@ from telefuser.service.livekit.motivation_scheduler import (
 )
 
 
-def _scheduler(*, max_batch_size: int = 4, load_balance_capacity_per_worker: int = 12) -> MotivationScheduler:
+def _scheduler(
+    *,
+    max_batch_size: int = 4,
+    load_balance_capacity_per_worker: int = 12,
+    pending_action_slots: int = 1,
+) -> MotivationScheduler:
     profiles = [
         MotivationProfile(1, "high", 0.40, 0.68, 20.0),
         MotivationProfile(2, "high", 0.72, 0.68, 30.0),
@@ -34,6 +39,7 @@ def _scheduler(*, max_batch_size: int = 4, load_balance_capacity_per_worker: int
         config=MotivationSchedulerConfig(
             max_batch_size=max_batch_size,
             load_balance_capacity_per_worker=load_balance_capacity_per_worker,
+            pending_action_slots=pending_action_slots,
         ),
     )
     scheduler.add_gpu(GpuSchedulingState("gpu-0", memory_free_gb=80.0))
@@ -57,6 +63,7 @@ def test_action_updates_replace_pending_without_releasing_a_second_job() -> None
     assert scheduler.diagnostics_snapshot()["action_lifecycle"] == {
         "released": 2,
         "superseded_before_dispatch": 1,
+        "dropped_pending_capacity": 0,
         "effective": 1,
         "completed": 0,
         "dropped_on_departure": 0,
@@ -80,7 +87,7 @@ def test_profile_frontier_discards_strictly_dominated_points() -> None:
     scheduler.register_session("s", owner_gpu="gpu-0", now=0.0)
     scheduler.submit_action("s", ["W"], now=0.0)
 
-    candidate = scheduler.find_best(now=0.0, include_wait=False)
+    candidate = scheduler.find_best(now=0.1, include_wait=False)
 
     assert candidate is not None
     assert candidate.fidelity != "dominated"
@@ -93,7 +100,7 @@ def test_action_arriving_while_running_waits_for_next_slot() -> None:
     assert first is not None
     candidate = scheduler.find_best(now=0.0, include_wait=False)
     assert candidate is not None
-    scheduler.reserve(candidate, now=0.0)
+    scheduler.reserve(candidate, now=0.1)
 
     next_job, invalidated = scheduler.submit_action("s", ["J"], now=0.1, release=True)
 
@@ -101,6 +108,33 @@ def test_action_arriving_while_running_waits_for_next_slot() -> None:
     assert invalidated is True
     assert scheduler.session("s").in_flight == first
     assert scheduler.session("s").pending_action == next_job
+
+
+def test_multi_slot_pending_actions_preserve_fifo_order() -> None:
+    scheduler = _scheduler(pending_action_slots=4)
+    scheduler.register_session("s", owner_gpu="gpu-0", now=0.0)
+    first, _ = scheduler.submit_action("s", ["first"], now=0.0)
+    assert first is not None
+    running = scheduler.find_best(now=0.0, include_wait=False)
+    assert running is not None
+    scheduler.reserve(running, now=0.0)
+
+    queued = []
+    for index in range(3):
+        job, _ = scheduler.submit_action("s", [f"queued-{index}"], now=0.1 + index * 0.1)
+        assert job is not None
+        queued.append(job)
+
+    state = scheduler.session("s")
+    assert state.pending_action_count == 3
+    assert state.pending_action is queued[0]
+    assert tuple(state.pending_action_queue) == tuple(queued[1:])
+    assert len({job.state_version for job in queued}) == 3
+
+    scheduler.complete(running, completed_at=0.5)
+    next_candidate = scheduler.find_best(now=0.5, include_wait=False)
+    assert next_candidate is not None
+    assert next_candidate.job_ids == (queued[0].job_id,)
 
 
 def test_pending_action_waits_out_in_flight_then_becomes_runnable() -> None:
@@ -154,22 +188,32 @@ def test_in_flight_session_does_not_block_another_ready_session() -> None:
 def test_idle_video_is_consumption_gated_and_does_not_get_overwritten() -> None:
     scheduler = _scheduler()
     scheduler.register_session("s", owner_gpu="gpu-0", now=0.0)
-    idle = scheduler.create_idle_job("s", now=0.0)
+    action, _ = scheduler.submit_action("s", ["W"], now=0.0)
+    assert action is not None
+    action_candidate = scheduler.find_best(now=0.0, include_wait=False)
+    assert action_candidate is not None
+    scheduler.reserve(action_candidate, now=0.0)
+    scheduler.complete(action_candidate, completed_at=0.1)
+    scheduler.submit_action("s", [], now=0.1, release=False)
+    scheduler.defer_idle_until("s", 0.1)
+    idle = scheduler.create_idle_job("s", now=0.1)
     assert idle is not None
-    candidate = scheduler.find_best(now=0.0, include_wait=False)
+    candidate = scheduler.find_best(now=0.1, include_wait=False)
     assert candidate is not None and candidate.job_ids == (idle.job_id,)
-    scheduler.reserve(candidate, now=0.0)
+    scheduler.reserve(candidate, now=0.1)
 
-    action, _ = scheduler.submit_action("s", ["W"], now=0.1, release=True)
-    scheduler.complete(candidate, completed_at=0.2)
+    action, _ = scheduler.submit_action("s", ["W"], now=0.2, release=True)
+    scheduler.complete(candidate, completed_at=0.3)
 
     state = scheduler.session("s")
     assert action is not None
     assert state.pending_action == action
     assert state.idle_video_outstanding is True
-    assert scheduler.create_idle_job("s", now=0.2) is None
+    assert state.idle_video_held is False
+    assert scheduler.create_idle_job("s", now=1.2) is None
 
-    scheduler.set_playback_active("s", True, now=1.2)
+    scheduler.release_idle_video("s", now=1.2)
+    scheduler.set_playback_active("s", True, now=2.2)
     assert state.idle_video_outstanding is False
     # The action remains pending; it still has priority over a new sentinel.
     assert scheduler.create_idle_job("s", now=1.2) is None
@@ -178,7 +222,14 @@ def test_idle_video_is_consumption_gated_and_does_not_get_overwritten() -> None:
 def test_action_drops_only_a_pending_idle_sentinel() -> None:
     scheduler = _scheduler()
     scheduler.register_session("s", owner_gpu="gpu-0", now=0.0)
-    idle = scheduler.create_idle_job("s", now=0.0)
+    action, _ = scheduler.submit_action("s", ["W"], now=0.0)
+    candidate = scheduler.find_best(now=0.0, include_wait=False)
+    assert action is not None and candidate is not None
+    scheduler.reserve(candidate, now=0.0)
+    scheduler.complete(candidate, completed_at=0.05)
+    scheduler.submit_action("s", [], now=0.1, release=False)
+    scheduler.defer_idle_until("s", 0.1)
+    idle = scheduler.create_idle_job("s", now=0.1)
     assert idle is not None
 
     action, _ = scheduler.submit_action("s", ["W"], now=0.1, release=True)
@@ -187,7 +238,7 @@ def test_action_drops_only_a_pending_idle_sentinel() -> None:
     assert scheduler.session("s").pending_idle is None
 
 
-def test_idle_can_follow_a_completed_action_before_the_next_heartbeat() -> None:
+def test_idle_waits_for_the_action_heartbeat_window() -> None:
     scheduler = _scheduler()
     scheduler.register_session("s", owner_gpu="gpu-0", now=0.0)
     action, _ = scheduler.submit_action("s", ["W"], now=0.0, release=True)
@@ -199,8 +250,12 @@ def test_idle_can_follow_a_completed_action_before_the_next_heartbeat() -> None:
 
     idle = scheduler.create_idle_job("s", now=0.1)
 
-    assert idle is not None
+    assert idle is None
     assert scheduler.session("s").latest_controls == ("W",)
+
+    scheduler.submit_action("s", [], now=1.0, release=False)
+    idle = scheduler.create_idle_job("s", now=1.0)
+    assert idle is not None
 
 
 def test_action_and_another_sessions_idle_head_can_share_a_batch() -> None:
@@ -208,9 +263,10 @@ def test_action_and_another_sessions_idle_head_can_share_a_batch() -> None:
     scheduler.register_session("action", owner_gpu="gpu-0", now=0.0, compatibility_key=(3,))
     scheduler.register_session("idle", owner_gpu="gpu-0", now=0.0, compatibility_key=(3,))
     action, _ = scheduler.submit_action("action", ["W"], now=0.0)
-    idle = scheduler.create_idle_job("idle", now=0.0)
+    scheduler.session("idle").action_seen = True
+    idle = scheduler.create_idle_job("idle", now=0.1)
 
-    candidate = scheduler.find_best(now=0.0, include_wait=False)
+    candidate = scheduler.find_best(now=0.1, include_wait=False)
 
     assert action is not None and idle is not None
     assert candidate is not None
@@ -233,6 +289,31 @@ def test_candidate_uses_global_slack_and_same_compatibility_key() -> None:
     assert set(candidate.session_ids) == {"a", "b"}
     assert candidate.batch_size == 2
     assert candidate.projected_slack["c"] < 3.0
+
+
+def test_slack_safe_larger_batch_is_prioritized_over_singleton_score() -> None:
+    scheduler = _scheduler(max_batch_size=4)
+    for index in range(4):
+        session_id = f"batch-priority-{index}"
+        scheduler.register_session(
+            session_id,
+            owner_gpu="gpu-0",
+            now=0.0,
+            slack_seconds=2.0,
+            compatibility_key=(3,),
+        )
+        scheduler.submit_action(session_id, ["W"], now=0.0)
+
+    candidate = scheduler.find_best(now=0.0, include_wait=False)
+
+    assert candidate is not None
+    assert candidate.batch_size == 4
+    assert set(candidate.session_ids) == {
+        "batch-priority-0",
+        "batch-priority-1",
+        "batch-priority-2",
+        "batch-priority-3",
+    }
 
 
 def test_motivation_softly_balances_resident_sessions_across_idle_gpus() -> None:

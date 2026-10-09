@@ -49,6 +49,9 @@ class MotivationSearchSummary:
     selected_migration_count: int
     selected_session_ids: tuple[str, ...]
     selected_job_ids: tuple[str, ...]
+    # Total queued action jobs, including jobs behind a session's runnable
+    # head. ``ready_action_count`` remains the number of runnable heads.
+    pending_action_count: int = 0
     policy_name: str = "motivation"
 
 
@@ -112,6 +115,7 @@ class MotivationDiagnosticsCollector:
         self._ready_count = 0
         self._ready_action_count = 0
         self._ready_idle_count = 0
+        self._pending_action_count = 0
         self._excluded_ready_count = 0
         self._enumerated = Counter()
         self._compatible = Counter()
@@ -132,6 +136,7 @@ class MotivationDiagnosticsCollector:
             self._ready_count += summary.ready_count
             self._ready_action_count += summary.ready_action_count
             self._ready_idle_count += summary.ready_idle_count
+            self._pending_action_count += summary.pending_action_count
             self._excluded_ready_count += summary.excluded_ready_count
             self._add_batch_counts(self._enumerated, summary.enumerated_by_batch_size)
             self._add_batch_counts(self._compatible, summary.compatible_by_batch_size)
@@ -165,6 +170,9 @@ class MotivationDiagnosticsCollector:
                 ),
                 "mean_ready_idle_count": (
                     self._ready_idle_count / self._search_count if self._search_count else 0.0
+                ),
+                "mean_pending_action_count": (
+                    self._pending_action_count / self._search_count if self._search_count else 0.0
                 ),
                 "mean_excluded_ready_count": (
                     self._excluded_ready_count / self._search_count if self._search_count else 0.0

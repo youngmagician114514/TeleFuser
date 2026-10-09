@@ -213,6 +213,7 @@ def extract_action_lifecycle(result: Mapping[str, Any]) -> dict[str, int] | None
         for key in (
             "released",
             "superseded_before_dispatch",
+            "dropped_pending_capacity",
             "effective",
             "completed",
             "dropped_on_departure",
@@ -231,6 +232,7 @@ def collect_producer_metrics(
     *,
     released_action_jobs: int | None = None,
     superseded_action_jobs: int | None = None,
+    effective_action_jobs: int | None = None,
 ) -> dict[str, Any]:
     """Build transport-independent QoE from completed model chunks.
 
@@ -365,7 +367,11 @@ def collect_producer_metrics(
         if released_action_jobs is not None
         else completed_actions
     )
-    if superseded_action_jobs is None:
+    if effective_action_jobs is not None:
+        superseded_actions = int(superseded_action_jobs or 0)
+        action_denominator = max(0, int(effective_action_jobs))
+        action_denominator_source = "scheduler_effective_actions"
+    elif superseded_action_jobs is None:
         # Legacy traces did not record pending-action supersession.  Completed
         # action deadline attainment is the only non-fabricated post-hoc
         # denominator; keep the raw trace-release total as a separate audit
@@ -611,6 +617,9 @@ def main() -> None:
         profile_quality,
         released_action_jobs=released_action_jobs,
         superseded_action_jobs=superseded_action_jobs,
+        effective_action_jobs=(
+            action_lifecycle.get("effective") if action_lifecycle is not None else None
+        ),
     )
     producer_metrics["trace_released_action_jobs"] = trace_released_action_jobs
     if action_lifecycle is not None:

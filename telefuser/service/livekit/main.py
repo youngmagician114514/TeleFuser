@@ -53,6 +53,8 @@ def run_stream_server(
     motivation_profile: str | None = None,
     motivation_memory_free_gb: float = 80.0,
     motivation_max_batch_size: int = 4,
+    motivation_lambda_quality: float = 2.0,
+    motivation_pending_action_slots: int = 4,
     motivation_migration: bool = True,
     motivation_policy: str = "motivation",
 ) -> None:
@@ -104,6 +106,8 @@ def run_stream_server(
             dispatch=lambda _lease: None,
             scheduler_config=MotivationSchedulerConfig(
                 max_batch_size=motivation_max_batch_size,
+                lambda_quality=motivation_lambda_quality,
+                pending_action_slots=motivation_pending_action_slots,
                 # FIFO is a static-owner baseline.  The scheduler also
                 # normalizes this defensively, but keeping the entrypoint
                 # value explicit makes runtime metadata and tests unambiguous.

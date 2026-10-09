@@ -250,6 +250,14 @@ class MotivationRuntimeController:
             release=release,
         )
 
+    def defer_idle_until(self, session_id: str, not_before: float) -> None:
+        """Keep idle prefetch behind the action heartbeat boundary."""
+        self.scheduler.defer_idle_until(session_id, not_before)
+
+    def release_idle_video(self, session_id: str, *, now: float | None = None) -> None:
+        """Release a held idle chunk when a new action resumes the stream."""
+        self.scheduler.release_idle_video(session_id, now=self._observed(now))
+
     def on_gpu_update(
         self,
         gpu_id: str,

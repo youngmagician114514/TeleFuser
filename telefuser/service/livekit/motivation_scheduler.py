@@ -19,8 +19,9 @@ import itertools
 import math
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -405,11 +406,12 @@ class ActionJob:
 class SessionSchedulingState:
     """Mutable control-plane state for one retained model session.
 
-    There is at most one pending action job and one pending idle sentinel.  A
-    newer action replaces an older pending action, but it never replaces an
-    already generated idle video.  ``in_flight`` is allowed to coexist with a
-    pending action because a control update cannot cancel a running model
-    invocation.
+    ``pending_action`` is the head of a bounded FIFO action queue. The queue
+    may retain additional action jobs in ``pending_action_queue`` so a burst of
+    controls can form cross-session batches without reordering one session's
+    work. It never replaces an already generated idle video. ``in_flight`` may
+    coexist with the pending queue because a control update cannot cancel a
+    running model invocation.
     """
 
     session_id: str
@@ -425,9 +427,23 @@ class SessionSchedulingState:
     quality_weight_seconds: float = 0.0
     latest_controls: tuple[str, ...] = ()
     pending_action: ActionJob | None = None
+    pending_action_queue: deque[ActionJob] = field(default_factory=deque, repr=False)
+    pending_action_slots: int = 1
     pending_idle: ActionJob | None = None
     in_flight: ActionJob | None = None
     idle_video_remaining_seconds: float = 0.0
+    # A released action owns the following heartbeat window.  Idle work may
+    # be prefetched only after that window closes without a newer action.
+    idle_not_before: float = 0.0
+    # Idle prefetch is a resume aid for a session that has produced at least
+    # one action chunk; it must not run ahead of the user's first input.
+    action_seen: bool = False
+    # Idle output is generated ahead of time but does not consume playout
+    # slack until a later action resumes the user's stream.
+    idle_video_held: bool = False
+    # An action may resume while an idle job is still in-flight. Preserve that
+    # intent so the late idle completion cannot re-arm the hold.
+    idle_video_release_requested: bool = False
     state_version: int = 0
     migration_target_gpu: str | None = None
     migration_ready_at: float = 0.0
@@ -447,11 +463,24 @@ class SessionSchedulingState:
             raise ValueError("quality_weight_seconds must be non-negative")
         if self.last_updated_at < 0 or not math.isfinite(self.last_updated_at):
             raise ValueError("last_updated_at must be finite and non-negative")
+        if (
+            not isinstance(self.pending_action_slots, int)
+            or isinstance(self.pending_action_slots, bool)
+            or self.pending_action_slots < 1
+        ):
+            raise ValueError("pending_action_slots must be a positive integer")
+        if len(self.pending_action_queue) > max(0, self.pending_action_slots - 1):
+            raise ValueError("pending_action_queue exceeds pending_action_slots")
 
     @property
     def idle_video_outstanding(self) -> bool:
         """Whether an idle output is still waiting to be consumed."""
         return self.idle_video_remaining_seconds > EPSILON
+
+    @property
+    def pending_action_count(self) -> int:
+        """Return the number of queued actions, excluding ``in_flight``."""
+        return (1 if self.pending_action is not None else 0) + len(self.pending_action_queue)
 
     def advance_to(self, now: float) -> None:
         """Consume playback slack and any idle output until ``now``.
@@ -466,7 +495,7 @@ class SessionSchedulingState:
         elapsed = max(0.0, now - self.last_updated_at)
         if self.playback_active and not self.departed:
             self.slack_seconds -= elapsed
-            if self.idle_video_remaining_seconds > EPSILON:
+            if self.idle_video_remaining_seconds > EPSILON and not self.idle_video_held:
                 self.idle_video_remaining_seconds = max(
                     0.0, self.idle_video_remaining_seconds - elapsed
                 )
@@ -481,13 +510,13 @@ class SessionSchedulingState:
         release: bool,
         sequence: int = 0,
     ) -> bool:
-        """Update the latest controls and optionally release an action job.
+        """Update controls and enqueue one ordered action job when released.
 
         Empty controls and non-release heartbeat updates do not create jobs.
         The return value reports whether the session's ready queue transitioned
-        from no pending action to a pending action.  An in-flight job does not
-        occupy that ready slot, so an action arriving during execution still
-        invalidates a search while leaving the running job untouched.
+        from empty to non-empty. A one-slot state retains the historical
+        latest-wins behavior; multi-slot states append in arrival order. An
+        in-flight job never occupies a pending slot.
         """
         self.advance_to(now)
         canonical = tuple(sorted({str(control) for control in controls if str(control)}))
@@ -499,18 +528,52 @@ class SessionSchedulingState:
         # idle job already in flight is retained and its generated video remains
         # protected from overwrite.
         self.pending_idle = None
-        had_pending = self.pending_action is not None
-        self.state_version += 1
-        self.pending_action = ActionJob(
+        self.action_seen = True
+        self.idle_video_release_requested = True
+        self.idle_video_held = False
+        # ``sequence`` is globally monotonic when called through the
+        # scheduler. Direct state tests may omit it, so retain a local
+        # monotonic fallback. The session's current state_version remains the
+        # head version until a queued job becomes runnable.
+        next_version = max(self.state_version + 1, int(sequence) if sequence > 0 else 0)
+        job = ActionJob(
             job_id=job_id,
             session_id=self.session_id,
             kind="action",
             controls=canonical,
             created_at=now,
-            state_version=self.state_version,
+            state_version=next_version,
             sequence=sequence,
         )
+        had_pending = self.pending_action is not None
+        if self.pending_action is None:
+            self.pending_action = job
+            self.state_version = next_version
+            return True
+        if len(self.pending_action_queue) >= self.pending_action_slots - 1:
+            if self.pending_action_slots == 1:
+                # Preserve the historical single-slot/latest-wins behavior
+                # for baselines and callers that explicitly request one slot.
+                self.pending_action = job
+                self.state_version = next_version
+                return False
+            # Preserve FIFO order and accepted work. The caller records this
+            # bounded-capacity drop separately from supersession.
+            return False
+        self.pending_action_queue.append(job)
         return not had_pending
+
+    def defer_idle_until(self, not_before: float) -> None:
+        """Keep idle work behind the current action heartbeat window."""
+        if not math.isfinite(not_before) or not_before < 0:
+            raise ValueError("not_before must be finite and non-negative")
+        self.idle_not_before = max(self.idle_not_before, not_before)
+
+    def release_idle_video(self, *, now: float) -> None:
+        """Start consuming a prefetched idle chunk when action resumes."""
+        self.advance_to(now)
+        self.idle_video_release_requested = True
+        self.idle_video_held = False
 
     def create_idle_job(self, *, job_id: str, now: float, sequence: int = 0) -> ActionJob | None:
         """Create one idle sentinel if no action or idle output is pending."""
@@ -520,12 +583,17 @@ class SessionSchedulingState:
         # sentinel while it waits for the next heartbeat.  ``submit_action``
         # still drops a not-yet-dispatched sentinel when a fresh action is
         # released, so real action work always wins within the session.
-        if self.departed or self.pending_action is not None:
+        if self.departed or self.pending_action is not None or not self.action_seen:
+            return None
+        if self.latest_controls:
+            return None
+        if now < self.idle_not_before - EPSILON:
             return None
         if self.pending_idle is not None or self.in_flight is not None:
             return None
         if self.idle_video_outstanding:
             return None
+        self.idle_video_release_requested = False
         self.state_version += 1
         self.pending_idle = ActionJob(
             job_id=job_id,
@@ -553,7 +621,9 @@ class SessionSchedulingState:
         if job.kind == "action":
             if self.pending_action is None or self.pending_action.job_id != job.job_id:
                 raise RuntimeError(f"action job {job.job_id} is no longer pending")
-            self.pending_action = None
+            self.pending_action = self.pending_action_queue.popleft() if self.pending_action_queue else None
+            if self.pending_action is not None:
+                self.state_version = self.pending_action.state_version
         else:
             if self.pending_idle is None or self.pending_idle.job_id != job.job_id:
                 raise RuntimeError(f"idle job {job.job_id} is no longer pending")
@@ -575,6 +645,11 @@ class SessionSchedulingState:
         if job.kind == "action":
             if self.pending_action is None:
                 self.pending_action = job
+                self.state_version = job.state_version
+            else:
+                self.pending_action_queue.appendleft(self.pending_action)
+                self.pending_action = job
+                self.state_version = job.state_version
         elif self.pending_action is None and self.pending_idle is None and not self.departed:
             self.pending_idle = job
 
@@ -596,6 +671,8 @@ class SessionSchedulingState:
         if job.kind == "idle":
             # The next idle sentinel is gated by actual playback consumption.
             self.idle_video_remaining_seconds = output_seconds
+            self.idle_video_held = not self.idle_video_release_requested
+            self.idle_video_release_requested = False
         self.in_flight = None
         return job
 
@@ -610,6 +687,7 @@ class SessionSchedulingState:
         self.departed = True
         self.active = False
         self.pending_action = None
+        self.pending_action_queue.clear()
         self.pending_idle = None
 
 
@@ -783,6 +861,9 @@ class MotivationSchedulerConfig:
     include_idle_jobs: bool = True
     migration_enabled: bool = True
     policy_name: str = "motivation"
+    # Motivation may retain a short ordered action burst per session. Baseline
+    # policies force this back to one in ``MotivationScheduler.__init__``.
+    pending_action_slots: int = 1
     # FIFO is intentionally a fixed-execution baseline.  The paper-facing
     # baseline is pinned to the normalized S4/W18 B1 point; no quality/latency
     # trade-off is made at runtime.  A caller may still override this in a
@@ -825,6 +906,12 @@ class MotivationSchedulerConfig:
             raise TypeError("model_capabilities must be a ModelServingCapabilities instance")
         if not 1 <= self.max_batch_size <= 4:
             raise ValueError("max_batch_size must be in [1, 4]")
+        if (
+            not isinstance(self.pending_action_slots, int)
+            or isinstance(self.pending_action_slots, bool)
+            or self.pending_action_slots < 1
+        ):
+            raise ValueError("pending_action_slots must be a positive integer")
         for name in (
             "utility_cap_seconds",
             "initial_slack_seconds",
@@ -1031,6 +1118,7 @@ class MotivationScheduler:
                 lambda_quality=0.0,
                 fairness_delta=0.0,
                 migration_enabled=False,
+                pending_action_slots=1,
             )
         elif self._policy.name == "turboserve":
             # TurboServe suspends idle sessions and has no adaptive quality or
@@ -1044,6 +1132,7 @@ class MotivationScheduler:
                 include_idle_jobs=False,
                 lambda_quality=0.0,
                 fairness_delta=0.0,
+                pending_action_slots=1,
             )
         elif self._policy.name == "slackserve":
             # SlackServe schedules one sequential chunk per stream.  Its
@@ -1058,6 +1147,7 @@ class MotivationScheduler:
                 include_idle_jobs=requested_config.slackserve_include_idle_jobs,
                 lambda_quality=0.0,
                 fairness_delta=0.0,
+                pending_action_slots=1,
             )
         else:
             self.config = requested_config
@@ -1074,6 +1164,7 @@ class MotivationScheduler:
         # latest-intent supersession without hiding dispatch/runtime failures.
         self._action_jobs_released = 0
         self._action_jobs_superseded_pending = 0
+        self._action_jobs_dropped_capacity = 0
         self._action_jobs_completed = 0
         self._action_jobs_dropped_on_departure = 0
         # Paper re-homing limits are control-tick limits, not global lifetime
@@ -1263,6 +1354,7 @@ class MotivationScheduler:
                 ),
                 quality_ema=initial_quality,
                 compatibility_key=normalized_compatibility_key,
+                pending_action_slots=self.config.pending_action_slots,
                 active=active,
                 last_updated_at=observed_at,
             )
@@ -1294,15 +1386,24 @@ class MotivationScheduler:
                 release=release,
                 sequence=self._job_sequence,
             )
-            job = state.pending_action if state.pending_action is not before else None
-            if release and job is not None:
+            if state.pending_action is not before:
+                job = state.pending_action
+            else:
+                job = next(
+                    (queued for queued in state.pending_action_queue if queued.job_id == job_id),
+                    None,
+                )
+            if release:
                 self._action_jobs_released += 1
-                if before is not None:
+                if job is None:
+                    self._action_jobs_dropped_capacity += 1
+                elif before is not None and self.config.pending_action_slots == 1:
                     self._action_jobs_superseded_pending += 1
                 # Replacement changes the session version, so a candidate that
                 # captured the old job is rejected even if the global ready set
                 # did not transition from empty to non-empty.
-                self._epoch += 1 if invalidated else 0
+                if job is not None:
+                    self._epoch += 1 if invalidated else 0
             return job, invalidated
 
     def create_idle_job(
@@ -1325,6 +1426,24 @@ class MotivationScheduler:
                 self._epoch += 1
             return job
 
+    def defer_idle_until(self, session_id: str, not_before: float) -> None:
+        """Keep a session's idle head behind its next action window."""
+        with self._lock:
+            state = self._sessions[session_id]
+            state.defer_idle_until(not_before)
+            self._epoch += 1
+
+    def release_idle_video(self, session_id: str, *, now: float | None = None) -> None:
+        """Release one prefetched idle chunk when a new action resumes."""
+        observed_at = self._clock() if now is None else now
+        with self._lock:
+            observed_at = self._advance_to(observed_at)
+            state = self._sessions.get(session_id)
+            if state is None or state.departed:
+                return
+            state.release_idle_video(now=observed_at)
+            self._epoch += 1
+
     def set_playback_active(self, session_id: str, active: bool, *, now: float | None = None) -> None:
         """Pause/resume slack consumption for an explicitly paused consumer."""
         observed_at = self._clock() if now is None else now
@@ -1341,8 +1460,7 @@ class MotivationScheduler:
         with self._lock:
             observed_at = self._advance_to(observed_at)
             state = self._sessions[session_id]
-            if state.pending_action is not None:
-                self._action_jobs_dropped_on_departure += 1
+            self._action_jobs_dropped_on_departure += state.pending_action_count
             state.mark_departed(now=observed_at)
             self._epoch += 1
 
@@ -1550,6 +1668,9 @@ class MotivationScheduler:
                 ready_count=len(ready),
                 ready_action_count=sum(1 for _, job in ready if job.kind == "action"),
                 ready_idle_count=sum(1 for _, job in ready if job.kind == "idle"),
+                pending_action_count=sum(
+                    state.pending_action_count for state in snapshot_states if not state.departed
+                ),
                 excluded_ready_count=len(all_ready) - len(ready),
                 gpu_count=len(gpus),
                 include_wait=include_wait,
@@ -1915,6 +2036,9 @@ class MotivationScheduler:
                 ready_count=len(ready),
                 ready_action_count=sum(1 for _, job in ready if job.kind == "action"),
                 ready_idle_count=sum(1 for _, job in ready if job.kind == "idle"),
+                pending_action_count=sum(
+                    state.pending_action_count for state in snapshot_states if not state.departed
+                ),
                 excluded_ready_count=len(all_ready) - len(ready),
                 gpu_count=len(gpus),
                 include_wait=include_wait,
@@ -2378,6 +2502,9 @@ class MotivationScheduler:
             ready_count=len(ready),
             ready_action_count=len(ready),
             ready_idle_count=0,
+            pending_action_count=sum(
+                state.pending_action_count for state in snapshot_states if not state.departed
+            ),
             excluded_ready_count=len(all_ready) - len(ready),
             gpu_count=len(gpus),
             include_wait=False,
@@ -2793,7 +2920,7 @@ class MotivationScheduler:
         # ``best_record`` is a lightweight descriptor.  Full candidate maps
         # are materialized once, after the exhaustive score search has ended.
         best_record: tuple[
-            tuple[float, int, int, float, int],
+            tuple[int, float, int, int, float, int],
             tuple[int, ...],
             str,
             MotivationProfile,
@@ -2802,7 +2929,7 @@ class MotivationScheduler:
             int,
             float,
         ] | None = None
-        candidates_best_key: tuple[float, int, int, float, int] | None = None
+        candidates_best_key: tuple[int, float, int, int, float, int] | None = None
         enumerated = empty_batch_counts()
         compatible = empty_batch_counts()
         profiles_evaluated = empty_batch_counts()
@@ -3044,9 +3171,20 @@ class MotivationScheduler:
                             # effective for the 24-session startup burst,
                             # where a fast B1 profile dominates all larger
                             # batches under the initial one-second slack.
-                            if (
-                                candidates_best_key is not None
-                                and optimistic_bound < candidates_best_key[0] - EPSILON
+                            # Batch-priority is lexicographic over the normal
+                            # utility score.  A larger batch must therefore
+                            # not be pruned merely because its latency score
+                            # is below an already-seen B1 candidate.  The
+                            # optimistic rank assumes the batch can satisfy
+                            # its member slack; the exact safety check below
+                            # decides the final rank.
+                            optimistic_batch_rank = size if size > 1 else 0
+                            if candidates_best_key is not None and (
+                                optimistic_batch_rank < candidates_best_key[0]
+                                or (
+                                    optimistic_batch_rank == candidates_best_key[0]
+                                    and optimistic_bound < candidates_best_key[1] - EPSILON
+                                )
                             ):
                                 continue
                             finish_at = start_at + profile.latency_seconds
@@ -3059,6 +3197,7 @@ class MotivationScheduler:
                             quality_delta_sum = 0.0
                             selected_quality_sum = 0.0
                             selected_qualities: list[float] = []
+                            selected_after_slacks: list[float] = []
                             quality = profile.quality
                             for index in indexes:
                                 updated_quality = ready_quality[index] + ready_quality_rate[index] * (
@@ -3084,6 +3223,7 @@ class MotivationScheduler:
                                 if active_playback[active_idx]:
                                     before -= duration
                                 after = before + output_seconds
+                                selected_after_slacks.append(after)
                                 before_utility = before if before < utility_cap else utility_cap
                                 after_utility = after if after < utility_cap else utility_cap
                                 score += after_utility - before_utility
@@ -3095,7 +3235,19 @@ class MotivationScheduler:
                                 selected_indexes=indexes,
                                 finish_at=finish_at,
                             )
+                            # A batch is preferred only when every selected
+                            # member remains playable after its own output.
+                            # Within the same safe batch size, retain the
+                            # existing Motivation score, quality, migration,
+                            # and finish-time ordering.
+                            batch_rank = (
+                                size
+                                if size > 1
+                                and all(value >= -EPSILON for value in selected_after_slacks)
+                                else 0
+                            )
                             candidate_key = (
+                                batch_rank,
                                 score,
                                 action_count,
                                 size,
@@ -3166,7 +3318,7 @@ class MotivationScheduler:
                 finish_at=best_finish_at,
                 migration_count=best_migration_count,
                 migration_seconds=best_migration_seconds,
-                score=best_key[0],
+                score=best_key[1],
                 projected_slack=projected_slack,
                 projected_quality=projected_quality,
                 snapshot_epoch=snapshot_epoch,
@@ -3189,6 +3341,7 @@ class MotivationScheduler:
                 policy_name=policy_name,
             )
             wait_key = (
+                0,
                 wait_candidate.score,
                 wait_candidate.action_count,
                 wait_candidate.batch_size,
@@ -3207,6 +3360,9 @@ class MotivationScheduler:
             ready_count=len(ready),
             ready_action_count=sum(1 for _, job in ready if job.kind == "action"),
             ready_idle_count=sum(1 for _, job in ready if job.kind == "idle"),
+            pending_action_count=sum(
+                state.pending_action_count for state in snapshot_states if not state.departed
+            ),
             excluded_ready_count=len(all_ready) - len(ready),
             gpu_count=len(gpus),
             include_wait=include_wait,
@@ -3250,10 +3406,15 @@ class MotivationScheduler:
         except Exception:
             snapshot = {}
         with self._lock:
-            effective = self._action_jobs_released - self._action_jobs_superseded_pending
+            effective = (
+                self._action_jobs_released
+                - self._action_jobs_superseded_pending
+                - self._action_jobs_dropped_capacity
+            )
             snapshot["action_lifecycle"] = {
                 "released": self._action_jobs_released,
                 "superseded_before_dispatch": self._action_jobs_superseded_pending,
+                "dropped_pending_capacity": self._action_jobs_dropped_capacity,
                 "effective": effective,
                 "completed": self._action_jobs_completed,
                 "dropped_on_departure": self._action_jobs_dropped_on_departure,

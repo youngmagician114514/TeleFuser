@@ -83,8 +83,9 @@ class _FakeTimer:
 def test_bridge_releases_action_and_commits_on_model_output() -> None:
     controller = _controller()
     dispatched = []
+    now = [0.0]
     bridge = MotivationExecutionBridge(
-        controller, dispatch=lambda lease, payloads: dispatched.append((lease, payloads)), clock=lambda: 0.0
+        controller, dispatch=lambda lease, payloads: dispatched.append((lease, payloads)), clock=lambda: now[0]
     )
     bridge.register_session("session-1", owner_gpu="gpu-0", now=0.0)
     bridge.register_pipeline_session("session-1", "pipeline-1")
@@ -101,10 +102,14 @@ def test_bridge_releases_action_and_commits_on_model_output() -> None:
     assert payloads[0][1]["motivation"]["fidelity"] == "b1_s4_w18"
     assert controller.scheduler.session("session-1").in_flight is not None
 
+    now[0] = 1.0
     bridge.on_model_output("worker-0", "pipeline-1", {"type": "chunk"})
+    bridge.on_control_message(
+        "worker-0", "session-1", {"type": "control_state", "controls": []}
+    )
     followup = controller.scheduler.session("session-1").in_flight
     assert followup is not None and followup.kind == "idle"
-    assert controller.scheduler.session("session-1").slack_seconds > 1.0
+    assert controller.scheduler.session("session-1").slack_seconds == pytest.approx(1.0)
     assert lease.candidate.batch_size == 1
 
 
@@ -147,10 +152,11 @@ def test_bridge_commits_at_compute_trace_without_double_counting_output() -> Non
 def test_bridge_ignores_model_output_from_previous_migration_owner() -> None:
     controller = _controller()
     dispatched = []
+    now = [0.0]
     bridge = MotivationExecutionBridge(
         controller,
         dispatch=lambda lease, payloads: dispatched.append((lease, payloads)),
-        clock=lambda: 0.0,
+        clock=lambda: now[0],
     )
     bridge.register_session("session-1", owner_gpu="gpu-0", now=0.0)
     bridge.register_pipeline_session("session-1", "pipeline-1")
@@ -158,7 +164,11 @@ def test_bridge_ignores_model_output_from_previous_migration_owner() -> None:
     assert dispatched
     bridge.on_model_output("worker-1", "pipeline-1", {"type": "chunk"})
     assert controller.scheduler.session("session-1").in_flight is not None
+    now[0] = 1.0
     bridge.on_model_output("worker-0", "pipeline-1", {"type": "chunk"})
+    bridge.on_control_message(
+        "worker-0", "session-1", {"type": "control_state", "controls": []}
+    )
     followup = controller.scheduler.session("session-1").in_flight
     assert followup is not None and followup.kind == "idle"
 
@@ -166,10 +176,11 @@ def test_bridge_ignores_model_output_from_previous_migration_owner() -> None:
 def test_bridge_does_not_commit_a_newer_lease_from_a_delayed_job_output() -> None:
     controller = _controller()
     dispatched = []
+    now = [0.0]
     bridge = MotivationExecutionBridge(
         controller,
         dispatch=lambda lease, payloads: dispatched.append((lease, payloads)),
-        clock=lambda: 0.0,
+        clock=lambda: now[0],
     )
     bridge.register_session("session-1", owner_gpu="gpu-0", now=0.0)
     bridge.register_pipeline_session("session-1", "pipeline-1")
@@ -177,8 +188,16 @@ def test_bridge_does_not_commit_a_newer_lease_from_a_delayed_job_output() -> Non
         "worker-0", "session-1", {"type": "control_state", "controls": ["W"]}
     )
     first_job_id = dispatched[-1][0].jobs[0].job_id
+    now[0] = 0.75
     bridge.on_control_message(
-        "worker-0", "session-1", {"type": "control_state", "controls": ["D"]}
+        "worker-0",
+        "session-1",
+        {
+            "type": "control_state",
+            "controls": ["D"],
+            "heartbeat": True,
+            "reason": "heartbeat",
+        },
     )
 
     bridge.on_model_output(
@@ -244,25 +263,38 @@ def test_bridge_dispatches_idle_and_waits_for_published_video_before_next_idle()
     bridge.register_session("session-1", owner_gpu="gpu-0", now=0.0)
     bridge.register_pipeline_session("session-1", "pipeline-1")
 
-    bridge.on_session_ready("session-1")
+    bridge.on_control_message(
+        "worker-0", "session-1", {"type": "control_state", "controls": ["W"]}
+    )
     assert len(dispatched) == 1
-    idle_lease, idle_payloads = dispatched[0]
+    action_lease, action_payloads = dispatched[0]
+    assert action_lease.jobs[0].kind == "action"
+    assert action_payloads[0][1]["controls"] == ["W"]
+
+    now[0] = 1.0
+    bridge.on_model_output("worker-0", "pipeline-1", {"type": "chunk"})
+    bridge.on_control_message(
+        "worker-0", "session-1", {"type": "control_state", "controls": []}
+    )
+    assert len(dispatched) == 2
+    idle_lease, idle_payloads = dispatched[1]
     assert idle_lease.jobs[0].kind == "idle"
     assert idle_payloads[0][1]["controls"] == []
     assert idle_payloads[0][1]["motivation"]["kind"] == "idle"
-
     bridge.on_model_output("worker-0", "pipeline-1", {"type": "chunk"})
     assert controller.scheduler.session("session-1").idle_video_outstanding is True
-    assert len(dispatched) == 1
+    assert controller.scheduler.session("session-1").idle_video_held is True
 
-    now[0] = 0.5
-    bridge.on_chunk_published("worker-0", "session-1", 12)
-    assert len(dispatched) == 1
-
-    now[0] = 1.1
+    now[0] = 1.5
     bridge.on_chunk_published("worker-0", "session-1", 12)
     assert len(dispatched) == 2
-    assert dispatched[1][0].jobs[0].kind == "idle"
+
+    now[0] = 2.0
+    bridge.on_control_message(
+        "worker-0", "session-1", {"type": "control_state", "controls": ["D"]}
+    )
+    assert len(dispatched) == 3
+    assert dispatched[2][0].jobs[0].kind == "action"
 
 
 def test_bridge_applies_one_second_gate_to_default_control_states() -> None:
@@ -378,9 +410,7 @@ def test_bridge_forwards_empty_state_to_stop_model_admission() -> None:
         "session-1",
         {"type": "control_state", "controls": []},
     ) is False
-    assert len(dispatched) == 1
-    assert dispatched[0][0][1]["controls"] == []
-    assert dispatched[0][0][1]["motivation"]["kind"] == "idle"
+    assert len(dispatched) == 0
     assert controller.scheduler.session("session-1").pending_action is None
 
 
@@ -406,7 +436,7 @@ def test_bridge_preserves_falsey_injected_batch_gate() -> None:
     bridge.close()
 
 
-def test_bridge_caps_default_profile_window_at_heartbeat_interval(monkeypatch) -> None:
+def test_bridge_caps_default_profile_window_at_short_coalesce_window(monkeypatch) -> None:
     _FakeTimer.instances.clear()
     monkeypatch.setattr("telefuser.service.livekit.motivation_execution.threading.Timer", _FakeTimer)
     now = [0.0]
@@ -431,7 +461,7 @@ def test_bridge_caps_default_profile_window_at_heartbeat_interval(monkeypatch) -
     bridge.on_control_message("worker-0", "session-1", {"type": "control_state", "controls": ["W"]})
 
     assert len(_FakeTimer.instances) == 1
-    assert _FakeTimer.instances[0].interval == pytest.approx(0.25)
+    assert _FakeTimer.instances[0].interval == pytest.approx(0.020)
     bridge.close()
 
 
@@ -515,7 +545,7 @@ def test_bridge_uses_profile_window_for_singleton_and_dispatches_on_expiry(monke
     assert len(_FakeTimer.instances) == 1
     timer = _FakeTimer.instances[0]
     assert timer.started is True
-    assert timer.interval == pytest.approx(2 * 0.4102 - 0.7386)
+    assert timer.interval == pytest.approx(0.020)
     gate_snapshot = bridge.snapshot()["batch_gate"]
     assert gate_snapshot["enabled"] is True
     assert gate_snapshot["armed"] is True
@@ -554,7 +584,7 @@ def test_bridge_cancels_singleton_gate_when_a_compatible_peer_arrives(monkeypatc
     bridge.close()
 
 
-def test_bridge_skips_gate_when_slack_would_be_exhausted(monkeypatch) -> None:
+def test_bridge_keeps_short_gate_inside_available_slack(monkeypatch) -> None:
     _FakeTimer.instances.clear()
     monkeypatch.setattr("telefuser.service.livekit.motivation_execution.threading.Timer", _FakeTimer)
     now = [0.0]
@@ -568,8 +598,9 @@ def test_bridge_skips_gate_when_slack_would_be_exhausted(monkeypatch) -> None:
     )
     bridge.on_control_message("worker-0", "urgent", {"type": "control_state", "controls": ["W"]})
 
-    assert len(dispatched) == 1
-    assert _FakeTimer.instances == []
+    assert dispatched == []
+    assert len(_FakeTimer.instances) == 1
+    assert _FakeTimer.instances[0].interval == pytest.approx(0.020)
     bridge.close()
 
 

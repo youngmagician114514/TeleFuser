@@ -1397,6 +1397,46 @@ def test_latest_queue_discards_oldest_video_and_records_metric() -> None:
     service.stop()
 
 
+def test_idle_chunk_is_held_until_action_resume_then_keeps_fifo_order() -> None:
+    service, _ = _service(output_queue_size=2)
+    state = _ABotWorldLiveKitSession(
+        session_id="held-idle",
+        pipeline_session=_FakePipelineSession("held-idle"),
+        output_queue=queue.Queue(maxsize=2),
+        control_event=threading.Event(),
+        config={"fps": 12, "control_latent_frames": 3, "delivery_mode": "latest"},
+    )
+    idle_payload = {
+        "type": "chunk",
+        "index": 0,
+        "frames": [Image.new("RGB", (8, 8)) for _ in range(12)],
+        "scheduler": {"motivation_kind": "idle"},
+    }
+    action_payload = {
+        "type": "chunk",
+        "index": 1,
+        "frames": [Image.new("RGB", (8, 8)) for _ in range(12)],
+        "scheduler": {"motivation_kind": "action"},
+    }
+    try:
+        state.hold_idle_output = True
+        assert service._put_output(state, idle_payload)
+        assert state.output_queue.empty()
+        assert list(state.held_idle_payloads) == [idle_payload]
+
+        service._activate_policy_state(
+            state,
+            {"W": True},
+            {"kind": "action", "job_id": "action-1", "fidelity": "b1"},
+            now=time.monotonic(),
+        )
+        assert state.output_queue.get_nowait()["scheduler"]["motivation_kind"] == "idle"
+        assert service._put_output(state, action_payload)
+        assert state.output_queue.get_nowait()["scheduler"]["motivation_kind"] == "action"
+    finally:
+        service.stop()
+
+
 def test_migration_waits_for_already_generated_output_to_drain() -> None:
     service, pipeline = _service()
     service.configure_session_capacity(1)
