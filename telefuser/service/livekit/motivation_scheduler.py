@@ -2535,7 +2535,7 @@ class MotivationScheduler:
 
     @staticmethod
     def _utility(slack: float, cap: float) -> float:
-        """The simulator's ``U(P)=min(P, cap)`` utility."""
+        """Return signed playback utility; a negative value is unmet credit."""
         return min(slack, cap)
 
     def _wait_candidate(
@@ -2920,7 +2920,7 @@ class MotivationScheduler:
         # ``best_record`` is a lightweight descriptor.  Full candidate maps
         # are materialized once, after the exhaustive score search has ended.
         best_record: tuple[
-            tuple[int, float, int, int, float, int],
+            tuple[float, int, int, float, int],
             tuple[int, ...],
             str,
             MotivationProfile,
@@ -2929,7 +2929,7 @@ class MotivationScheduler:
             int,
             float,
         ] | None = None
-        candidates_best_key: tuple[int, float, int, int, float, int] | None = None
+        candidates_best_key: tuple[float, int, int, float, int] | None = None
         enumerated = empty_batch_counts()
         compatible = empty_batch_counts()
         profiles_evaluated = empty_batch_counts()
@@ -2960,6 +2960,51 @@ class MotivationScheduler:
                 profile_cache[cache_key] = profiles
             return profiles
 
+        gpu_by_id = {gpu.gpu_id: gpu for gpu in gpus}
+        owner_b1_latency: dict[str, float | None] = {}
+        batch_b1_latency: dict[tuple[str, str], float | None] = {}
+
+        def b1_latency_for_profile(
+            gpu: GpuSchedulingState, profile: MotivationProfile
+        ) -> float | None:
+            """Return the measured B1 latency in the profile's family."""
+            _, family = profile_batch_family(profile.fidelity)
+            cache_key = (gpu.gpu_id, family)
+            if cache_key not in batch_b1_latency:
+                rows = profiles_for(gpu, 1)
+                matching = tuple(
+                    row
+                    for row in rows
+                    if profile_batch_family(row.fidelity)[1] == family
+                )
+                batch_b1_latency[cache_key] = min(
+                    (row.latency_seconds for row in matching), default=None
+                )
+            return batch_b1_latency[cache_key]
+
+        def owner_finish_at(state: SessionSchedulingState, ordinal: int = 1) -> float:
+            """Predict the next singleton finish on a session's owner.
+
+            This is only the migration admissibility baseline.  The actual
+            candidate still uses the selected target batch/profile and the
+            full joint score.  A migration must beat this local continuation
+            so load-balance reward cannot justify state movement by itself.
+            """
+            owner_gpu = gpu_by_id.get(state.owner_gpu)
+            if owner_gpu is None or not owner_gpu.available:
+                # A failed/unavailable owner has no viable local
+                # continuation; migration is the recovery option.
+                return math.inf
+            if state.owner_gpu not in owner_b1_latency:
+                rows = profiles_for(owner_gpu, 1)
+                owner_b1_latency[state.owner_gpu] = (
+                    min((row.latency_seconds for row in rows), default=None)
+                )
+            latency = owner_b1_latency[state.owner_gpu]
+            if latency is None:
+                return math.inf
+            return max(observed_at, owner_gpu.free_at) + latency * max(1, ordinal)
+
         # Baseline terms are common to every profile at a given predicted
         # duration.  Keep a sorted prefix representation for the normal
         # playback-active sessions.  The old hot loop scanned every active
@@ -2977,20 +3022,42 @@ class MotivationScheduler:
         active_quality_sum = sum(state.quality_ema for state in active_states)
         active_slacks = tuple(state.slack_seconds for state in active_states)
         active_playback = tuple(state.playback_active for state in active_states)
+        # A local compute decision occupies only the GPUs present in this
+        # search. Sessions resident on another GPU continue concurrently and
+        # must not be charged this candidate's latency. A global search still
+        # sees every active session; ``find_best_local`` supplies one GPU and
+        # therefore obtains the separable per-worker objective used by the
+        # second scheduling stage.
+        objective_gpu_ids = {gpu.gpu_id for gpu in available_gpus}
+        objective_mask = tuple(
+            state.owner_gpu in objective_gpu_ids for state in active_states
+        )
         playback_slacks = sorted(
-            slack for slack, playback in zip(active_slacks, active_playback, strict=True) if playback
+            slack
+            for slack, playback, in_scope in zip(
+                active_slacks,
+                active_playback,
+                objective_mask,
+                strict=True,
+            )
+            if playback and in_scope
         )
         playback_slack_prefix = [0.0]
         for slack in playback_slacks:
             playback_slack_prefix.append(playback_slack_prefix[-1] + slack)
         paused_utility = sum(
             slack if slack < utility_cap else utility_cap
-            for slack, playback in zip(active_slacks, active_playback, strict=True)
-            if not playback
+            for slack, playback, in_scope in zip(
+                active_slacks,
+                active_playback,
+                objective_mask,
+                strict=True,
+            )
+            if not playback and in_scope
         )
 
         def baseline_utility(duration: float) -> float:
-            """Return exact system utility after ``duration`` seconds."""
+            """Return utility for the resources in this search scope."""
             threshold = utility_cap + duration
             split = bisect.bisect_left(playback_slacks, threshold)
             return (
@@ -3159,6 +3226,15 @@ class MotivationScheduler:
                         action_count = sum(ready_action_flags[index] for index in indexes)
                         active_count = len(active_states)
                         for profile, optimistic_bound in profile_bounds:
+                            if size > 1:
+                                b1_latency = b1_latency_for_profile(gpu, profile)
+                                if (
+                                    b1_latency is None
+                                    or profile.latency_seconds
+                                    >= size * b1_latency - EPSILON
+                                ):
+                                    reject("batch_no_gain")
+                                    continue
                             # A profile-level optimistic bound avoids walking
                             # every member combination once an earlier
                             # candidate is already strictly better.  The bound
@@ -3167,27 +3243,60 @@ class MotivationScheduler:
                             # ignores migration/fairness penalties.  The
                             # maximum possible load-balancing reward is added
                             # to keep pruning optimistic, so it cannot remove
-                            # a true winner.  It is especially
-                            # effective for the 24-session startup burst,
-                            # where a fast B1 profile dominates all larger
-                            # batches under the initial one-second slack.
-                            # Batch-priority is lexicographic over the normal
-                            # utility score.  A larger batch must therefore
-                            # not be pruned merely because its latency score
-                            # is below an already-seen B1 candidate.  The
-                            # optimistic rank assumes the batch can satisfy
-                            # its member slack; the exact safety check below
-                            # decides the final rank.
-                            optimistic_batch_rank = size if size > 1 else 0
+                            # a true winner.  Candidate ranking is based on
+                            # the same signed-slack objective for every batch
+                            # size; negative slack is a deficit, not a batch
+                            # admissibility condition.
                             if candidates_best_key is not None and (
-                                optimistic_batch_rank < candidates_best_key[0]
-                                or (
-                                    optimistic_batch_rank == candidates_best_key[0]
-                                    and optimistic_bound < candidates_best_key[1] - EPSILON
-                                )
+                                optimistic_bound < candidates_best_key[0] - EPSILON
                             ):
                                 continue
                             finish_at = start_at + profile.latency_seconds
+                            # Placement is part of the same decision as
+                            # batching and profile selection.  A remote
+                            # candidate is admissible only if its selected
+                            # batch/profile finishes at least one moved item
+                            # earlier than that item's serialized continuation
+                            # on its owner with the fastest measured B1 point.
+                            # This is a strict gain test, not a generic
+                            # load-balancing trigger.
+                            remote_indexes = tuple(
+                                index
+                                for index in indexes
+                                if gpu_estimates[index].required
+                            )
+                            if remote_indexes:
+                                local_finishes: list[float] = []
+                                by_owner: dict[str, list[int]] = {}
+                                for index in remote_indexes:
+                                    by_owner.setdefault(
+                                        ready_states[index].owner_gpu, []
+                                    ).append(index)
+                                for owner_indexes in by_owner.values():
+                                    owner_indexes.sort(
+                                        key=lambda index: (
+                                            ready_jobs[index].sequence,
+                                            ready_states[index].session_id,
+                                        )
+                                    )
+                                    local_finishes.extend(
+                                        owner_finish_at(state, ordinal)
+                                        for ordinal, state in enumerate(
+                                            (ready_states[index] for index in owner_indexes),
+                                            start=1,
+                                        )
+                                    )
+                                # A batch migration is useful when at least
+                                # one moved item finishes earlier than its
+                                # serialized local continuation.  Comparing
+                                # against only the first local B1 would reject
+                                # valid B2/B3 gains from one source GPU.
+                                if not any(
+                                    finish_at < local_finish - EPSILON
+                                    for local_finish in local_finishes
+                                ):
+                                    reject("migration_no_gain")
+                                    continue
                             duration = finish_at - observed_at
                             baseline_score = slack_cache.get(duration)
                             if baseline_score is None:
@@ -3197,7 +3306,6 @@ class MotivationScheduler:
                             quality_delta_sum = 0.0
                             selected_quality_sum = 0.0
                             selected_qualities: list[float] = []
-                            selected_after_slacks: list[float] = []
                             quality = profile.quality
                             for index in indexes:
                                 updated_quality = ready_quality[index] + ready_quality_rate[index] * (
@@ -3223,9 +3331,8 @@ class MotivationScheduler:
                                 if active_playback[active_idx]:
                                     before -= duration
                                 after = before + output_seconds
-                                selected_after_slacks.append(after)
-                                before_utility = before if before < utility_cap else utility_cap
-                                after_utility = after if after < utility_cap else utility_cap
+                                before_utility = self._utility(before, utility_cap)
+                                after_utility = self._utility(after, utility_cap)
                                 score += after_utility - before_utility
                             score += lambda_quality * selected_quality_sum
                             # Penalize both transfer count and predicted transfer time.
@@ -3235,19 +3342,7 @@ class MotivationScheduler:
                                 selected_indexes=indexes,
                                 finish_at=finish_at,
                             )
-                            # A batch is preferred only when every selected
-                            # member remains playable after its own output.
-                            # Within the same safe batch size, retain the
-                            # existing Motivation score, quality, migration,
-                            # and finish-time ordering.
-                            batch_rank = (
-                                size
-                                if size > 1
-                                and all(value >= -EPSILON for value in selected_after_slacks)
-                                else 0
-                            )
                             candidate_key = (
-                                batch_rank,
                                 score,
                                 action_count,
                                 size,
@@ -3318,7 +3413,7 @@ class MotivationScheduler:
                 finish_at=best_finish_at,
                 migration_count=best_migration_count,
                 migration_seconds=best_migration_seconds,
-                score=best_key[1],
+                score=best_key[0],
                 projected_slack=projected_slack,
                 projected_quality=projected_quality,
                 snapshot_epoch=snapshot_epoch,
@@ -3341,7 +3436,6 @@ class MotivationScheduler:
                 policy_name=policy_name,
             )
             wait_key = (
-                0,
                 wait_candidate.score,
                 wait_candidate.action_count,
                 wait_candidate.batch_size,

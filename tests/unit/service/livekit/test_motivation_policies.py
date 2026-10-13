@@ -61,6 +61,20 @@ def _turboserve_scheduler(*, migration_enabled: bool = True) -> MotivationSchedu
     return scheduler
 
 
+def _idle_sentinel_after_action(scheduler: MotivationScheduler, session_id: str) -> object:
+    """Build an idle sentinel through the real action-completion contract."""
+    action, _ = scheduler.submit_action(session_id, ["W"], now=0.0)
+    assert action is not None
+    candidate = scheduler.find_best(now=0.0, include_wait=False)
+    assert candidate is not None
+    scheduler.reserve(candidate, now=0.0)
+    scheduler.complete(candidate, completed_at=0.4)
+    # The action heartbeat is over; an empty control update permits idle
+    # prefetch while policy-specific include_idle filtering remains active.
+    scheduler.submit_action(session_id, [], now=0.4, release=False)
+    return scheduler.create_idle_job(session_id, now=0.4)
+
+
 def test_turboserve_preserves_balanced_owners_and_dispatches_singletons() -> None:
     scheduler = _turboserve_scheduler(migration_enabled=True)
     owners = ("gpu-0", "gpu-1", "gpu-0", "gpu-1", "gpu-0", "gpu-1")
@@ -102,9 +116,9 @@ def test_turboserve_is_not_motivation_quality_or_idle_mode() -> None:
     assert scheduler.config.lambda_quality == 0.0
     assert scheduler.config.fairness_delta == 0.0
     scheduler.register_session("idle", owner_gpu="gpu-0", now=0.0)
-    idle = scheduler.create_idle_job("idle", now=0.0)
+    idle = _idle_sentinel_after_action(scheduler, "idle")
     assert idle is not None
-    assert scheduler.find_best(now=0.0, include_wait=False) is None
+    assert scheduler.find_best(now=0.4, include_wait=False) is None
 
 
 def test_turboserve_migrates_only_after_minmax_gain_is_positive() -> None:
@@ -176,9 +190,9 @@ def test_fifo_does_not_call_the_motivation_search(monkeypatch) -> None:
 def test_fifo_never_dispatches_idle_only_work() -> None:
     scheduler = _scheduler("fifo")
     scheduler.register_session("idle", owner_gpu="gpu-0", now=0.0)
-    idle_job = scheduler.create_idle_job("idle", now=0.0)
+    idle_job = _idle_sentinel_after_action(scheduler, "idle")
 
-    candidate = scheduler.find_best(now=0.0, include_wait=True)
+    candidate = scheduler.find_best(now=0.4, include_wait=True)
 
     assert idle_job is not None
     assert candidate is None
@@ -254,10 +268,10 @@ def test_fifo_prioritizes_action_over_an_older_idle_sentinel() -> None:
     scheduler = _scheduler("fifo")
     scheduler.register_session("idle", owner_gpu="gpu-0", now=0.0)
     scheduler.register_session("action", owner_gpu="gpu-0", now=0.0)
-    idle_job = scheduler.create_idle_job("idle", now=0.0)
-    action_job, _ = scheduler.submit_action("action", ["W"], now=0.1)
+    idle_job = _idle_sentinel_after_action(scheduler, "idle")
+    action_job, _ = scheduler.submit_action("action", ["W"], now=0.5)
 
-    candidate = scheduler.find_best(now=0.1, include_wait=False)
+    candidate = scheduler.find_best(now=0.5, include_wait=False)
 
     assert idle_job is not None and action_job is not None
     assert candidate is not None

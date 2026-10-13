@@ -200,6 +200,7 @@ class LiveKitServeRuntime:
                 dispatch=self._dispatch_motivation_batch,
                 release_policy=motivation_release_policy or release_on_control_state,
                 heartbeat_interval_seconds=config.action_collection_window_seconds,
+                phase_sync_action_release=config.action_phase_sync_enabled,
                 placement_interval_seconds=(
                     config.motivation_placement_interval_seconds
                     if motivation_controller.scheduler.policy_name == "motivation"

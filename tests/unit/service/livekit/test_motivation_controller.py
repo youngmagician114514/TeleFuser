@@ -130,6 +130,42 @@ def test_controller_reserves_and_completes_local_dispatch() -> None:
     assert controller.on_completion(lease, completed_at=0.4)[0].session_id == "s"
 
 
+def test_stage_two_uses_each_free_gpu_without_cross_gpu_slack_penalty() -> None:
+    profiles = [
+        MotivationProfile(1, "family", 0.40, 0.8, 20.0),
+        MotivationProfile(2, "family", 0.70, 0.8, 30.0),
+        MotivationProfile(4, "family", 1.20, 0.8, 40.0),
+    ]
+    scheduler = MotivationScheduler(
+        StaticMotivationProfileTable(profiles),
+        config=MotivationSchedulerConfig(max_batch_size=4),
+    )
+    scheduler.add_gpu(GpuSchedulingState("gpu-0", memory_free_gb=80.0))
+    scheduler.add_gpu(GpuSchedulingState("gpu-1", memory_free_gb=80.0))
+    for index in range(8):
+        session_id = f"stage-two-{index}"
+        scheduler.register_session(
+            session_id,
+            owner_gpu="gpu-0" if index < 4 else "gpu-1",
+            now=0.0,
+            slack_seconds=-3.0,
+            compatibility_key=(1,),
+        )
+        scheduler.submit_action(session_id, ["W"], now=0.0)
+
+    leases = []
+    controller = MotivationRuntimeController(scheduler, dispatch=leases.append)
+
+    first = controller.schedule_once(now=0.0, run_placement=False)
+    second = controller.schedule_once(now=0.0, run_placement=False)
+
+    assert first is not None and second is not None
+    assert first.candidate.gpu_id == "gpu-0"
+    assert second.candidate.gpu_id == "gpu-1"
+    assert first.candidate.batch_size == 4
+    assert second.candidate.batch_size == 4
+
+
 def test_motivation_compute_stage_keeps_balanced_session_local() -> None:
     scheduler = _make_scheduler()
     scheduler.add_gpu(GpuSchedulingState("gpu-1", free_at=0.0, memory_free_gb=80.0))

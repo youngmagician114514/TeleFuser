@@ -344,6 +344,7 @@ class MotivationRuntimeController:
                         now=search_at,
                         include_wait=False,
                         exclude_session_ids=pending_migrations,
+                        immediate_only=True,
                     )
                 return self.scheduler.find_best(
                     now=search_at,
@@ -366,6 +367,7 @@ class MotivationRuntimeController:
                         exclude_session_ids=self._migration_filters(
                             now=self.scheduler.current_time
                         )[0],
+                        immediate_only=True,
                     )
                 return self.scheduler.find_best(
                     now=self.scheduler.current_time,
@@ -387,13 +389,15 @@ class MotivationRuntimeController:
         now: float | None = None,
         include_wait: bool = False,
         exclude_session_ids: Iterable[str] = (),
+        immediate_only: bool = False,
     ) -> DispatchCandidate | None:
-        """Choose one local Motivation candidate without placement search.
+        """Choose one stage-two candidate from a worker-local ready queue.
 
-        Each free GPU searches only its committed resident sessions.  The
-        searches are independent and read-only; the existing versioned
-        reservation remains the sole commit point, so a stale result is simply
-        discarded without introducing a scheduler-wide lock or barrier.
+        Placement owns session-to-GPU assignment. Compute selection therefore
+        compares batch/profile choices only among sessions already resident
+        on one worker. Independent GPUs are separable resources: dispatching
+        on one must not charge its latency to sessions that another GPU can
+        serve concurrently.
         """
         if self.scheduler.policy_name != "motivation":
             return self.scheduler.find_best(
@@ -403,31 +407,38 @@ class MotivationRuntimeController:
                 allow_migrations=False,
             )
         observed_at = self._observed(now)
-        excluded = {str(value) for value in exclude_session_ids}
-        candidates: list[DispatchCandidate] = []
-        for gpu in self._immediate_gpu_states(now=observed_at):
-            if gpu.reserved_memory_gb > EPSILON:
-                continue
-            candidate = self.scheduler.find_best_local(
-                gpu.gpu_id,
-                now=observed_at,
-                include_wait=False,
-                exclude_session_ids=excluded,
+        pending_migrations, _ = self._migration_filters(now=observed_at)
+        excluded = tuple({str(value) for value in exclude_session_ids}.union(pending_migrations))
+        gpus = (
+            self._immediate_gpu_states(now=observed_at)
+            if immediate_only
+            else tuple(gpu for gpu in self.scheduler.gpus() if gpu.available)
+        )
+        candidates = tuple(
+            candidate
+            for gpu in sorted(gpus, key=lambda state: state.gpu_id)
+            if (
+                candidate := self.scheduler.find_best_local(
+                    gpu.gpu_id,
+                    now=observed_at,
+                    include_wait=include_wait,
+                    exclude_session_ids=excluded,
+                )
             )
-            if candidate is not None:
-                candidates.append(candidate)
-        if candidates:
-            return max(
-                candidates,
-                key=lambda candidate: (
-                    candidate.score,
-                    candidate.action_count,
-                    candidate.batch_size,
-                    -candidate.finish_at,
-                    candidate.gpu_id or "",
-                ),
-            )
-        return None
+            is not None
+        )
+        if not candidates:
+            return None
+        # The drain loop fills the other independent GPUs in this scheduling
+        # turn. Earliest completion only defines deterministic dispatch order.
+        return min(
+            candidates,
+            key=lambda candidate: (
+                candidate.start_at,
+                candidate.finish_at,
+                candidate.gpu_id or "",
+            ),
+        )
 
     def schedule_once(
         self,
@@ -438,10 +449,9 @@ class MotivationRuntimeController:
     ) -> DispatchLease | None:
         """Search synchronously and dispatch one current candidate if possible.
 
-        ``run_placement`` gates Motivation's global stage-one rehoming pass.
-        The default remains enabled for standalone callers and tests; the
-        LiveKit bridge disables it for ordinary action/output callbacks and
-        enables it from its periodic placement tick.
+        ``run_placement`` controls stage one. Normal action/completion events
+        run only the worker-local compute stage; the periodic placement tick
+        may additionally initiate one deadline-improving migration.
         """
         observed_at = self._observed(now)
         # A backend may expose readiness without installing a callback (the
@@ -451,25 +461,20 @@ class MotivationRuntimeController:
         self._commit_ready_migrations(observed_at)
         if not self._fifo_mode:
             self._ensure_idle_jobs(now=observed_at)
+        if run_placement and self.scheduler.policy_name == "motivation":
+            self.run_placement_once(now=observed_at)
         pending_migrations, blocked_migrations = self._migration_filters(now=observed_at)
-        # Motivation is deliberately split into a cheap placement phase and a
-        # local compute phase.  Baselines retain their original policy-owned
-        # search path below.
+        # Stage one has already run only on a placement tick. The normal path
+        # now performs stage-two worker-local batch/profile search.
         if self.scheduler.policy_name == "motivation":
-            if (
-                run_placement
-                and self.migration_manager is not None
-                and self.migration_backend_factory is not None
-            ):
-                self._run_placement(
-                    observed_at,
-                    pending_migrations=pending_migrations,
-                    blocked_migrations=blocked_migrations,
-                )
             candidate = self.find_compute_candidate(
                 now=observed_at,
                 include_wait=False,
+                # A blocked session may still run on its current owner; only
+                # an already active migration must be excluded from a fresh
+                # candidate snapshot.
                 exclude_session_ids=pending_migrations,
+                immediate_only=True,
             )
             if candidate is None:
                 return None
@@ -503,6 +508,7 @@ class MotivationRuntimeController:
                 now=fallback_now,
                 include_wait=False,
                 exclude_session_ids=self._migration_filters(now=fallback_now)[0],
+                immediate_only=True,
             )
         else:
             fallback = self.scheduler.find_best(
@@ -558,7 +564,11 @@ class MotivationRuntimeController:
         return tuple(
             gpu
             for gpu in self.scheduler.gpus()
-            if gpu.available and gpu.free_at <= now + EPSILON
+            if (
+                gpu.available
+                and gpu.free_at <= now + EPSILON
+                and gpu.reserved_memory_gb <= EPSILON
+            )
         )
 
     def pending_migration_sessions(self) -> tuple[str, ...]:
@@ -901,44 +911,24 @@ class MotivationRuntimeController:
         return not migration_started_or_committed
 
     def run_placement_once(self, *, now: float | None = None) -> bool:
-        """Run Motivation's stage-one rehoming pass without selecting compute.
-
-        The LiveKit bridge calls this only from its periodic placement tick;
-        action and output callbacks continue directly to the local compute
-        stage.  Ready transfers are committed first so placement observes the
-        latest owner map.
-        """
+        """Run one stage-one deadline-improving placement decision."""
         observed_at = self._observed(now)
         self._commit_ready_migrations(observed_at)
         pending_migrations, blocked_migrations = self._migration_filters(now=observed_at)
-        return self._run_placement(
-            observed_at,
-            pending_migrations=pending_migrations,
-            blocked_migrations=blocked_migrations,
-        )
-
-    def _run_placement(
-        self,
-        observed_at: float,
-        *,
-        pending_migrations: Iterable[str],
-        blocked_migrations: Iterable[str],
-    ) -> bool:
-        """Start at most one placement candidate from an existing snapshot."""
         if (
             self.scheduler.policy_name != "motivation"
             or self.migration_manager is None
             or self.migration_backend_factory is None
         ):
             return False
-        placement = self.scheduler.plan_rehoming(
+        decision = self.scheduler.plan_rehoming(
             now=observed_at,
-            blocked_session_ids=(*pending_migrations, *blocked_migrations),
+            blocked_session_ids=tuple(set(pending_migrations).union(blocked_migrations)),
         )
-        if placement is None:
+        if decision is None:
             return False
-        migration_candidate = self.scheduler.placement_candidate(placement)
-        self.dispatch_candidate(migration_candidate, now=observed_at)
+        candidate = self.scheduler.placement_candidate(decision)
+        self.dispatch_candidate(candidate, now=observed_at)
         return True
 
     def _notify_migration_wakeup(self) -> None:

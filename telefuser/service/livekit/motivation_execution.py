@@ -120,6 +120,7 @@ class MotivationExecutionBridge:
         dispatch: ControlDispatch,
         release_policy: ReleasePolicy = release_on_control_state,
         heartbeat_interval_seconds: float = 0.5,
+        phase_sync_action_release: bool = False,
         clock: Callable[[], float] = time.monotonic,
         batch_gate: MotivationBatchGate | None = None,
         enable_batch_gate: bool = True,
@@ -133,6 +134,9 @@ class MotivationExecutionBridge:
         self.release_policy = release_policy
         self._heartbeat_interval_seconds = float(heartbeat_interval_seconds)
         self._clock = clock
+        if not isinstance(phase_sync_action_release, bool):
+            raise TypeError("phase_sync_action_release must be a bool")
+        self._phase_sync_action_release = phase_sync_action_release
         if not isinstance(enable_batch_gate, bool):
             raise TypeError("enable_batch_gate must be a bool")
         if not isinstance(defer_scheduling, bool):
@@ -208,6 +212,15 @@ class MotivationExecutionBridge:
         self._lock = threading.RLock()
         self._controls: dict[str, set[str]] = {}
         self._next_release_at: dict[str, float] = {}
+        # Raw controls may arrive at arbitrary times.  A single shared timer
+        # releases all sessions admitted to the current phase with their
+        # latest control state, so the release boundary is common without
+        # forcing the input producers to synchronize.
+        self._phase_pending_sessions: set[str] = set()
+        self._phase_timer: threading.Timer | None = None
+        self._phase_deadline: float | None = None
+        self._phase_origin: float | None = None
+        self._phase_generation = 0
         self._pipeline_to_session: dict[str, str] = {}
         self._leases: dict[str, _LeaseProgress] = {}
         self._job_to_lease: dict[str, str] = {}
@@ -248,6 +261,7 @@ class MotivationExecutionBridge:
         message_type = str(chunk.get("type", ""))
         if message_type == "stop":
             self.controller.on_session_departed(session_id, now=self._clock())
+            self._cancel_phase_session(session_id)
             return False
         if message_type not in {"control_state", "control"}:
             return False
@@ -265,16 +279,36 @@ class MotivationExecutionBridge:
             trace_release_metadata = "heartbeat" in chunk or "reason" in chunk
             if not trace_release_metadata:
                 release = release and self._heartbeat_window_allows(session_id, observed_at)
-        self.controller.on_action(
-            session_id,
-            controls,
-            now=observed_at,
-            # An empty state must reach the ABot service so it stops admitting
-            # new model work; it never creates an action job.
-            release=release and bool(controls),
-        )
+        if self._phase_sync_action_release:
+            # Keep latest_controls current immediately, but defer creation of
+            # the action Job until the next shared phase boundary.  This is
+            # deliberately one update per session per phase, so intermediate
+            # control transitions are coalesced without reordering sessions.
+            self.controller.on_action(
+                session_id,
+                controls,
+                now=observed_at,
+                release=False,
+            )
+            if controls and release:
+                with self._lock:
+                    self._phase_pending_sessions.add(session_id)
+                self._arm_phase_release(observed_at)
+            elif not controls:
+                self._cancel_phase_session(session_id)
+        else:
+            self.controller.on_action(
+                session_id,
+                controls,
+                now=observed_at,
+                # An empty state must reach the ABot service so it stops admitting
+                # new model work; it never creates an action job.
+                release=release and bool(controls),
+            )
+        phase_release = self._phase_sync_action_release and bool(controls) and release
         if (
             release
+            and not self._phase_sync_action_release
             and controls
             and getattr(self.controller.scheduler, "policy_name", "motivation") == "motivation"
         ):
@@ -296,9 +330,96 @@ class MotivationExecutionBridge:
             # unrelated completion/publication callback.
             self._schedule()
             return False
+        if phase_release:
+            # The actual controller submission is performed by the shared
+            # phase timer. The input event itself is consumed by this bridge.
+            return True
         if release:
             self._schedule()
         return True
+
+    def _next_phase_boundary_locked(self, observed_at: float) -> float:
+        """Return the next shared release boundary for one observed input."""
+
+        if self._phase_origin is None:
+            self._phase_origin = observed_at
+        elapsed = max(0.0, observed_at - self._phase_origin)
+        periods = math.floor(elapsed / self._heartbeat_interval_seconds) + 1
+        return self._phase_origin + periods * self._heartbeat_interval_seconds
+
+    def _arm_phase_release(self, observed_at: float) -> None:
+        """Arm one timer for all sessions waiting on the current phase."""
+
+        with self._lock:
+            if not self._phase_pending_sessions or self._schedule_closed:
+                return
+            if self._phase_timer is not None:
+                return
+            deadline = self._next_phase_boundary_locked(observed_at)
+            self._phase_deadline = deadline
+            self._phase_generation += 1
+            generation = self._phase_generation
+            delay = max(1e-6, deadline - self._clock())
+            timer = threading.Timer(delay, self._flush_phase_release, args=(generation,))
+            timer.daemon = True
+            self._phase_timer = timer
+        timer.start()
+
+    def _cancel_phase_session(self, session_id: str) -> None:
+        """Remove a departed/empty session from the pending phase."""
+
+        timer: threading.Timer | None = None
+        with self._lock:
+            self._phase_pending_sessions.discard(session_id)
+            if not self._phase_pending_sessions and self._phase_timer is not None:
+                timer = self._phase_timer
+                self._phase_timer = None
+                self._phase_deadline = None
+                self._phase_generation += 1
+        if timer is not None:
+            timer.cancel()
+
+    def _flush_phase_release(self, generation: int) -> None:
+        """Release the latest action of every session at one common boundary."""
+
+        with self._lock:
+            if generation != self._phase_generation:
+                return
+            self._phase_timer = None
+            self._phase_deadline = None
+            session_ids = tuple(sorted(self._phase_pending_sessions))
+            self._phase_pending_sessions.clear()
+        observed_at = self._clock()
+        released = False
+        for session_id in session_ids:
+            with self._lock:
+                controls = tuple(sorted(self._controls.get(session_id, ())))
+            if not controls:
+                continue
+            try:
+                self.controller.on_action(
+                    session_id,
+                    controls,
+                    now=observed_at,
+                    release=True,
+                )
+            except KeyError:
+                # Session teardown can race the phase timer. The departure
+                # path owns cleanup; a stale phase member is simply skipped.
+                continue
+            released = True
+            if getattr(self.controller.scheduler, "policy_name", "motivation") == "motivation":
+                self.controller.release_idle_video(session_id, now=observed_at)
+                self.controller.defer_idle_until(
+                    session_id,
+                    observed_at + self._heartbeat_interval_seconds,
+                )
+        if released:
+            self._schedule()
+        with self._lock:
+            pending = bool(self._phase_pending_sessions)
+        if pending:
+            self._arm_phase_release(observed_at)
 
     def on_model_output(
         self,
@@ -603,6 +724,7 @@ class MotivationExecutionBridge:
         # jobs are not stranded until a later scheduler event.
         self._fail_lease_for_session(session_id, _SESSION_DEPARTED_ERROR)
         self._cancel_batch_gate()
+        self._cancel_phase_session(session_id)
         with self._lock:
             timer = self._idle_wakeup_timers.pop(session_id, None)
             if timer is not None:
@@ -619,6 +741,14 @@ class MotivationExecutionBridge:
         """Close timers, deferred scheduling, and controller resources."""
 
         self._cancel_batch_gate()
+        with self._lock:
+            phase_timer = self._phase_timer
+            self._phase_timer = None
+            self._phase_deadline = None
+            self._phase_pending_sessions.clear()
+            self._phase_generation += 1
+        if phase_timer is not None:
+            phase_timer.cancel()
         with self._lock:
             timers = tuple(self._idle_wakeup_timers.values())
             self._idle_wakeup_timers.clear()
@@ -848,17 +978,15 @@ class MotivationExecutionBridge:
         """Run one policy search/dispatch round and return its lease, if any."""
         observed_at = self._clock()
         try:
-            # Keep stage one independent from the action batching gate. A
-            # periodic placement tick must still evaluate rehoming when a
-            # singleton action is waiting for a compatible peer; only the
-            # stage-two compute dispatch is gated.
-            if force_placement:
-                self.controller.run_placement_once(now=observed_at)
-            if not force_batch_gate and self._defer_singleton_action(observed_at):
+            if (
+                not force_batch_gate
+                and not force_placement
+                and self._defer_singleton_action(observed_at)
+            ):
                 return None
             lease = self.controller.schedule_once(
                 now=observed_at,
-                run_placement=False,
+                run_placement=force_placement,
             )
         except Exception:
             logger.exception("Motivation scheduling callback failed")
@@ -1079,7 +1207,7 @@ class MotivationExecutionBridge:
         timer.start()
 
     def _placement_tick(self, generation: int) -> None:
-        """Run one rehoming pass, then arm the next pass without blocking compute."""
+        """Run one joint placement/compute wakeup, then re-arm the timer."""
         with self._lock:
             if generation != self._placement_generation or self._schedule_closed:
                 return
@@ -1151,6 +1279,13 @@ class MotivationExecutionBridge:
                 "tick_count": self._placement_tick_count,
                 "armed": self._placement_timer is not None,
             }
+            phase_stats = {
+                "enabled": self._phase_sync_action_release,
+                "interval_seconds": self._heartbeat_interval_seconds,
+                "pending_sessions": len(self._phase_pending_sessions),
+                "deadline": self._phase_deadline,
+                "armed": self._phase_timer is not None,
+            }
         with self._schedule_guard:
             immediate_drain_stats = {
                 "running": self._schedule_running,
@@ -1208,6 +1343,7 @@ class MotivationExecutionBridge:
             "controls": controls,
             "next_release_at": next_release_at,
             "batch_gate": batch_gate_stats,
+            "phase_sync": phase_stats,
             "placement": placement_stats,
             "immediate_drain": immediate_drain_stats,
             "diagnostics": self.controller.diagnostics_snapshot(),

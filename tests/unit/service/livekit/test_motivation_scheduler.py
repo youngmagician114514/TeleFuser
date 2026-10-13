@@ -316,13 +316,72 @@ def test_slack_safe_larger_batch_is_prioritized_over_singleton_score() -> None:
     }
 
 
-def test_motivation_softly_balances_resident_sessions_across_idle_gpus() -> None:
-    """A comparable remote candidate should use an idle worker.
+def test_negative_slack_still_uses_a_throughput_winning_batch() -> None:
+    """Signed slack deficits must not make a valid batch ineligible.
 
-    Timeline-only placement cannot see this imbalance after a worker has gone
-    idle.  The Motivation load term includes resident sessions, so the first
-    of several otherwise identical jobs is moved to the empty worker.  FIFO
-    and the other baseline policies do not use this objective.
+    Both members remain below zero after the invocation.  The B2 profile is
+    nevertheless the same objective's winner because it returns more output
+    than two serialized B1 invocations.  This is a regression test for the
+    old lexicographic ``safe batch`` rank, which silently forced B1 whenever
+    projected slack was negative.
+    """
+    scheduler = MotivationScheduler(
+        StaticMotivationProfileTable(
+            [
+                MotivationProfile(1, "family", 0.40, 0.8, 20.0, output_seconds=0.68),
+                MotivationProfile(2, "family", 0.70, 0.8, 30.0, output_seconds=1.20),
+            ]
+        ),
+        config=MotivationSchedulerConfig(max_batch_size=2),
+    )
+    scheduler.add_gpu(GpuSchedulingState("gpu-0", memory_free_gb=80.0))
+    for index in range(2):
+        session_id = f"negative-batch-{index}"
+        scheduler.register_session(
+            session_id,
+            owner_gpu="gpu-0",
+            now=0.0,
+            slack_seconds=-1.0,
+            compatibility_key=(1,),
+        )
+        scheduler.submit_action(session_id, ["W"], now=0.0, release=True)
+
+    candidate = scheduler.find_best(now=0.0, include_wait=False)
+
+    assert candidate is not None
+    assert candidate.batch_size == 2
+    assert all(value < 0.0 for value in candidate.projected_slack.values())
+
+
+def test_batch_without_measured_throughput_gain_is_not_selected() -> None:
+    scheduler = MotivationScheduler(
+        StaticMotivationProfileTable(
+            [
+                MotivationProfile(1, "b1_family", 0.40, 0.8, 20.0),
+                MotivationProfile(2, "b2_family", 0.85, 0.8, 30.0),
+            ]
+        ),
+        config=MotivationSchedulerConfig(max_batch_size=2),
+    )
+    scheduler.add_gpu(GpuSchedulingState("gpu-0", memory_free_gb=80.0))
+    for index in range(2):
+        sid = f"no-gain-{index}"
+        scheduler.register_session(sid, owner_gpu="gpu-0", now=0.0, compatibility_key=(1,))
+        scheduler.submit_action(sid, ["W"], now=0.0)
+
+    candidate = scheduler.find_best(now=0.0, include_wait=False)
+
+    assert candidate is not None
+    assert candidate.batch_size == 1
+    assert candidate.fidelity == "b1_family"
+
+
+def test_motivation_does_not_migrate_for_load_balance_without_finish_gain() -> None:
+    """Resident imbalance alone must not trigger a state transfer.
+
+    Placement is part of the compute candidate now.  Even with a positive
+    load-balance weight, a remote candidate is rejected when its selected
+    batch/profile is no earlier than the fastest local B1 continuation.
     """
     profile = MotivationProfile(1, "fixed", 0.4, 0.8, 20.0)
     scheduler = MotivationScheduler(
@@ -345,8 +404,39 @@ def test_motivation_softly_balances_resident_sessions_across_idle_gpus() -> None
     candidate = scheduler.find_best(now=0.0, include_wait=False)
 
     assert candidate is not None
+    assert candidate.gpu_id == "gpu-0"
+    assert candidate.migration_count == 0
+
+
+def test_motivation_joint_search_migrates_when_selected_target_finishes_earlier() -> None:
+    """The joint candidate may migrate when the chosen target profile wins."""
+    profiles = StaticMotivationProfileTable(
+        [
+            MotivationProfile(1, "fixed", 0.40, 0.8, 20.0),
+            MotivationProfile(1, "fixed", 0.10, 0.8, 20.0, gpu_id="gpu-1"),
+        ]
+    )
+    scheduler = MotivationScheduler(
+        profiles,
+        config=MotivationSchedulerConfig(
+            max_batch_size=1,
+            lambda_quality=0.0,
+            lambda_migration=0.0,
+            lambda_load_balance=0.0,
+        ),
+        migration_estimator=LocalMigrationEstimator(first_layer_ready_seconds=0.0),
+    )
+    scheduler.add_gpu(GpuSchedulingState("gpu-0", memory_free_gb=80.0))
+    scheduler.add_gpu(GpuSchedulingState("gpu-1", memory_free_gb=80.0))
+    scheduler.register_session("urgent", owner_gpu="gpu-0", now=0.0)
+    scheduler.submit_action("urgent", ["W"], now=0.0)
+
+    candidate = scheduler.find_best(now=0.0, include_wait=False)
+
+    assert candidate is not None
     assert candidate.gpu_id == "gpu-1"
     assert candidate.migration_count == 1
+    assert candidate.fidelity == "fixed"
 
 
 def test_two_stage_placement_has_no_compute_profile_and_local_search_stays_local() -> None:

@@ -58,6 +58,13 @@ class LiveKitServeConfig(BaseSettings):
             "this does not change the one-second model output/playback block"
         ),
     )
+    action_phase_sync_enabled: bool = Field(
+        default=True,
+        description=(
+            "Release sampled action jobs on shared collection-window phase boundaries; "
+            "raw control arrival times remain independent"
+        ),
+    )
     autoscaling_enabled: bool = Field(default=False, description="Dynamically load configured GPU workers")
     autoscaling_min_workers: int = Field(default=1, ge=1, le=64)
     autoscaling_target_utilization: float = Field(default=0.75, gt=0, le=1)

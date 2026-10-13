@@ -369,6 +369,56 @@ def test_bridge_trusts_trace_heartbeat_cadence_without_local_regating() -> None:
     assert bridge.snapshot()["next_release_at"] == {}
 
 
+def test_bridge_phase_sync_releases_latest_actions_at_one_shared_boundary(
+    monkeypatch,
+) -> None:
+    _FakeTimer.instances.clear()
+    monkeypatch.setattr("telefuser.service.livekit.motivation_execution.threading.Timer", _FakeTimer)
+    now = [0.1]
+    controller = _batch_controller(now, include_idle_jobs=False)
+    dispatched = []
+    bridge = MotivationExecutionBridge(
+        controller,
+        dispatch=lambda lease, payloads: dispatched.append((lease, payloads)),
+        heartbeat_interval_seconds=0.5,
+        phase_sync_action_release=True,
+        clock=lambda: now[0],
+    )
+    for session_id in ("session-1", "session-2"):
+        bridge.register_session(session_id, owner_gpu="gpu-0", now=0.0)
+
+    bridge.on_control_message(
+        "worker-0", "session-1", {"type": "control_state", "controls": ["W"]}
+    )
+    assert dispatched == []
+    phase_timer = _FakeTimer.instances[-1]
+    assert phase_timer.interval == pytest.approx(0.5)
+
+    # Intermediate input changes only update the latest state for this phase.
+    now[0] = 0.2
+    bridge.on_control_message(
+        "worker-0", "session-1", {"type": "control_state", "controls": ["A"]}
+    )
+
+    # The second user arrives at a different time but joins the same phase.
+    now[0] = 0.23
+    bridge.on_control_message(
+        "worker-0", "session-2", {"type": "control_state", "controls": ["D"]}
+    )
+    assert _FakeTimer.instances[-1] is phase_timer
+    assert dispatched == []
+
+    now[0] = 0.6
+    phase_timer.fire()
+    assert len(dispatched) == 1
+    lease, payloads = dispatched[0]
+    assert lease.candidate.batch_size == 2
+    assert {session_id for session_id, _ in payloads} == {"session-1", "session-2"}
+    assert dict(payloads)["session-1"]["controls"] == ["A"]
+    assert bridge.snapshot()["phase_sync"]["pending_sessions"] == 0
+    bridge.close()
+
+
 def test_bridge_keeps_intermediate_updates_in_the_latest_state_only() -> None:
     controller = _controller()
     dispatched = []
@@ -465,7 +515,7 @@ def test_bridge_caps_default_profile_window_at_short_coalesce_window(monkeypatch
     bridge.close()
 
 
-def test_bridge_runs_motivation_placement_only_on_periodic_tick(monkeypatch) -> None:
+def test_bridge_uses_periodic_tick_as_a_joint_search_wakeup(monkeypatch) -> None:
     _FakeTimer.instances.clear()
     monkeypatch.setattr("telefuser.service.livekit.motivation_execution.threading.Timer", _FakeTimer)
     now = [0.0]
@@ -477,21 +527,14 @@ def test_bridge_runs_motivation_placement_only_on_periodic_tick(monkeypatch) -> 
     )
     scheduler.add_gpu(GpuSchedulingState("gpu-0", memory_free_gb=80.0))
     controller = MotivationRuntimeController(scheduler, dispatch=lambda lease: None, clock=lambda: now[0])
-    placement_flags: list[bool] = []
     schedule_flags: list[bool] = []
     schedule_once = controller.schedule_once
-    run_placement_once = controller.run_placement_once
 
     def tracked_schedule_once(**kwargs):
         schedule_flags.append(bool(kwargs.get("run_placement", True)))
         return schedule_once(**kwargs)
 
     monkeypatch.setattr(controller, "schedule_once", tracked_schedule_once)
-    monkeypatch.setattr(
-        controller,
-        "run_placement_once",
-        lambda **kwargs: placement_flags.append(True) or run_placement_once(**kwargs),
-    )
     bridge = MotivationExecutionBridge(
         controller,
         dispatch=lambda lease, payloads: None,
@@ -505,13 +548,11 @@ def test_bridge_runs_motivation_placement_only_on_periodic_tick(monkeypatch) -> 
     assert first_tick.interval == pytest.approx(10.0)
 
     bridge.schedule_wakeup()
-    assert placement_flags == []
     assert schedule_flags == [False]
 
     now[0] = 10.0
     first_tick.fire()
-    assert placement_flags == [True]
-    assert schedule_flags == [False, False]
+    assert schedule_flags == [False, True]
     assert len(_FakeTimer.instances) == 2
     assert bridge.snapshot()["placement"] == {
         "enabled": True,
