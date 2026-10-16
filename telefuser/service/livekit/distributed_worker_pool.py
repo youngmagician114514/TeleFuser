@@ -192,9 +192,27 @@ class DistributedLiveKitWorkerPool(WorkerPool):
         # Remote agents must be ready before local NCCL initialization: all
         # node-local child pools enter the same global communicator.
         if self._remote_clients:
-            health_results = await asyncio.gather(*(client.health() for client in self._remote_clients.values()))
-            for node_id, health in zip(self._remote_clients, health_results, strict=True):
-                self._apply_remote_capacities(node_id, health)
+            # The remote agent binds its RPC socket before entering NCCL.  A
+            # short retry here permits either host to be launched first while
+            # still making a failed/mis-addressed node fail early.
+            deadline = asyncio.get_running_loop().time() + 300.0
+            while True:
+                results = await asyncio.gather(
+                    *(client.health() for client in self._remote_clients.values()),
+                    return_exceptions=True,
+                )
+                failures = [result for result in results if isinstance(result, Exception)]
+                if not failures:
+                    for node_id, health in zip(self._remote_clients, results, strict=True):
+                        if str(health.get("status", "ready")) == "failed":
+                            raise NodeAgentRpcError(
+                                f"remote node-agent {node_id!r} failed to start: {health.get('error', 'unknown error')}"
+                            )
+                        self._apply_remote_capacities(node_id, health)
+                    break
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise NodeAgentRpcError(f"remote node-agent health check failed: {failures[0]}")
+                await asyncio.sleep(1.0)
         await self._local.start(skip_validation=skip_validation)
         self._started = True
         if self._remote_clients:
@@ -205,7 +223,7 @@ class DistributedLiveKitWorkerPool(WorkerPool):
     async def _reconcile_remote_sessions(self) -> None:
         """Release coordinator capacity when a remote room exits unexpectedly."""
         while True:
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(float(getattr(self._config, "node_agent_poll_interval_seconds", 0.1)))
             for node_id, client in tuple(self._remote_clients.items()):
                 try:
                     health = await client.health()
@@ -222,6 +240,12 @@ class DistributedLiveKitWorkerPool(WorkerPool):
                     worker_id = str(message.get("worker_id", ""))
                     session_id = str(message.get("session_id", ""))
                     chunk = dict(message.get("chunk") or {})
+                    if chunk.get("type") == "stop":
+                        with contextlib.suppress(Exception):
+                            await self._client_for_worker(worker_id).call(
+                                "stop_session", {"session_id": session_id}
+                            )
+                        continue
                     handled = bool(self._event_sink.on_control_message(worker_id, session_id, chunk))
                     if not handled:
                         self.dispatch_batch(

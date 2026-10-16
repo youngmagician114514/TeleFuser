@@ -19,12 +19,13 @@ export LIVEKIT_KEY='...'
 export LIVEKIT_SECRET='...'
 export AGENT_SECRET='change-me'
 
-# 只在非中心节点执行；node-1 将 node-id/rank/address 改为自身值。
+# 只在非中心节点执行；下面以 node-1 为例，使用 node-1 的地址和 rank。
 telefuser node-agent "$PIPE" \
   --livekit-url "$LIVEKIT_URL" --livekit-api-key "$LIVEKIT_KEY" \
   --livekit-api-secret "$LIVEKIT_SECRET" --num-workers 8 \
+  --max-sessions-per-worker 12 \
   --worker-gpu-map '0;1;2;3;4;5;6;7' \
-  --node-id node-0 --node-address host-a --node-rank 0 \
+  --node-id node-1 --node-address host-b --node-rank 1 \
   --node-agent-port 8090 --node-agent-secret "$AGENT_SECRET" \
   --cluster-world-size 2 --cluster-topology "$TOPOLOGY" \
   --nccl-master-address host-a --nccl-master-port 29500 --nccl-world-size 16 \
@@ -34,6 +35,7 @@ telefuser node-agent "$PIPE" \
 telefuser stream-serve "$PIPE" --port 8088 \
   --livekit-url "$LIVEKIT_URL" --livekit-api-key "$LIVEKIT_KEY" \
   --livekit-api-secret "$LIVEKIT_SECRET" --num-workers 8 \
+  --max-sessions-per-worker 12 \
   --worker-gpu-map '0;1;2;3;4;5;6;7' --worker-mode process-nccl \
   --node-id node-0 --node-address host-a --node-rank 0 \
   --node-agent-port 8090 --node-agent-secret "$AGENT_SECRET" \
@@ -49,6 +51,7 @@ telefuser stream-serve "$PIPE" --port 8088 \
 - 单机默认值仍为 `node-0`、`127.0.0.1`、world size 1；单机 NCCL 继续使用原来的本地临时端口。
 - 跨机 NCCL 使用固定 master 地址/端口和全局 rank：node-0 使用 rank 0–7，node-1 使用 rank 8–15。
 - `node-agent` 的端口只承载内部 JSON 控制 RPC，提供 health、session start、batch dispatch 和 stop。请求按节点串行发送以保持 session 生命周期顺序，但不同节点可以并行。
+- `node-agent` 会先绑定控制端口，再在后台加入全局 NCCL rendezvous；因此应先启动 node-1 agent，再启动 node-0 coordinator，但两边不会因为等待对方进程而互相死锁。协调器会在启动阶段重试远端 health。
 - 全局 scheduler 使用 `node-id/worker-id` 作为 owner，因此两个节点重复的本地 GPU 编号不会冲突。新 session 可以直接分配到任一节点，远端 agent 返回 pipeline-session ready 后中心才向 Motivation 注册该 session。
 - 节点内 re-home 继续使用现有 NCCL state-transfer；跨节点 migration 在当前实现中被显式关闭，Motivation 的候选搜索不会产生跨节点迁移请求，避免把未实现的跨机 KV handoff 当成本地迁移执行。
 - 单机 `cluster_world_size=1` 时仍使用原来的 worker id、单机 pool、单机 NCCL rendezvous 和原有调度路径。

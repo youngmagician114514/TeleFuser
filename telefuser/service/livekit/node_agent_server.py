@@ -202,22 +202,55 @@ class NodeAgentServer:
         )
         self._server: asyncio.AbstractServer | None = None
         self._skip_validation = bool(skip_validation)
+        self._pool_start_task: asyncio.Task[None] | None = None
+        self._pool_started = False
+        self._pool_start_error: str | None = None
 
     async def start(self) -> None:
-        await self.pool.start(skip_validation=self._skip_validation)
+        # Bind the control port before entering the global NCCL rendezvous.
+        # A peer coordinator must be able to discover this process while its
+        # local workers are also joining the same communicator; waiting for
+        # ``pool.start`` here deadlocks the two hosts during startup.
+        if self._server is not None:
+            return
         self._server = await asyncio.start_server(
             self._handle_connection,
             host=self.config.host,
             port=self.config.node_agent_port,
             limit=4 * 1024 * 1024,
         )
+        self._pool_start_task = asyncio.create_task(
+            self._start_pool(), name=f"node-agent-pool-start-{self.config.node_id}"
+        )
         logger.info(
-            "NodeAgent ready: node=%s address=%s port=%s workers=%s",
+            "NodeAgent control endpoint listening: node=%s address=%s port=%s workers=%s",
             self.config.node_id,
             self.config.effective_node_address(),
             self.config.node_agent_port,
             self.config.num_workers,
         )
+
+    async def _start_pool(self) -> None:
+        try:
+            await self.pool.start(skip_validation=self._skip_validation)
+            self._pool_started = True
+            logger.info("NodeAgent workers ready: node=%s workers=%s", self.config.node_id, self.config.num_workers)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._pool_start_error = repr(exc)
+            logger.exception("NodeAgent worker startup failed: node=%s", self.config.node_id)
+
+    async def _ensure_pool_started(self) -> None:
+        if self._pool_start_error is not None:
+            raise RuntimeError(f"node-agent worker startup failed: {self._pool_start_error}")
+        task = self._pool_start_task
+        if task is not None:
+            await task
+        if self._pool_start_error is not None:
+            raise RuntimeError(f"node-agent worker startup failed: {self._pool_start_error}")
+        if not self._pool_started:
+            raise RuntimeError("node-agent worker pool is not ready")
 
     async def serve_forever(self) -> None:
         if self._server is None:
@@ -231,6 +264,11 @@ class NodeAgentServer:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
+        if self._pool_start_task is not None and not self._pool_start_task.done():
+            self._pool_start_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._pool_start_task
+        self._pool_start_task = None
         await self.pool.aclose()
 
     async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -258,9 +296,12 @@ class NodeAgentServer:
 
     async def _dispatch(self, method: str, params: dict[str, Any]) -> Any:
         if method == "health":
-            snapshot = self.pool.turboserve_snapshot()
+            snapshot = self.pool.turboserve_snapshot() if self._pool_started else {}
+            status = "failed" if self._pool_start_error else ("ready" if self._pool_started else "starting")
             return {
-                "status": "ready",
+                "status": status,
+                "pool_started": self._pool_started,
+                "error": self._pool_start_error,
                 "node_id": self.config.node_id,
                 "active_workers": snapshot.get("active_workers", []),
                 "num_workers": self.config.num_workers,
@@ -274,6 +315,7 @@ class NodeAgentServer:
                 "model_outputs": self._sink.drain_model_outputs(),
             }
         if method == "start_session":
+            await self._ensure_pool_started()
             record = SessionRecord.model_validate(params["record"])
             if record.worker_id is None or not record.worker_id.startswith(f"{self.config.node_id}/"):
                 raise ValueError(f"session worker {record.worker_id!r} is not local to this node")
@@ -282,6 +324,7 @@ class NodeAgentServer:
             pipeline_id = await asyncio.wait_for(waiter, timeout=180.0)
             return {"session_id": record.session_id, "pipeline_session_id": pipeline_id}
         if method == "dispatch_batch":
+            await self._ensure_pool_started()
             worker_id = str(params["worker_id"])
             items = [(str(session_id), dict(chunk)) for session_id, chunk in params.get("items", [])]
             lease = SimpleNamespace(
@@ -291,9 +334,11 @@ class NodeAgentServer:
             self.pool.dispatch_batch(lease, items)
             return {"accepted": len(items)}
         if method == "stop_session":
+            await self._ensure_pool_started()
             await self.pool.stop_session(str(params["session_id"]))
             return {"stopped": True}
         if method == "migrate_session":
+            await self._ensure_pool_started()
             ownership = await self.pool.migrate_session(
                 str(params["pipeline_session_id"]), str(params["target_worker_id"])
             )

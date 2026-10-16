@@ -52,6 +52,11 @@ class LiveKitServeConfig(BaseSettings):
         default="",
         description="Optional shared secret for the internal NodeAgent control plane",
     )
+    node_agent_poll_interval_seconds: float = Field(
+        default=0.1,
+        gt=0,
+        description="Coordinator polling interval for remote node-agent events",
+    )
     cluster_world_size: int = Field(default=1, ge=1, le=128, description="Number of node agents in the deployment")
     cluster_topology: str | None = Field(
         default=None,
