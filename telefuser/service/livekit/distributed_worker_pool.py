@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import uuid
 from types import SimpleNamespace
 from typing import Any
 
@@ -61,33 +62,54 @@ class NodeAgentRpcClient:
             control_port=self.endpoint.port,
         )
 
-    async def call(self, method: str, params: dict[str, Any] | None = None, *, timeout: float | None = None) -> Any:
-        async with self._lock:
-            self._request_id += 1
-            request = {
-                "id": self._request_id,
-                "method": str(method),
-                "params": params or {},
-                "secret": self.secret,
-            }
-            host, port = self.address
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port), timeout=timeout or self.timeout
-            )
-            try:
-                writer.write((json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8"))
-                await writer.drain()
-                raw = await asyncio.wait_for(reader.readline(), timeout=timeout or self.timeout)
-                if not raw:
-                    raise NodeAgentRpcError(f"node agent {self.endpoint.node_id!r} closed the connection")
-                response = json.loads(raw.decode("utf-8"))
-                if not response.get("ok", False):
-                    raise NodeAgentRpcError(str(response.get("error", "node-agent request failed")))
-                return response.get("result")
-            finally:
-                writer.close()
-                with contextlib.suppress(Exception):
-                    await writer.wait_closed()
+    async def call(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+        ordered: bool = True,
+    ) -> Any:
+        """Issue one RPC, optionally preserving the control-plane order.
+
+        Lifecycle requests use the ordered path.  A migration send/receive is
+        a long-lived data-plane request, so callers set ``ordered=False`` and
+        get an independent short-lived connection; otherwise one transfer
+        would block every other migration involving the same node.
+        """
+        if ordered:
+            async with self._lock:
+                return await self._call_unlocked(method, params, timeout=timeout)
+        return await self._call_unlocked(method, params, timeout=timeout)
+
+    async def _call_unlocked(
+        self, method: str, params: dict[str, Any] | None, *, timeout: float | None
+    ) -> Any:
+        self._request_id += 1
+        request = {
+            "id": self._request_id,
+            "method": str(method),
+            "params": params or {},
+            "secret": self.secret,
+        }
+        host, port = self.address
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout or self.timeout
+        )
+        try:
+            writer.write((json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8"))
+            await writer.drain()
+            raw = await asyncio.wait_for(reader.readline(), timeout=timeout or self.timeout)
+            if not raw:
+                raise NodeAgentRpcError(f"node agent {self.endpoint.node_id!r} closed the connection")
+            response = json.loads(raw.decode("utf-8"))
+            if not response.get("ok", False):
+                raise NodeAgentRpcError(str(response.get("error", "node-agent request failed")))
+            return response.get("result")
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
 
     async def health(self) -> dict[str, Any]:
         result = await self.call("health")
@@ -128,11 +150,13 @@ class DistributedLiveKitWorkerPool(WorkerPool):
         self._started = False
         self._closed = False
         self._session_workers: dict[str, str] = {}
+        self._session_records: dict[str, SessionRecord] = {}
         self._pipeline_sessions: dict[str, str] = {}
         self._session_start_tasks: set[asyncio.Task[Any]] = set()
         self._starting_remote_sessions: set[str] = set()
         self._remote_clients: dict[str, NodeAgentRpcClient] = {}
         self._reconcile_task: asyncio.Task[Any] | None = None
+        self._cross_node_migrations: set[str] = set()
 
         local_endpoints = config.local_cluster_worker_endpoints()
         master, _port, _world, rank_offset = config.nccl_rendezvous(local_worker_count=len(local_endpoints))
@@ -288,6 +312,7 @@ class DistributedLiveKitWorkerPool(WorkerPool):
                         endpoint.node_id != node_id
                         or session_id in active
                         or session_id in self._starting_remote_sessions
+                        or session_id in self._cross_node_migrations
                     ):
                         continue
                     self._session_workers.pop(session_id, None)
@@ -307,6 +332,7 @@ class DistributedLiveKitWorkerPool(WorkerPool):
         if record.worker_id is None:
             raise RuntimeError(f"Session {record.session_id} has no assigned worker")
         self._session_workers[record.session_id] = record.worker_id
+        self._session_records[record.session_id] = record
         endpoint = self._endpoint_for_worker(record.worker_id)
         if endpoint.node_id == self._config.node_id:
             self._local.start_session(record)
@@ -398,13 +424,14 @@ class DistributedLiveKitWorkerPool(WorkerPool):
         else:
             await self._client_for_worker(worker_id).call("stop_session", {"session_id": session_id})
         self._session_workers.pop(session_id, None)
+        self._session_records.pop(session_id, None)
         self._starting_remote_sessions.discard(session_id)
         for pipeline_id, api_id in tuple(self._pipeline_sessions.items()):
             if api_id == session_id:
                 self._pipeline_sessions.pop(pipeline_id, None)
 
     async def migrate_session(self, pipeline_session_id: str, target_worker_id: str, **kwargs: Any) -> TurboServeOwnership:
-        del kwargs
+        on_compute_ready = kwargs.get("on_compute_ready")
         api_session_id = self._pipeline_sessions.get(pipeline_session_id)
         source_worker_id = self._session_workers.get(api_session_id) if api_session_id is not None else None
         if source_worker_id is None:
@@ -412,9 +439,21 @@ class DistributedLiveKitWorkerPool(WorkerPool):
         source = self._endpoint_for_worker(source_worker_id)
         target = self._endpoint_for_worker(target_worker_id)
         if source.node_id != target.node_id:
-            raise RuntimeError("cross-node session migration is disabled; placement is node-affine")
+            ownership = await self._migrate_cross_node(
+                api_session_id=api_session_id or pipeline_session_id,
+                pipeline_session_id=pipeline_session_id,
+                source_worker_id=source_worker_id,
+                target_worker_id=target_worker_id,
+            )
+            if callable(on_compute_ready):
+                on_compute_ready()
+            return ownership
         if source.node_id == self._config.node_id:
-            return await self._local.migrate_session(pipeline_session_id, target_worker_id)
+            return await self._local.migrate_session(
+                pipeline_session_id,
+                target_worker_id,
+                on_compute_ready=on_compute_ready,
+            )
         result = await self._client_for_worker(source_worker_id).call(
             "migrate_session",
             {"pipeline_session_id": pipeline_session_id, "target_worker_id": target_worker_id},
@@ -427,10 +466,266 @@ class DistributedLiveKitWorkerPool(WorkerPool):
             epoch=int(result["epoch"]),
         )
 
+    def _global_rank(self, worker_id: str) -> int:
+        return int(self._config.cluster_worker_rank(worker_id))
+
+    async def _migrate_cross_node(
+        self,
+        *,
+        api_session_id: str,
+        pipeline_session_id: str,
+        source_worker_id: str,
+        target_worker_id: str,
+    ) -> TurboServeOwnership:
+        """Transfer a model session between node agents using the same NCCL phases.
+
+        LiveKit transport is moved only after the target model has imported the
+        state.  During the transfer the source output pump is paused, so source
+        and target never publish the same chunk concurrently.
+        """
+        source = self._endpoint_for_worker(source_worker_id)
+        target = self._endpoint_for_worker(target_worker_id)
+        if source.node_id == target.node_id:
+            raise RuntimeError("cross-node migration helper requires different nodes")
+        record = self._session_records.get(api_session_id)
+        if record is None:
+            raise RuntimeError(f"Session {api_session_id!r} has no distributed transport record")
+        transfer_id = f"remote-{uuid.uuid4().hex}"
+        source_client = self._remote_clients.get(source.node_id)
+        target_client = self._remote_clients.get(target.node_id)
+        self._cross_node_migrations.add(api_session_id)
+        source_started = False
+        target_prepared = False
+        target_attached = False
+        source_committed = False
+
+        async def source_export() -> dict[str, Any]:
+            if source.node_id == self._config.node_id:
+                return await self._local.export_remote_migration(pipeline_session_id, transfer_id)
+            if source_client is None:
+                raise RuntimeError(f"source node agent {source.node_id!r} is unavailable")
+            return dict(
+                await source_client.call(
+                    "remote_export",
+                    {"pipeline_session_id": pipeline_session_id, "transfer_id": transfer_id},
+                    ordered=False,
+                )
+            )
+
+        async def target_prepare(metadata: dict[str, Any], ownership_epoch: int) -> None:
+            if target.node_id == self._config.node_id:
+                await self._local.prepare_remote_receive(
+                    worker_id=target_worker_id,
+                    pipeline_session_id=pipeline_session_id,
+                    transfer_id=transfer_id,
+                    metadata=metadata,
+                    source_rank=self._global_rank(source_worker_id),
+                    ownership_epoch=ownership_epoch,
+                )
+                return
+            if target_client is None:
+                raise RuntimeError(f"target node agent {target.node_id!r} is unavailable")
+            await target_client.call(
+                "remote_prepare_recv",
+                {
+                    "worker_id": target_worker_id,
+                    "pipeline_session_id": pipeline_session_id,
+                    "transfer_id": transfer_id,
+                    "metadata": metadata,
+                    "source_rank": self._global_rank(source_worker_id),
+                    "ownership_epoch": ownership_epoch,
+                },
+                ordered=False,
+            )
+
+        async def source_send() -> Any:
+            if source.node_id == self._config.node_id:
+                return await self._local.send_remote_migration(
+                    worker_id=source_worker_id,
+                    transfer_id=transfer_id,
+                    target_rank=self._global_rank(target_worker_id),
+                )
+            if source_client is None:
+                raise RuntimeError(f"source node agent {source.node_id!r} is unavailable")
+            return await source_client.call(
+                "remote_send",
+                {
+                    "worker_id": source_worker_id,
+                    "transfer_id": transfer_id,
+                    "target_rank": self._global_rank(target_worker_id),
+                },
+                ordered=False,
+            )
+
+        async def target_recv() -> Any:
+            if target.node_id == self._config.node_id:
+                return await self._local.receive_remote_migration(
+                    worker_id=target_worker_id,
+                    transfer_id=transfer_id,
+                    pipeline_session_id=pipeline_session_id,
+                    source_rank=self._global_rank(source_worker_id),
+                )
+            if target_client is None:
+                raise RuntimeError(f"target node agent {target.node_id!r} is unavailable")
+            return await target_client.call(
+                "remote_recv",
+                {
+                    "worker_id": target_worker_id,
+                    "transfer_id": transfer_id,
+                    "pipeline_session_id": pipeline_session_id,
+                    "source_rank": self._global_rank(source_worker_id),
+                },
+                ordered=False,
+            )
+
+        async def target_attach(target_record: SessionRecord) -> None:
+            if target.node_id == self._config.node_id:
+                await self._local.attach_existing_transport(target_record, pipeline_session_id)
+                return
+            if target_client is None:
+                raise RuntimeError(f"target node agent {target.node_id!r} is unavailable")
+            await target_client.call(
+                "remote_attach_transport",
+                {
+                    "record": target_record.model_dump(mode="json"),
+                    "pipeline_session_id": pipeline_session_id,
+                },
+                ordered=False,
+            )
+
+        async def source_commit() -> list[dict[str, Any]]:
+            if source.node_id == self._config.node_id:
+                return await self._local.commit_remote_source(pipeline_session_id, transfer_id)
+            if source_client is None:
+                raise RuntimeError(f"source node agent {source.node_id!r} is unavailable")
+            result = await source_client.call(
+                "remote_commit_source",
+                {"pipeline_session_id": pipeline_session_id, "transfer_id": transfer_id},
+                ordered=False,
+            )
+            return [dict(item) for item in result.get("pending_controls", ())]
+
+        async def source_detach() -> None:
+            if source.node_id == self._config.node_id:
+                await self._local.detach_transport(api_session_id)
+            elif source_client is not None:
+                await source_client.call(
+                    "remote_detach_transport", {"session_id": api_session_id}, ordered=False
+                )
+
+        async def source_finish() -> None:
+            if source.node_id == self._config.node_id:
+                self._local.finish_remote_source(pipeline_session_id)
+            elif source_client is not None:
+                await source_client.call(
+                    "remote_finish_source", {"pipeline_session_id": pipeline_session_id}, ordered=False
+                )
+
+        async def target_abort() -> None:
+            if target.node_id == self._config.node_id:
+                await self._local.abort_remote_target(pipeline_session_id, target_worker_id, transfer_id)
+            elif target_client is not None:
+                await target_client.call(
+                    "remote_abort_target",
+                    {
+                        "pipeline_session_id": pipeline_session_id,
+                        "worker_id": target_worker_id,
+                        "transfer_id": transfer_id,
+                    },
+                    ordered=False,
+                )
+
+        try:
+            exported = await source_export()
+            source_started = True
+            source_epoch = int(exported.pop("source_epoch", 1))
+            exported.pop("source_worker_id", None)
+            exported.pop("pipeline_session_id", None)
+            await target_prepare(exported, source_epoch + 1)
+            target_prepared = True
+            transfer_results = await asyncio.gather(source_send(), target_recv(), return_exceptions=True)
+            transfer_failures = [result for result in transfer_results if isinstance(result, BaseException)]
+            if transfer_failures:
+                raise transfer_failures[0]
+            target_record = record.model_copy(update={"worker_id": target_worker_id})
+            await target_attach(target_record)
+            target_attached = True
+            pending_controls = await source_commit()
+            source_committed = True
+            # The source model has already closed. Detach its now-idle room
+            # runner, then release parent-side source bookkeeping.
+            with contextlib.suppress(Exception):
+                await source_detach()
+            with contextlib.suppress(Exception):
+                await source_finish()
+            if pending_controls:
+                items = [(pipeline_session_id, dict(chunk)) for chunk in pending_controls]
+                if target.node_id == self._config.node_id:
+                    self._local.push_model_batch(items)
+                elif target_client is not None:
+                    await target_client.call(
+                        "dispatch_batch",
+                        {
+                            "worker_id": target_worker_id,
+                            "items": items,
+                            "motivation_job_ids": [],
+                            "motivation_session_ids": [pipeline_session_id],
+                        },
+                    )
+            self._session_workers[api_session_id] = target_worker_id
+            self._session_records[api_session_id] = target_record
+            return TurboServeOwnership(
+                session_id=pipeline_session_id,
+                worker_id=target_worker_id,
+                epoch=source_epoch + 1,
+            )
+        except Exception:
+            if target_attached:
+                with contextlib.suppress(Exception):
+                    if target.node_id == self._config.node_id:
+                        await self._local.detach_transport(api_session_id)
+                    elif target_client is not None:
+                        await target_client.call(
+                            "remote_detach_transport", {"session_id": api_session_id}, ordered=False
+                        )
+            if target_prepared:
+                with contextlib.suppress(Exception):
+                    await target_abort()
+            if source_started and not source_committed:
+                with contextlib.suppress(Exception):
+                    if source.node_id == self._config.node_id:
+                        await self._local.abort_remote_source(pipeline_session_id, transfer_id)
+                    elif source_client is not None:
+                        await source_client.call(
+                            "remote_abort_source",
+                            {"pipeline_session_id": pipeline_session_id, "transfer_id": transfer_id},
+                            ordered=False,
+                        )
+            raise
+        finally:
+            self._cross_node_migrations.discard(api_session_id)
+
     async def migrate_session_remote(self, request: NodeAgentMigrationRequest) -> NodeAgentMigrationResult:
-        raise RuntimeError(
-            "cross-node state transfer is intentionally disabled until a coordinated NCCL handoff is configured; "
-            f"keep {request.session_id!r} on {request.source_node_id!r}"
+        api_session_id = request.session_id
+        pipeline_session_id = self._pipeline_sessions.get(api_session_id, api_session_id)
+        source_worker_id = self._session_workers.get(api_session_id, request.source_gpu)
+        ownership = await self._migrate_cross_node(
+            api_session_id=api_session_id,
+            pipeline_session_id=pipeline_session_id,
+            source_worker_id=source_worker_id,
+            target_worker_id=request.target_gpu,
+        )
+        return NodeAgentMigrationResult(
+            operation_id=f"remote-{uuid.uuid4().hex}",
+            ready=True,
+            completed=True,
+            metadata={
+                "session_id": ownership.session_id,
+                "worker_id": ownership.worker_id,
+                "epoch": ownership.epoch,
+                "source_node_id": request.source_node_id,
+                "target_node_id": request.target_node_id,
+            },
         )
 
     def active_worker_count(self) -> int:
@@ -445,7 +740,8 @@ class DistributedLiveKitWorkerPool(WorkerPool):
         snapshot = dict(self._local.turboserve_snapshot())
         snapshot["distributed"] = True
         snapshot["remote_nodes"] = sorted(self._remote_clients)
-        snapshot["cross_node_migration"] = False
+        snapshot["cross_node_migration"] = True
+        snapshot["cross_node_transfer"] = "process-nccl"
         return snapshot
 
     async def aclose(self) -> None:

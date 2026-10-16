@@ -230,6 +230,7 @@ class _ParentTransportSink:
         self.pool._event_sink.on_worker_capacity(worker_id, capacity, profile)
 
     def on_session_status(self, session_id: str, status: str, error: str | None = None) -> None:
+        self.pool._transport_status(session_id, status, error)
         self.pool._event_sink.on_session_status(session_id, status, error)
 
     def on_pipeline_session(self, session_id: str, pipeline_session_id: str) -> None:
@@ -238,6 +239,14 @@ class _ParentTransportSink:
     def on_session_finished(self, worker_id: str, session_id: str, error: str | None = None) -> None:
         self.pool._transport_finished(session_id)
         self.pool._event_sink.on_session_finished(worker_id, session_id, error)
+
+    def on_transport_detached(
+        self, worker_id: str, session_id: str, pipeline_session_id: str | None = None
+    ) -> None:
+        self.pool._transport_detached(session_id)
+        callback = getattr(self.pool._event_sink, "on_transport_detached", None)
+        if callable(callback):
+            callback(worker_id, session_id, pipeline_session_id)
 
     def on_control_received(self, worker_id: str, session_id: str) -> None:
         callback = getattr(self.pool._event_sink, "on_control_received", None)
@@ -274,6 +283,7 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         self._model_output_dropped: dict[str, int] = {}
         self._transport_workers: dict[str, LiveKitWorker] = {}
         self._transport_tasks: dict[str, asyncio.Task[None]] = {}
+        self._transport_ready_waiters: dict[str, asyncio.Future[None]] = {}
         self._migrating_controls: dict[str, list[dict]] = {}
         self._provisional_migration_controls: dict[str, list[dict]] = {}
         self._provisional_model_events: dict[str, list[dict[str, Any]]] = {}
@@ -461,6 +471,267 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         self._transport_workers[record.session_id] = runner
         self._transport_tasks[record.session_id] = task
         task.add_done_callback(lambda done, sid=record.session_id: self._transport_task_done(sid, done))
+
+    def adopt_imported_session(
+        self,
+        *,
+        worker_id: str,
+        pipeline_session_id: str,
+        ownership_epoch: int,
+    ) -> None:
+        """Register a model session imported by a remote NCCL transfer.
+
+        The child process creates the actual model session during ``nccl_recv``;
+        this parent-side record must exist first so output events have a queue
+        as soon as the first layer becomes usable.
+        """
+        if worker_id not in self._active_workers:
+            raise RuntimeError(f"Model worker {worker_id!r} is not active")
+        if pipeline_session_id in self._pipeline_routes:
+            raise RuntimeError(f"Pipeline session {pipeline_session_id!r} is already routed")
+        output: asyncio.Queue[_ModelOutput | None] = asyncio.Queue(maxsize=_MODEL_OUTPUT_PARENT_QUEUE_SIZE)
+        drained = asyncio.Event()
+        drained.set()
+        self._model_outputs[pipeline_session_id] = output
+        self._model_output_drained[pipeline_session_id] = drained
+        self._model_output_dropped[pipeline_session_id] = 0
+        self._pipeline_routes[pipeline_session_id] = worker_id
+        self._publisher_progress_sequences[pipeline_session_id] = -1
+        self._publisher_frame_tracking[pipeline_session_id] = True
+        self._session_workers[pipeline_session_id] = worker_id
+        self._ownership.register(pipeline_session_id, worker_id, epoch=int(ownership_epoch))
+
+    async def attach_existing_transport(self, record: SessionRecord, pipeline_session_id: str) -> None:
+        """Start a LiveKit publisher for a model session imported on this node."""
+        if record.worker_id is None or record.worker_id not in self._active_workers:
+            raise RuntimeError("Model worker is not active")
+        if record.session_id in self._transport_workers:
+            raise RuntimeError(f"Session {record.session_id!r} already has a LiveKit transport")
+        runner = LiveKitWorker(
+            worker_id=record.worker_id,
+            config=self._config,
+            pipeline_file=self._pipeline_file,
+            token_service=LiveKitTokenService(
+                api_key=self._config.livekit_api_key,
+                api_secret=self._config.livekit_api_secret,
+                token_ttl=self._config.token_ttl,
+            ),
+            event_sink=_ParentTransportSink(self),
+            pipeline_adapter=_ProcessPipelineAdapter(self, record.worker_id),
+        )
+        waiter = asyncio.get_running_loop().create_future()
+        self._transport_ready_waiters[record.session_id] = waiter
+        task = asyncio.create_task(
+            runner.run_session(record, existing_pipeline_session_id=pipeline_session_id),
+            name=f"livekit-transport-handoff-{record.session_id}",
+        )
+        self._transport_workers[record.session_id] = runner
+        self._transport_tasks[record.session_id] = task
+        task.add_done_callback(lambda done, sid=record.session_id: self._transport_task_done(sid, done))
+        try:
+            await asyncio.wait_for(asyncio.shield(waiter), timeout=120.0)
+        except BaseException:
+            # A target transport may fail after the model state has already
+            # been imported.  Detach the room runner while preserving the
+            # model route; the migration coordinator will then atomically
+            # discard that route and its child-side receive slot.
+            with contextlib.suppress(Exception):
+                await runner.handoff_transport(record.session_id)
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(asyncio.shield(task), timeout=15.0)
+            raise
+        finally:
+            self._transport_ready_waiters.pop(record.session_id, None)
+
+    async def detach_transport(self, session_id: str) -> None:
+        """Stop the local LiveKit publisher without closing its model session."""
+        runner = self._transport_workers.get(session_id)
+        task = self._transport_tasks.get(session_id)
+        if runner is None or task is None:
+            return
+        await runner.handoff_transport(session_id)
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=15.0)
+        except asyncio.TimeoutError:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    async def export_remote_migration(self, pipeline_session_id: str, transfer_id: str) -> dict[str, Any]:
+        """Export a full state snapshot for a target worker on another node."""
+        source_worker_id = self._pipeline_routes.get(pipeline_session_id)
+        if source_worker_id is None:
+            raise RuntimeError(f"Pipeline session {pipeline_session_id!r} has no active route")
+        self._retain_migration_activity(pipeline_session_id)
+        self._migrating_controls[pipeline_session_id] = []
+        metadata = await self._run_migration_phase(
+            transfer_id,
+            "remote_export",
+            lambda: self._request(
+                source_worker_id,
+                "nccl_export",
+                session_id=pipeline_session_id,
+                transfer_id=transfer_id,
+                timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
+            ),
+        )
+        result = dict(metadata["result"])
+        owner = self._ownership.owner(pipeline_session_id)
+        result["source_worker_id"] = source_worker_id
+        result["source_epoch"] = int(owner.epoch)
+        result["pipeline_session_id"] = pipeline_session_id
+        return result
+
+    async def prepare_remote_receive(
+        self,
+        *,
+        worker_id: str,
+        pipeline_session_id: str,
+        transfer_id: str,
+        metadata: dict[str, Any],
+        source_rank: int,
+        ownership_epoch: int,
+    ) -> None:
+        """Reserve target pages and register parent routing before NCCL receive."""
+        self.adopt_imported_session(
+            worker_id=worker_id,
+            pipeline_session_id=pipeline_session_id,
+            ownership_epoch=ownership_epoch,
+        )
+        try:
+            await self._run_migration_phase(
+                transfer_id,
+                "remote_prepare_recv",
+                lambda: self._request(
+                    worker_id,
+                    "nccl_prepare_recv",
+                    transfer_id=transfer_id,
+                    metadata=metadata,
+                    session_id=pipeline_session_id,
+                    source_rank=int(source_rank),
+                    owner_worker_id=worker_id,
+                    ownership_epoch=int(ownership_epoch),
+                    model_output_credit_window=_MODEL_OUTPUT_PARENT_QUEUE_SIZE,
+                    timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
+                ),
+            )
+        except Exception:
+            self._forget_imported_session(pipeline_session_id, send_close=False)
+            raise
+
+    async def receive_remote_migration(
+        self,
+        *,
+        worker_id: str,
+        transfer_id: str,
+        pipeline_session_id: str,
+        source_rank: int,
+    ) -> dict[str, Any]:
+        """Receive and import state from a worker on another node."""
+        result = await self._run_migration_phase(
+            transfer_id,
+            "remote_recv",
+            lambda: self._request(
+                worker_id,
+                "nccl_recv",
+                transfer_id=transfer_id,
+                session_id=pipeline_session_id,
+                source_rank=int(source_rank),
+                timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
+            ),
+        )
+        return dict(result.get("result", {})) if isinstance(result, dict) else {}
+
+    async def send_remote_migration(self, *, worker_id: str, transfer_id: str, target_rank: int) -> dict[str, Any]:
+        result = await self._run_migration_phase(
+            transfer_id,
+            "remote_send",
+            lambda: self._request(
+                worker_id,
+                "nccl_send",
+                transfer_id=transfer_id,
+                target_rank=int(target_rank),
+                timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
+            ),
+        )
+        return dict(result.get("result", {})) if isinstance(result, dict) else {}
+
+    async def commit_remote_source(self, pipeline_session_id: str, transfer_id: str) -> list[dict[str, Any]]:
+        source_worker_id = self._pipeline_routes.get(pipeline_session_id)
+        if source_worker_id is None:
+            return []
+        await self._run_migration_phase(
+            transfer_id,
+            "remote_commit_source",
+            lambda: self._request(
+                source_worker_id,
+                "nccl_commit_source",
+                session_id=pipeline_session_id,
+                timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
+            ),
+        )
+        pending = list(self._migrating_controls.pop(pipeline_session_id, []))
+        return pending
+
+    def finish_remote_source(self, pipeline_session_id: str) -> None:
+        """Drop source-side parent bookkeeping after the target is live."""
+        self._forget_imported_session(pipeline_session_id, send_close=False)
+        self._release_migration_activity(pipeline_session_id)
+
+    async def abort_remote_source(self, pipeline_session_id: str, transfer_id: str) -> None:
+        source_worker_id = self._pipeline_routes.get(pipeline_session_id)
+        if source_worker_id is not None:
+            with contextlib.suppress(Exception):
+                await self._request(
+                    source_worker_id,
+                    "nccl_abort_source",
+                    session_id=pipeline_session_id,
+                    transfer_id=transfer_id,
+                    timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
+                )
+            with contextlib.suppress(Exception):
+                await self._request(
+                    source_worker_id,
+                    "model_output_resume",
+                    session_id=pipeline_session_id,
+                    timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
+                )
+        pending = list(self._migrating_controls.pop(pipeline_session_id, []))
+        for chunk in pending:
+            if source_worker_id is not None:
+                self._send(source_worker_id, {"type": "model_push", "session_id": pipeline_session_id, "chunk": chunk})
+        self._release_migration_activity(pipeline_session_id)
+
+    async def abort_remote_target(self, pipeline_session_id: str, worker_id: str, transfer_id: str) -> None:
+        # ``nccl_discard`` closes the imported model and releases its receive
+        # pages in the child.  Wait for its request result before dropping the
+        # parent route so a late model-output event cannot target a freed
+        # queue or leave a retained session slot behind.
+        with contextlib.suppress(Exception):
+            await self._request(
+                worker_id,
+                "nccl_discard",
+                session_id=pipeline_session_id,
+                transfer_id=transfer_id,
+                timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
+            )
+        self._forget_imported_session(pipeline_session_id, send_close=False)
+
+    def _forget_imported_session(self, pipeline_session_id: str, *, send_close: bool) -> None:
+        worker_id = self._pipeline_routes.pop(pipeline_session_id, None)
+        self._session_workers.pop(pipeline_session_id, None)
+        self._ownership.release(pipeline_session_id)
+        self._migrating_controls.pop(pipeline_session_id, None)
+        self._provisional_migration_controls.pop(pipeline_session_id, None)
+        self._provisional_model_events.pop(pipeline_session_id, None)
+        self._migration_manifests.pop(pipeline_session_id, None)
+        self._session_runtime_metrics.pop(pipeline_session_id, None)
+        self._deferred_model_closes.discard(pipeline_session_id)
+        self._publisher_progress_sequences.pop(pipeline_session_id, None)
+        self._publisher_frame_tracking.pop(pipeline_session_id, None)
+        if send_close and worker_id in self._active_workers:
+            self._send(worker_id, {"type": "model_close", "session_id": pipeline_session_id})
+        self._close_model_output(pipeline_session_id)
 
     def dispatch_batch(self, lease: Any, payloads: list[tuple[str, dict]]) -> None:
         """Send one policy-selected batch through the parent transport routes."""
@@ -1639,9 +1910,27 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
     def _transport_finished(self, session_id: str) -> None:
         self.close_model_session(session_id)
 
+    def _transport_status(self, session_id: str, status: str, error: str | None = None) -> None:
+        waiter = self._transport_ready_waiters.get(session_id)
+        if waiter is None or waiter.done():
+            return
+        if status == "running":
+            waiter.set_result(None)
+        elif status == "failed":
+            waiter.set_exception(RuntimeError(error or f"LiveKit transport failed for {session_id!r}"))
+
+    def _transport_detached(self, session_id: str) -> None:
+        """Forget only the publisher runner; the model route remains owned here."""
+        self._transport_workers.pop(session_id, None)
+        self._transport_tasks.pop(session_id, None)
+
     def _transport_task_done(self, session_id: str, task: asyncio.Task[None]) -> None:
         self._transport_tasks.pop(session_id, None)
         self._transport_workers.pop(session_id, None)
+        waiter = self._transport_ready_waiters.get(session_id)
+        if waiter is not None and not waiter.done():
+            error = task.exception() if not task.cancelled() else RuntimeError("LiveKit transport cancelled")
+            waiter.set_exception(error or RuntimeError(f"LiveKit transport ended before readiness: {session_id!r}"))
         if not task.cancelled() and task.exception() is not None:
             logger.warning("LiveKit transport failed: session=%s error=%s", session_id, task.exception())
 

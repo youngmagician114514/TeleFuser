@@ -53,5 +53,7 @@ telefuser stream-serve "$PIPE" --port 8088 \
 - `node-agent` 的端口只承载内部 JSON 控制 RPC，提供 health、session start、batch dispatch 和 stop。请求按节点串行发送以保持 session 生命周期顺序，但不同节点可以并行。
 - `node-agent` 会先绑定控制端口，再在后台加入全局 NCCL rendezvous；因此应先启动 node-1 agent，再启动 node-0 coordinator，但两边不会因为等待对方进程而互相死锁。协调器会在启动阶段重试远端 health。
 - 全局 scheduler 使用 `node-id/worker-id` 作为 owner，因此两个节点重复的本地 GPU 编号不会冲突。新 session 可以直接分配到任一节点，远端 agent 返回 pipeline-session ready 后中心才向 Motivation 注册该 session。
-- 节点内 re-home 继续使用现有 NCCL state-transfer；跨节点 migration 在当前实现中被显式关闭，Motivation 的候选搜索不会产生跨节点迁移请求，避免把未实现的跨机 KV handoff 当成本地迁移执行。
+- 节点内 re-home 使用 NCCL P2P state-transfer；跨节点 re-home 使用同一套 export/prepare/send/receive/commit 协议，由源、目标 NodeAgent 协调，NCCL 使用全局 rank 进行跨机 P2P。跨节点候选会额外计入 `motivation_migration_cross_node_extra_seconds` 的 RDMA/跨机估计成本。
+- 跨节点迁移先恢复目标模型 session，再把 LiveKit transport 接到目标节点；源节点在 ownership commit 后释放旧 model/transport。迁移失败时目标 discard、源 resume，session 仍保持原 owner。
+- 当前跨节点迁移需要节点间 NCCL 网络可达；如果部署环境没有稳定的 RDMA/NCCL 跨机链路，应通过 `--no-motivation-migration` 或关闭 Motivation migration，而不是让调度器把跨机链路当作本地 NVLink。
 - 单机 `cluster_world_size=1` 时仍使用原来的 worker id、单机 pool、单机 NCCL rendezvous 和原有调度路径。

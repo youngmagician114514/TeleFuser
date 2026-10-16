@@ -140,7 +140,11 @@ def run_stream_server(
                 # normalizes this defensively, but keeping the entrypoint
                 # value explicit makes runtime metadata and tests unambiguous.
                 migration_enabled=motivation_migration and normalized_policy != "fifo",
-                allow_cross_node_migration=(config.cluster_world_size == 1),
+                # DistributedLiveKitWorkerPool implements the same state
+                # transfer protocol across nodes; the scheduler only charges
+                # the topology-specific transfer estimate.
+                allow_cross_node_migration=True,
+                cross_node_migration_extra_seconds=config.motivation_migration_cross_node_extra_seconds,
                 policy_name=normalized_policy,
                 load_balance_capacity_per_worker=config.session_capacity_limit() or 12,
                 turboserve_capacity_per_worker=config.session_capacity_limit() or 12,

@@ -898,6 +898,7 @@ class MotivationSchedulerConfig:
     include_idle_jobs: bool = True
     migration_enabled: bool = True
     allow_cross_node_migration: bool = True
+    cross_node_migration_extra_seconds: float = 0.12
     policy_name: str = "motivation"
     # Motivation may retain a short ordered action burst per session. Baseline
     # policies force this back to one in ``MotivationScheduler.__init__``.
@@ -1253,10 +1254,10 @@ class MotivationScheduler:
     ) -> MigrationEstimate:
         """Estimate a move while respecting the deployment's node boundary.
 
-        A multi-node runtime owns each session's LiveKit room on one node.
-        Unless a transport explicitly implements a distributed state handoff,
-        a policy candidate must not turn a local re-home into a remote move.
-        The default remains enabled for the existing single-node scheduler.
+        A multi-node runtime owns each session's LiveKit room on one node, so a
+        cross-node candidate carries the configured network-transfer estimate.
+        The distributed worker pool implements the corresponding state handoff
+        through the node-agent process-NCCL data plane.
         """
         owner = self._gpus.get(session.owner_gpu)
         if (
@@ -1265,7 +1266,18 @@ class MotivationScheduler:
             and owner.node_id != target_gpu.node_id
         ):
             return MigrationEstimate(ready_at=now, required=False)
-        return self.migration_estimator.estimate(session, target_gpu=target_gpu.gpu_id, now=now)
+        estimate = self.migration_estimator.estimate(session, target_gpu=target_gpu.gpu_id, now=now)
+        if owner is None or owner.node_id == target_gpu.node_id or not estimate.required:
+            return estimate
+        extra = max(0.0, float(self.config.cross_node_migration_extra_seconds))
+        if extra <= 0:
+            return estimate
+        return replace(
+            estimate,
+            ready_at=estimate.ready_at + extra,
+            cost_seconds=estimate.cost_seconds + extra,
+            first_layer_ready_seconds=estimate.first_layer_ready_seconds + extra,
+        )
 
     @property
     def policy_name(self) -> str:

@@ -347,6 +347,70 @@ class NodeAgentServer:
                 "worker_id": ownership.worker_id,
                 "epoch": ownership.epoch,
             }
+        if method == "remote_export":
+            await self._ensure_pool_started()
+            return await self.pool.export_remote_migration(
+                str(params["pipeline_session_id"]), str(params["transfer_id"])
+            )
+        if method == "remote_prepare_recv":
+            await self._ensure_pool_started()
+            await self.pool.prepare_remote_receive(
+                worker_id=str(params["worker_id"]),
+                pipeline_session_id=str(params["pipeline_session_id"]),
+                transfer_id=str(params["transfer_id"]),
+                metadata=dict(params["metadata"]),
+                source_rank=int(params["source_rank"]),
+                ownership_epoch=int(params["ownership_epoch"]),
+            )
+            return {"prepared": True}
+        if method == "remote_send":
+            await self._ensure_pool_started()
+            return await self.pool.send_remote_migration(
+                worker_id=str(params["worker_id"]),
+                transfer_id=str(params["transfer_id"]),
+                target_rank=int(params["target_rank"]),
+            )
+        if method == "remote_recv":
+            await self._ensure_pool_started()
+            return await self.pool.receive_remote_migration(
+                worker_id=str(params["worker_id"]),
+                transfer_id=str(params["transfer_id"]),
+                pipeline_session_id=str(params["pipeline_session_id"]),
+                source_rank=int(params["source_rank"]),
+            )
+        if method == "remote_attach_transport":
+            await self._ensure_pool_started()
+            record = SessionRecord.model_validate(params["record"])
+            await self.pool.attach_existing_transport(record, str(params["pipeline_session_id"]))
+            return {"attached": True}
+        if method == "remote_detach_transport":
+            await self._ensure_pool_started()
+            await self.pool.detach_transport(str(params["session_id"]))
+            return {"detached": True}
+        if method == "remote_commit_source":
+            await self._ensure_pool_started()
+            pending = await self.pool.commit_remote_source(
+                str(params["pipeline_session_id"]), str(params["transfer_id"])
+            )
+            return {"pending_controls": pending}
+        if method == "remote_finish_source":
+            await self._ensure_pool_started()
+            self.pool.finish_remote_source(str(params["pipeline_session_id"]))
+            return {"finished": True}
+        if method == "remote_abort_source":
+            await self._ensure_pool_started()
+            await self.pool.abort_remote_source(
+                str(params["pipeline_session_id"]), str(params["transfer_id"])
+            )
+            return {"aborted": True}
+        if method == "remote_abort_target":
+            await self._ensure_pool_started()
+            await self.pool.abort_remote_target(
+                str(params["pipeline_session_id"]),
+                str(params["worker_id"]),
+                str(params["transfer_id"]),
+            )
+            return {"aborted": True}
         if method == "close":
             await self.aclose()
             return {"closed": True}

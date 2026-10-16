@@ -360,11 +360,13 @@ class TurboServeOwnershipTable:
         self._committed: dict[str, TurboServeMigrationToken] = {}
         self._lock = threading.RLock()
 
-    def register(self, session_id: str, worker_id: str) -> TurboServeOwnership:
+    def register(self, session_id: str, worker_id: str, *, epoch: int = 1) -> TurboServeOwnership:
         with self._lock:
             if session_id in self._owners:
                 raise ValueError(f"TurboServe session {session_id!r} already has an owner")
-            ownership = TurboServeOwnership(session_id, worker_id, 1)
+            if int(epoch) < 1:
+                raise ValueError("TurboServe ownership epoch must be positive")
+            ownership = TurboServeOwnership(session_id, worker_id, int(epoch))
             self._owners[session_id] = ownership
             return ownership
 

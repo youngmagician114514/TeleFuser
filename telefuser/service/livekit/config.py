@@ -156,6 +156,14 @@ class LiveKitServeConfig(BaseSettings):
             "online route-ready telemetry supersedes this prior"
         ),
     )
+    motivation_migration_cross_node_extra_seconds: float = Field(
+        default=0.12,
+        ge=0,
+        description=(
+            "Additional route-ready estimate for RDMA/cross-node state transfer; "
+            "the transfer protocol remains identical to node-local migration"
+        ),
+    )
     turboserve_min_migration_gain_ms: float = Field(default=40.0, ge=0)
     turboserve_rebalance_iteration_limit: int = Field(default=3, ge=1, le=64)
     motivation_migration_cooldown_seconds: float = Field(
@@ -390,6 +398,17 @@ class LiveKitServeConfig(BaseSettings):
     def local_cluster_worker_endpoints(self) -> tuple["WorkerEndpoint", ...]:
         """Return only endpoints hosted by this process's node."""
         return tuple(endpoint for endpoint in self.cluster_worker_endpoints() if endpoint.node_id == self.node_id)
+
+    def cluster_worker_rank(self, worker_id: str) -> int:
+        """Return the stable global NCCL rank for a node-qualified worker."""
+        endpoints = self.cluster_worker_endpoints()
+        for endpoint in endpoints:
+            if endpoint.endpoint_id == worker_id:
+                node = self.topology().node(endpoint.node_id)
+                preceding = sum(len(item.gpu_ids) for item in self.topology().nodes if item.rank < node.rank)
+                local_index = int(endpoint.worker_id.rsplit("-", 1)[-1])
+                return preceding + local_index
+        raise KeyError(f"unknown cluster worker {worker_id!r}")
 
     def effective_node_address(self) -> str:
         """Return the topology address when one was supplied, else node_address."""

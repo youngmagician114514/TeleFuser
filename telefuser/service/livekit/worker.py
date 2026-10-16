@@ -37,6 +37,9 @@ class WorkerEventSink(Protocol):
     def on_session_status(self, session_id: str, status: SessionStatus, error: str | None = None) -> None: ...
     def on_pipeline_session(self, session_id: str, pipeline_session_id: str) -> None: ...
     def on_session_finished(self, worker_id: str, session_id: str, error: str | None = None) -> None: ...
+    def on_transport_detached(
+        self, worker_id: str, session_id: str, pipeline_session_id: str | None = None
+    ) -> None: ...
     def on_control_received(self, worker_id: str, session_id: str) -> None: ...
     def on_control_message(self, worker_id: str, session_id: str, chunk: dict[str, Any]) -> bool: ...
     def on_chunk_published(
@@ -68,6 +71,12 @@ class NullWorkerEventSink:
         return None
 
     def on_session_finished(self, worker_id: str, session_id: str, error: str | None = None) -> None:
+        return None
+
+    def on_transport_detached(
+        self, worker_id: str, session_id: str, pipeline_session_id: str | None = None
+    ) -> None:
+        del worker_id, session_id, pipeline_session_id
         return None
 
     def on_control_received(self, worker_id: str, session_id: str) -> None:
@@ -128,6 +137,7 @@ class LiveKitWorker:
         self._pending_control_chunk: dict[str, Any] | None = None
         self._delivery_ack_event = asyncio.Event()
         self._stop_event = asyncio.Event()
+        self._preserve_pipeline_on_close = False
 
     async def start(self, *, skip_validation: bool = False) -> None:
         """Load the stream pipeline owned by this worker."""
@@ -141,8 +151,13 @@ class LiveKitWorker:
         await self.pipeline_adapter.aclose()
         self.event_sink.on_worker_status(self.worker_id, "stopped")
 
-    async def run_session(self, record: SessionRecord) -> None:
-        """Join a LiveKit room, create a pipeline session, and publish output chunks."""
+    async def run_session(
+        self,
+        record: SessionRecord,
+        *,
+        existing_pipeline_session_id: str | None = None,
+    ) -> None:
+        """Join a LiveKit room and publish a new or already-imported pipeline session."""
         if self._active_session_id is not None:
             raise RuntimeError(f"Worker {self.worker_id} is already running a session")
 
@@ -171,17 +186,20 @@ class LiveKitWorker:
             self.event_sink.on_worker_status(self.worker_id, "starting_pipeline")
             self.event_sink.on_session_status(record.session_id, "starting_pipeline")
             if self.pipeline_adapter.stream_mode == STREAM_MODE_BIDIRECTIONAL:
-                self._pipeline_session_registered = False
-                self._pipeline_session_id = self.pipeline_adapter.create_session(record.config)
-                wait_session_ready = getattr(self.pipeline_adapter, "wait_session_ready", None)
-                if callable(wait_session_ready):
-                    await asyncio.wait_for(
-                        wait_session_ready(self._pipeline_session_id),
-                        timeout=_PIPELINE_SESSION_READY_TIMEOUT_SECONDS,
-                    )
+                self._pipeline_session_registered = existing_pipeline_session_id is not None
+                self._pipeline_session_id = existing_pipeline_session_id
+                if self._pipeline_session_id is None:
+                    self._pipeline_session_id = self.pipeline_adapter.create_session(record.config)
+                    wait_session_ready = getattr(self.pipeline_adapter, "wait_session_ready", None)
+                    if callable(wait_session_ready):
+                        await asyncio.wait_for(
+                            wait_session_ready(self._pipeline_session_id),
+                            timeout=_PIPELINE_SESSION_READY_TIMEOUT_SECONDS,
+                        )
                 self._publisher_progress_sequence = 0
                 self._publisher_frame_tracking_enabled = self._enable_publisher_frame_tracking()
-                self.event_sink.on_pipeline_session(record.session_id, self._pipeline_session_id)
+                if existing_pipeline_session_id is None:
+                    self.event_sink.on_pipeline_session(record.session_id, self._pipeline_session_id)
                 # The LiveKit RTC callback may run on another thread. Publish
                 # the route as registered only after the runtime has installed
                 # its Motivation session state, then replay the latest control.
@@ -229,8 +247,14 @@ class LiveKitWorker:
                     ).model_dump(mode="json")
                 )
         finally:
+            pipeline_session_id = self._pipeline_session_id
             await self._close_active_session()
-            self.event_sink.on_session_finished(self.worker_id, record.session_id, error)
+            if self._preserve_pipeline_on_close:
+                detached = getattr(self.event_sink, "on_transport_detached", None)
+                if callable(detached):
+                    detached(self.worker_id, record.session_id, pipeline_session_id)
+            else:
+                self.event_sink.on_session_finished(self.worker_id, record.session_id, error)
 
     @property
     def pipeline_session_id(self) -> str | None:
@@ -258,6 +282,13 @@ class LiveKitWorker:
         if self._pipeline_session_id is not None:
             with contextlib.suppress(Exception):
                 self.pipeline_adapter.push_chunk(self._pipeline_session_id, {"type": "stop"})
+
+    async def handoff_transport(self, session_id: str) -> None:
+        """Detach the LiveKit publisher while retaining the imported model state."""
+        if self._active_session_id != session_id:
+            return
+        self._preserve_pipeline_on_close = True
+        self._stop_event.set()
 
     def _enable_publisher_frame_tracking(self) -> bool:
         pipeline_session_id = self._pipeline_session_id
@@ -570,7 +601,7 @@ class LiveKitWorker:
         self._pipeline_session_id = None
         self._pipeline_session_registered = False
         self._pending_control_chunk = None
-        if pipeline_session_id is not None:
+        if pipeline_session_id is not None and not self._preserve_pipeline_on_close:
             with contextlib.suppress(Exception):
                 await asyncio.to_thread(self.pipeline_adapter.close_session, pipeline_session_id)
         try:
