@@ -1,43 +1,54 @@
-# TeleWorldServer 跨机准备（2 × 8 H100）
+# TeleWorldServer 跨机运行（2 × 8 H100）
 
-这份文档记录当前代码已经接入的跨机边界。它完成拓扑描述、全局 NCCL rendezvous、
-全局 worker endpoint 标识和结构化跨节点迁移请求；真正的远端 session 路由仍需要
-一个实现 `WorkerPool.migrate_session_remote` 的多机 WorkerPool，当前本机 router
-不会误把远端 GPU 当成本机 GPU。
+当前版本已经提供可运行的跨机 serving data plane。每台机器启动一个
+`node-agent`，它只管理本机的 process-NCCL workers 和 LiveKit transport；中心
+`stream-serve` 进程管理全局 admission、Motivation policy 和 session placement。
+拥有 session 的节点直接加入同一个 LiveKit 房间并发布视频，视频帧不会经过中心
+节点二次转发。
 
 ## 节点配置
 
-两台机器各自启动一个服务进程，每个服务进程只声明本机的 8 张卡。两个进程使用同一个拓扑字符串和同一个 NCCL master 地址：
+两台机器使用同一份 pipeline、LiveKit 凭据、拓扑字符串和 NCCL master。每台机器
+声明本机的 8 张卡；节点地址必须是对另一台机器可达的地址。
 
 ```bash
-# node-0 / host-a
-export TELEFUSER_LIVEKIT_NODE_ID=node-0
-export TELEFUSER_LIVEKIT_NODE_ADDRESS=host-a
-export TELEFUSER_LIVEKIT_NODE_RANK=0
-export TELEFUSER_LIVEKIT_CLUSTER_WORLD_SIZE=2
-export TELEFUSER_LIVEKIT_CLUSTER_TOPOLOGY='node-0@host-a=0,1,2,3,4,5,6,7;node-1@host-b=0,1,2,3,4,5,6,7'
-export TELEFUSER_LIVEKIT_NCCL_MASTER_ADDRESS=host-a
-export TELEFUSER_LIVEKIT_NCCL_MASTER_PORT=29500
-export TELEFUSER_LIVEKIT_NUM_WORKERS=8
-export TELEFUSER_LIVEKIT_WORKER_GPU_MAP='0;1;2;3;4;5;6;7'
-export TELEFUSER_LIVEKIT_WORKER_MODE=process-nccl
+export PIPE=/path/to/abot_world_pipeline.py
+export TOPOLOGY='node-0@host-a=0,1,2,3,4,5,6,7;node-1@host-b=0,1,2,3,4,5,6,7'
+export LIVEKIT_URL='https://livekit.example'
+export LIVEKIT_KEY='...'
+export LIVEKIT_SECRET='...'
+export AGENT_SECRET='change-me'
 
-# node-1 / host-b：只修改以下三项
-export TELEFUSER_LIVEKIT_NODE_ID=node-1
-export TELEFUSER_LIVEKIT_NODE_ADDRESS=host-b
-export TELEFUSER_LIVEKIT_NODE_RANK=1
+# 只在非中心节点执行；node-1 将 node-id/rank/address 改为自身值。
+telefuser node-agent "$PIPE" \
+  --livekit-url "$LIVEKIT_URL" --livekit-api-key "$LIVEKIT_KEY" \
+  --livekit-api-secret "$LIVEKIT_SECRET" --num-workers 8 \
+  --worker-gpu-map '0;1;2;3;4;5;6;7' \
+  --node-id node-0 --node-address host-a --node-rank 0 \
+  --node-agent-port 8090 --node-agent-secret "$AGENT_SECRET" \
+  --cluster-world-size 2 --cluster-topology "$TOPOLOGY" \
+  --nccl-master-address host-a --nccl-master-port 29500 --nccl-world-size 16 \
+  --skip-validation
+
+# 仅在 node-0 启动中心 API；node-0 的本地 worker 由 stream-serve 管理，不能再启动一个 node-agent。
+telefuser stream-serve "$PIPE" --port 8088 \
+  --livekit-url "$LIVEKIT_URL" --livekit-api-key "$LIVEKIT_KEY" \
+  --livekit-api-secret "$LIVEKIT_SECRET" --num-workers 8 \
+  --worker-gpu-map '0;1;2;3;4;5;6;7' --worker-mode process-nccl \
+  --node-id node-0 --node-address host-a --node-rank 0 \
+  --node-agent-port 8090 --node-agent-secret "$AGENT_SECRET" \
+  --cluster-world-size 2 --cluster-topology "$TOPOLOGY" \
+  --nccl-master-address host-a --nccl-master-port 29500 --nccl-world-size 16 \
+  --motivation-profile /path/to/profile.csv --skip-validation
 ```
 
-也可以使用命令行参数 `--node-id`、`--node-address`、`--node-rank`、`--cluster-world-size` 和 `--cluster-topology`。`cluster_topology` 中的 GPU 编号是节点本地编号，因此两个节点都出现 `0`–`7` 是正确的。
+`cluster_topology` 中的 GPU 编号是节点本地编号，因此两个节点都出现 `0`–`7` 是正确的。
 
-## 当前边界
+## 控制面和迁移边界
 
 - 单机默认值仍为 `node-0`、`127.0.0.1`、world size 1；单机 NCCL 继续使用原来的本地临时端口。
 - 跨机 NCCL 使用固定 master 地址/端口和全局 rank：node-0 使用 rank 0–7，node-1 使用 rank 8–15。
-- `GpuSchedulingState`、`WorkerState` 和 `SessionStateTransferRequest` 现在携带 node/address 元数据，调度诊断可以区分 `intra_node` 与 `inter_node`。
-- 每个本地 worker 都有稳定的 `node-id/worker-id` endpoint；同名的 `worker-0` 在两个节点上不会冲突。`ProcessWorkerSpec.rank` 同时记录它在全局 NCCL group 中的 rank。
-- `NodeAgentMigrationRequest` 是远端 agent 的控制面契约，完整携带 session、源/目标节点、GPU、地址、时间估计和 state bytes；它不把 KV payload 放进 HTTP/控制面消息。
-- 没有远端 WorkerPool 时，跨节点迁移会返回明确错误并保留源 ownership；它不会把 `node-1/gpu-0` 当成 node-0 的本地 GPU 执行。
-- 当前版本还没有宣称可以直接完成跨节点 session state transfer。下一步需要实现远端 WorkerPool/NodeAgent：目标节点准备 paged state、跨节点传输、然后由全局 ownership commit 原子切换路由。
-
-因此，这一版适合先进行 2×8 拓扑启动和 NCCL rendezvous smoke test；在接入远端 WorkerPool 之前，不应把它当作完整的跨机性能结果。
+- `node-agent` 的端口只承载内部 JSON 控制 RPC，提供 health、session start、batch dispatch 和 stop。请求按节点串行发送以保持 session 生命周期顺序，但不同节点可以并行。
+- 全局 scheduler 使用 `node-id/worker-id` 作为 owner，因此两个节点重复的本地 GPU 编号不会冲突。新 session 可以直接分配到任一节点，远端 agent 返回 pipeline-session ready 后中心才向 Motivation 注册该 session。
+- 节点内 re-home 继续使用现有 NCCL state-transfer；跨节点 migration 在当前实现中被显式关闭，Motivation 的候选搜索不会产生跨节点迁移请求，避免把未实现的跨机 KV handoff 当成本地迁移执行。
+- 单机 `cluster_world_size=1` 时仍使用原来的 worker id、单机 pool、单机 NCCL rendezvous 和原有调度路径。

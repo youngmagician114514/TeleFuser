@@ -75,6 +75,7 @@ from .node_agent import (
     NodeAgentMigrationRequest,
     NodeAgentMigrationResult,
 )
+from .distributed_worker_pool import DistributedLiveKitWorkerPool, NodeAgentRpcClient, NodeAgentRpcError
 from .turboserve import (
     TurboServeAutoscalingController,
     TurboServeOwnershipTable,
@@ -104,6 +105,9 @@ __all__ = [
     "NodeAgentDirectory",
     "NodeAgentMigrationRequest",
     "NodeAgentMigrationResult",
+    "DistributedLiveKitWorkerPool",
+    "NodeAgentRpcClient",
+    "NodeAgentRpcError",
     "DispatchCandidate",
     "DispatchLease",
     "GpuSchedulingState",

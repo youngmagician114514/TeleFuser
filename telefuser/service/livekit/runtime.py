@@ -49,6 +49,7 @@ from .turboserve import (
     TurboServeWorkerLoad,
 )
 from .worker_pool import InProcessLiveKitWorkerPool, WorkerPool
+from .distributed_worker_pool import DistributedLiveKitWorkerPool
 
 
 @dataclass(frozen=True)
@@ -191,9 +192,13 @@ class LiveKitServeRuntime:
         self.config = config
         self.pipeline_file = pipeline_file
         self.registry = registry or SessionRegistry()
+        scheduler_endpoints = (
+            config.cluster_worker_endpoints() if config.cluster_world_size > 1 else None
+        )
         self.scheduler = scheduler or LiveKitScheduler(
-            num_workers=config.num_workers,
-            gpu_groups=config.worker_gpu_groups(),
+            num_workers=len(scheduler_endpoints) if scheduler_endpoints is not None else config.num_workers,
+            gpu_groups=None if scheduler_endpoints is not None else config.worker_gpu_groups(),
+            worker_endpoints=scheduler_endpoints,
             queue_size=config.queue_size,
             max_sessions_per_worker=config.session_capacity_limit() or 1,
             node_id=config.node_id,
@@ -257,7 +262,9 @@ class LiveKitServeRuntime:
         # performs a second placement decision for policy-managed sessions.
         self._motivation_owns_placement = motivation_controller is not None
         self._background_rebalance_enabled = (
-            config.turboserve_rebalance_enabled and not self._motivation_owns_placement
+            config.turboserve_rebalance_enabled
+            and config.cluster_world_size == 1
+            and not self._motivation_owns_placement
         )
         self._autoscale_task: asyncio.Task | None = None
         self._cluster_scheduler = TurboServeClusterScheduler(
@@ -585,6 +592,9 @@ class LiveKitServeRuntime:
             "configured_max_sessions_per_worker": self.config.max_sessions_per_worker,
             "control_idle_timeout": self.config.control_idle_timeout,
             "worker_mode": self.config.worker_mode,
+            "node_id": self.config.node_id,
+            "cluster_world_size": self.config.cluster_world_size,
+            "cluster_topology": self.config.cluster_topology,
             "queue_size": self.config.queue_size,
             "autoscaling_enabled": self.config.autoscaling_enabled,
             "motivation_scheduler_enabled": self._motivation_bridge is not None,
@@ -765,6 +775,16 @@ class LiveKitServeRuntime:
         if isinstance(security_level, str):
             security_level = SecurityLevel[security_level.upper()]
         initial_workers = self.config.autoscaling_min_workers if self.config.autoscaling_enabled else None
+        if self.config.cluster_world_size > 1:
+            if self.config.worker_mode != "process-nccl":
+                raise ValueError("distributed serving requires worker_mode='process-nccl'")
+            return DistributedLiveKitWorkerPool(
+                config=self.config,
+                pipeline_file=self.pipeline_file,
+                event_sink=self,
+                security_level=security_level,
+                skip_validation=self.skip_validation,
+            )
         if self.config.worker_mode in {"process", "process-nccl"}:
             worker_states = self.scheduler.workers()
             _, _, _, rank_offset = self.config.nccl_rendezvous(local_worker_count=len(worker_states))

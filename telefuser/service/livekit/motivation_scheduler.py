@@ -897,6 +897,7 @@ class MotivationSchedulerConfig:
     initial_quality: float | None = None
     include_idle_jobs: bool = True
     migration_enabled: bool = True
+    allow_cross_node_migration: bool = True
     policy_name: str = "motivation"
     # Motivation may retain a short ordered action burst per session. Baseline
     # policies force this back to one in ``MotivationScheduler.__init__``.
@@ -1242,6 +1243,29 @@ class MotivationScheduler:
 
         with self._lock:
             self._profile_frontier_cache.clear()
+
+    def _estimate_migration(
+        self,
+        session: SessionSchedulingState,
+        *,
+        target_gpu: GpuSchedulingState,
+        now: float,
+    ) -> MigrationEstimate:
+        """Estimate a move while respecting the deployment's node boundary.
+
+        A multi-node runtime owns each session's LiveKit room on one node.
+        Unless a transport explicitly implements a distributed state handoff,
+        a policy candidate must not turn a local re-home into a remote move.
+        The default remains enabled for the existing single-node scheduler.
+        """
+        owner = self._gpus.get(session.owner_gpu)
+        if (
+            not self.config.allow_cross_node_migration
+            and owner is not None
+            and owner.node_id != target_gpu.node_id
+        ):
+            return MigrationEstimate(ready_at=now, required=False)
+        return self.migration_estimator.estimate(session, target_gpu=target_gpu.gpu_id, now=now)
 
     @property
     def policy_name(self) -> str:
@@ -1951,10 +1975,8 @@ class MotivationScheduler:
                         target_item = assess(item.state, receiver, item.job)
                         if target_item is None:
                             continue
-                        estimate = self.migration_estimator.estimate(
-                            item.state,
-                            target_gpu=receiver.gpu_id,
-                            now=observed_at,
+                        estimate = self._estimate_migration(
+                            item.state, target_gpu=receiver, now=observed_at
                         )
                         if not estimate.required:
                             continue
@@ -2304,10 +2326,8 @@ class MotivationScheduler:
                     or session_id in blocked
                 ):
                     continue
-                estimate = self.migration_estimator.estimate(
-                    state,
-                    target_gpu=target_id,
-                    now=observed_at,
+                estimate = self._estimate_migration(
+                    state, target_gpu=gpu_by_id[target_id], now=observed_at
                 )
                 if not estimate.required:
                     continue
@@ -2775,10 +2795,8 @@ class MotivationScheduler:
                     target_profile = placement_profile(target.gpu_id)
                     if target_profile is None:
                         continue
-                    estimate = self.migration_estimator.estimate(
-                        state,
-                        target_gpu=target.gpu_id,
-                        now=observed_at,
+                    estimate = self._estimate_migration(
+                        state, target_gpu=target, now=observed_at
                     )
                     if not estimate.required:
                         continue
@@ -3175,11 +3193,7 @@ class MotivationScheduler:
             estimates = estimates_by_gpu.get(gpu.gpu_id)
             if estimates is None:
                 estimates = tuple(
-                    self.migration_estimator.estimate(
-                        state,
-                        target_gpu=gpu.gpu_id,
-                        now=observed_at,
-                    )
+                    self._estimate_migration(state, target_gpu=gpu, now=observed_at)
                     for state in ready_states
                 )
                 estimates_by_gpu[gpu.gpu_id] = estimates

@@ -73,6 +73,7 @@ class LiveKitScheduler:
         *,
         num_workers: int,
         gpu_groups: list[list[str]] | None = None,
+        worker_endpoints: list[WorkerEndpoint] | tuple[WorkerEndpoint, ...] | None = None,
         queue_size: int = 0,
         max_sessions_per_worker: int = 1,
         node_id: str = "node-0",
@@ -86,22 +87,40 @@ class LiveKitScheduler:
             raise ValueError("max_sessions_per_worker must be >= 1")
 
         now = utc_timestamp()
-        groups = gpu_groups or [[] for _ in range(num_workers)]
-        if len(groups) != num_workers:
-            raise ValueError(f"Expected {num_workers} GPU groups, got {len(groups)}")
-
-        self._workers: dict[str, WorkerState] = {
-            f"worker-{idx}": WorkerState(
-                worker_id=f"worker-{idx}",
-                node_id=node_id,
-                node_address=node_address,
-                status="idle",
-                gpu_ids=list(groups[idx]),
-                session_capacity=max_sessions_per_worker,
-                last_heartbeat_at=now,
-            )
-            for idx in range(num_workers)
-        }
+        if worker_endpoints is not None:
+            endpoints = tuple(worker_endpoints)
+            if len(endpoints) != num_workers:
+                raise ValueError(f"Expected {num_workers} worker endpoints, got {len(endpoints)}")
+            if len({endpoint.endpoint_id for endpoint in endpoints}) != len(endpoints):
+                raise ValueError("worker_endpoints contain duplicate endpoint ids")
+            self._workers = {
+                endpoint.endpoint_id: WorkerState(
+                    worker_id=endpoint.endpoint_id,
+                    node_id=endpoint.node_id,
+                    node_address=endpoint.address,
+                    status="idle",
+                    gpu_ids=list(endpoint.gpu_ids),
+                    session_capacity=max_sessions_per_worker,
+                    last_heartbeat_at=now,
+                )
+                for endpoint in endpoints
+            }
+        else:
+            groups = gpu_groups or [[] for _ in range(num_workers)]
+            if len(groups) != num_workers:
+                raise ValueError(f"Expected {num_workers} GPU groups, got {len(groups)}")
+            self._workers = {
+                f"worker-{idx}": WorkerState(
+                    worker_id=f"worker-{idx}",
+                    node_id=node_id,
+                    node_address=node_address,
+                    status="idle",
+                    gpu_ids=list(groups[idx]),
+                    session_capacity=max_sessions_per_worker,
+                    last_heartbeat_at=now,
+                )
+                for idx in range(num_workers)
+            }
         self._queue_size = queue_size
         self._queue: deque[_QueuedSession] = deque()
         self._room_names: dict[str, str] = {}

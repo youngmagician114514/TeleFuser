@@ -42,6 +42,16 @@ class LiveKitServeConfig(BaseSettings):
     node_id: str = Field(default="node-0", description="Stable identity of the host running this service")
     node_address: str = Field(default="127.0.0.1", description="Reachable control/data address of this host")
     node_rank: int = Field(default=0, ge=0, description="Stable rank of this host within the cluster")
+    node_agent_port: int = Field(
+        default=8090,
+        ge=1,
+        le=65535,
+        description="NodeAgent control port used by the coordinator and peer nodes",
+    )
+    node_agent_secret: str = Field(
+        default="",
+        description="Optional shared secret for the internal NodeAgent control plane",
+    )
     cluster_world_size: int = Field(default=1, ge=1, le=128, description="Number of node agents in the deployment")
     cluster_topology: str | None = Field(
         default=None,
@@ -257,6 +267,8 @@ class LiveKitServeConfig(BaseSettings):
         if self.cluster_world_size > 1:
             if self.worker_mode != "process-nccl":
                 raise ValueError("multi-node serving currently requires worker_mode='process-nccl'")
+            if self.autoscaling_enabled:
+                raise ValueError("multi-node serving currently requires autoscaling_enabled=False")
             if self.autoscaling_enabled and self.autoscaling_min_workers != self.num_workers:
                 raise ValueError("multi-node NCCL requires all local workers to start together")
         if self.autoscaling_min_workers > self.num_workers:
@@ -329,6 +341,50 @@ class LiveKitServeConfig(BaseSettings):
     def local_node(self) -> NodeAgent:
         """Return this process's node record from the validated topology."""
         return self.topology().node(self.node_id)
+
+    def cluster_worker_endpoints(self) -> tuple["WorkerEndpoint", ...]:
+        """Return globally unique one-GPU worker endpoints for a cluster.
+
+        The legacy single-node path intentionally keeps its original
+        ``worker-N`` identifiers.  A multi-node deployment uses stable
+        ``node-id/worker-N`` endpoint ids so local GPU ordinals can repeat on
+        different hosts without colliding in admission or policy state.
+        """
+        from .topology import WorkerEndpoint
+
+        topology = self.topology()
+        if len(topology.nodes) == 1 and self.cluster_world_size == 1:
+            groups = self.worker_gpu_groups()
+            node = topology.nodes[0]
+            return tuple(
+                WorkerEndpoint(
+                    worker_id=f"worker-{index}",
+                    node_id=node.node_id,
+                    gpu_ids=tuple(group),
+                    address=node.address,
+                    port=self.node_agent_port,
+                    rank=node.rank,
+                )
+                for index, group in enumerate(groups)
+            )
+        endpoints: list[WorkerEndpoint] = []
+        for node in topology.nodes:
+            for index, gpu_id in enumerate(node.gpu_ids):
+                endpoints.append(
+                    WorkerEndpoint(
+                        worker_id=f"worker-{index}",
+                        node_id=node.node_id,
+                        gpu_ids=(gpu_id,),
+                        address=node.address,
+                        port=node.control_port or self.node_agent_port,
+                        rank=node.rank,
+                    )
+                )
+        return tuple(endpoints)
+
+    def local_cluster_worker_endpoints(self) -> tuple["WorkerEndpoint", ...]:
+        """Return only endpoints hosted by this process's node."""
+        return tuple(endpoint for endpoint in self.cluster_worker_endpoints() if endpoint.node_id == self.node_id)
 
     def effective_node_address(self) -> str:
         """Return the topology address when one was supplied, else node_address."""

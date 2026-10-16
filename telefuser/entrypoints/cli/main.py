@@ -132,6 +132,76 @@ def serve(
     )
 
 
+@main.command(name="node-agent")
+@click.argument("pipe_path")
+@click.option("--host", default="0.0.0.0", type=str)
+@click.option("--livekit-url", default=None, type=str)
+@click.option("--livekit-api-key", default=None, type=str)
+@click.option("--livekit-api-secret", default=None, type=str)
+@click.option("--num-workers", default=1, type=int)
+@click.option("--max-sessions-per-worker", default=None, type=str)
+@click.option("--worker-gpu-map", default=None, type=str)
+@click.option("--node-id", required=True, type=str)
+@click.option("--node-address", required=True, type=str)
+@click.option("--node-rank", required=True, type=int)
+@click.option("--node-agent-port", default=8090, type=int)
+@click.option("--node-agent-secret", default="", type=str)
+@click.option("--cluster-world-size", required=True, type=int)
+@click.option("--cluster-topology", required=True, type=str)
+@click.option("--nccl-master-address", required=True, type=str)
+@click.option("--nccl-master-port", default=29500, type=int)
+@click.option("--nccl-world-size", default=None, type=int)
+@click.option("--security-level", default="strict", type=click.Choice(["none", "basic", "strict", "sandbox"], case_sensitive=False))
+@click.option("--skip-validation", is_flag=True, default=False)
+def node_agent(
+    pipe_path: str,
+    host: str,
+    livekit_url: str | None,
+    livekit_api_key: str | None,
+    livekit_api_secret: str | None,
+    num_workers: int,
+    max_sessions_per_worker: str | None,
+    worker_gpu_map: str | None,
+    node_id: str,
+    node_address: str,
+    node_rank: int,
+    node_agent_port: int,
+    node_agent_secret: str,
+    cluster_world_size: int,
+    cluster_topology: str,
+    nccl_master_address: str,
+    nccl_master_port: int,
+    nccl_world_size: int | None,
+    security_level: str,
+    skip_validation: bool,
+) -> None:
+    """Start a node-local worker agent for a multi-host stream server."""
+    from telefuser.service.livekit.main import run_node_agent
+
+    run_node_agent(
+        pipe_path=pipe_path,
+        host=host,
+        livekit_url=livekit_url,
+        livekit_api_key=livekit_api_key,
+        livekit_api_secret=livekit_api_secret,
+        num_workers=num_workers,
+        max_sessions_per_worker=max_sessions_per_worker,
+        worker_gpu_map=worker_gpu_map,
+        node_id=node_id,
+        node_address=node_address,
+        node_rank=node_rank,
+        node_agent_port=node_agent_port,
+        node_agent_secret=node_agent_secret,
+        cluster_world_size=cluster_world_size,
+        cluster_topology=cluster_topology,
+        nccl_master_address=nccl_master_address,
+        nccl_master_port=nccl_master_port,
+        nccl_world_size=nccl_world_size,
+        security_level=security_level,
+        skip_validation=skip_validation,
+    )
+
+
 @main.command(name="stream-serve")
 @click.argument("pipe_path")
 @click.option("--host", default="0.0.0.0", type=str, help="HTTP API bind host")
@@ -158,6 +228,8 @@ def serve(
 @click.option("--node-id", default=None, type=str, help="Stable identity of the host running this service")
 @click.option("--node-address", default=None, type=str, help="Reachable address of the host running this service")
 @click.option("--node-rank", default=None, type=int, help="Rank of this host in the multi-node deployment")
+@click.option("--node-agent-port", default=None, type=int, help="Internal NodeAgent control port")
+@click.option("--node-agent-secret", default=None, type=str, help="Shared secret for internal NodeAgent RPC")
 @click.option("--cluster-world-size", default=None, type=int, help="Number of node agents in the deployment")
 @click.option(
     "--cluster-topology",
@@ -265,6 +337,8 @@ def stream_serve(
     node_id: str | None,
     node_address: str | None,
     node_rank: int | None,
+    node_agent_port: int | None,
+    node_agent_secret: str | None,
     cluster_world_size: int | None,
     cluster_topology: str | None,
     nccl_master_address: str | None,
@@ -324,6 +398,8 @@ def stream_serve(
         node_id=node_id,
         node_address=node_address,
         node_rank=node_rank,
+        node_agent_port=node_agent_port,
+        node_agent_secret=node_agent_secret,
         cluster_world_size=cluster_world_size,
         cluster_topology=cluster_topology,
         nccl_master_address=nccl_master_address,

@@ -9,6 +9,7 @@ from typing import Any
 import uvicorn
 
 from telefuser._logo import TELEFUSER_LOGO
+from telefuser.service.security.security_validator import SecurityLevel
 from telefuser.utils.logging import logger
 
 from .app import create_livekit_app
@@ -38,6 +39,8 @@ def run_stream_server(
     node_id: str | None = None,
     node_address: str | None = None,
     node_rank: int | None = None,
+    node_agent_port: int | None = None,
+    node_agent_secret: str | None = None,
     cluster_world_size: int | None = None,
     cluster_topology: str | None = None,
     nccl_master_address: str | None = None,
@@ -80,6 +83,8 @@ def run_stream_server(
             "node_id": node_id,
             "node_address": node_address,
             "node_rank": node_rank,
+            "node_agent_port": node_agent_port,
+            "node_agent_secret": node_agent_secret,
             "cluster_world_size": cluster_world_size,
             "cluster_topology": cluster_topology,
             "nccl_master_address": nccl_master_address,
@@ -108,14 +113,16 @@ def run_stream_server(
         normalized_policy = str(motivation_policy).strip().lower()
         if normalized_policy == "slackserver":
             normalized_policy = "slackserve"
+        endpoints = config.cluster_worker_endpoints()
         gpu_states = [
             GpuSchedulingState(
-                f"worker-{index}",
-                node_id=config.node_id,
-                endpoint_address=config.effective_node_address(),
+                endpoint.endpoint_id if config.cluster_world_size > 1 else endpoint.worker_id,
+                node_id=endpoint.node_id,
+                endpoint_address=endpoint.address,
+                endpoint_port=endpoint.port if config.cluster_world_size > 1 else None,
                 memory_free_gb=motivation_memory_free_gb,
             )
-            for index in range(config.num_workers)
+            for endpoint in endpoints
         ]
         diagnostics = MotivationDiagnosticsCollector(
             recent_search_limit=64,
@@ -133,6 +140,7 @@ def run_stream_server(
                 # normalizes this defensively, but keeping the entrypoint
                 # value explicit makes runtime metadata and tests unambiguous.
                 migration_enabled=motivation_migration and normalized_policy != "fifo",
+                allow_cross_node_migration=(config.cluster_world_size == 1),
                 policy_name=normalized_policy,
                 load_balance_capacity_per_worker=config.session_capacity_limit() or 12,
                 turboserve_capacity_per_worker=config.session_capacity_limit() or 12,
@@ -192,6 +200,68 @@ def run_stream_server(
             asyncio.run(runtime.aclose())
         except Exception as exc:
             logger.warning(f"Error during LiveKit server cleanup: {exc}")
+
+
+def run_node_agent(
+    *,
+    pipe_path: str,
+    host: str | None = None,
+    livekit_url: str | None = None,
+    livekit_api_key: str | None = None,
+    livekit_api_secret: str | None = None,
+    num_workers: int | None = None,
+    max_sessions_per_worker: int | str | None = None,
+    worker_gpu_map: str | None = None,
+    node_id: str | None = None,
+    node_address: str | None = None,
+    node_rank: int | None = None,
+    node_agent_port: int | None = None,
+    node_agent_secret: str | None = None,
+    cluster_world_size: int | None = None,
+    cluster_topology: str | None = None,
+    nccl_master_address: str | None = None,
+    nccl_master_port: int | None = None,
+    nccl_world_size: int | None = None,
+    worker_mode: str = "process-nccl",
+    skip_validation: bool = False,
+    security_level: str | None = None,
+) -> None:
+    """Run a node-local worker agent for a distributed coordinator."""
+    config = LiveKitServeConfig(
+        host=host or "0.0.0.0",
+        livekit_url=livekit_url or "",
+        livekit_api_key=livekit_api_key or "",
+        livekit_api_secret=livekit_api_secret or "",
+        num_workers=num_workers or 1,
+        max_sessions_per_worker=max_sessions_per_worker or "auto",
+        worker_gpu_map=worker_gpu_map,
+        node_id=node_id or "node-0",
+        node_address=node_address or "127.0.0.1",
+        node_rank=node_rank or 0,
+        node_agent_port=node_agent_port or 8090,
+        node_agent_secret=node_agent_secret or "",
+        cluster_world_size=cluster_world_size or 1,
+        cluster_topology=cluster_topology,
+        nccl_master_address=nccl_master_address,
+        nccl_master_port=nccl_master_port or 29500,
+        nccl_world_size=nccl_world_size,
+        worker_mode=worker_mode,
+    )
+    config.require_livekit_credentials()
+    from .node_agent_server import run_node_agent as _run_node_agent
+
+    level = None if security_level is None else SecurityLevel[security_level.upper()]
+    try:
+        asyncio.run(
+            _run_node_agent(
+                pipe_path=pipe_path,
+                config=config,
+                security_level=level,
+                skip_validation=skip_validation,
+            )
+        )
+    except KeyboardInterrupt:
+        logger.info("NodeAgent interrupted by user")
 
 
 def _drop_none(values: dict[str, Any]) -> dict[str, Any]:
