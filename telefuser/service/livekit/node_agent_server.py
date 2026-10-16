@@ -28,6 +28,8 @@ class _NodeAgentEventSink(NullWorkerEventSink):
         self.dispatch_failures: list[dict[str, Any]] = []
         self.published_chunks: list[dict[str, Any]] = []
         self.capacities: dict[str, int] = {}
+        self.control_received: list[dict[str, str]] = []
+        self.control_messages: list[dict[str, Any]] = []
         self._waiters: dict[str, asyncio.Future[str]] = {}
 
     def watch_pipeline(self, session_id: str) -> asyncio.Future[str]:
@@ -49,6 +51,26 @@ class _NodeAgentEventSink(NullWorkerEventSink):
     def on_worker_capacity(self, worker_id: str, capacity: int, profile: dict[str, object] | None = None) -> None:
         del profile
         self.capacities[str(worker_id)] = int(capacity)
+
+    def on_control_received(self, worker_id: str, session_id: str) -> None:
+        self.control_received.append({"worker_id": str(worker_id), "session_id": str(session_id)})
+
+    def on_control_message(self, worker_id: str, session_id: str, chunk: dict[str, Any]) -> bool:
+        # Always forward the raw control to the coordinator.  The coordinator
+        # decides whether Motivation owns it; a non-Motivation policy can send
+        # the same message back through the remote worker-pool RPC.
+        self.control_messages.append(
+            {"worker_id": str(worker_id), "session_id": str(session_id), "chunk": dict(chunk)}
+        )
+        return True
+
+    def drain_control_messages(self) -> list[dict[str, Any]]:
+        values, self.control_messages = self.control_messages, []
+        return values
+
+    def drain_control_received(self) -> list[dict[str, str]]:
+        values, self.control_received = self.control_received, []
+        return values
 
     def on_session_finished(self, worker_id: str, session_id: str, error: str | None = None) -> None:
         del worker_id
@@ -216,6 +238,8 @@ class NodeAgentServer:
                 "compute_completions": self._sink.drain_compute_completions(),
                 "dispatch_failures": self._sink.drain_dispatch_failures(),
                 "published_chunks": self._sink.drain_published_chunks(),
+                "control_messages": self._sink.drain_control_messages(),
+                "control_received": self._sink.drain_control_received(),
             }
         if method == "start_session":
             record = SessionRecord.model_validate(params["record"])

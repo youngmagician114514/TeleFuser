@@ -214,6 +214,20 @@ class DistributedLiveKitWorkerPool(WorkerPool):
                     continue
                 active = {str(session_id) for session_id in health.get("active_sessions", ())}
                 self._apply_remote_capacities(node_id, health)
+                for received in health.get("control_received", ()):
+                    self._event_sink.on_control_received(
+                        str(received.get("worker_id", "")), str(received.get("session_id", ""))
+                    )
+                for message in health.get("control_messages", ()):
+                    worker_id = str(message.get("worker_id", ""))
+                    session_id = str(message.get("session_id", ""))
+                    chunk = dict(message.get("chunk") or {})
+                    handled = bool(self._event_sink.on_control_message(worker_id, session_id, chunk))
+                    if not handled:
+                        self.dispatch_batch(
+                            SimpleNamespace(candidate=SimpleNamespace(gpu_id=worker_id), jobs=()),
+                            [(session_id, chunk)],
+                        )
                 for completion in health.get("compute_completions", ()):
                     self._event_sink.on_motivation_compute_complete(
                         job_ids=tuple(str(value) for value in completion.get("job_ids", ())),
