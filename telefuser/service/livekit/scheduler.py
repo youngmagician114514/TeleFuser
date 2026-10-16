@@ -9,6 +9,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from .schemas import utc_timestamp
+from .topology import WorkerEndpoint
 
 WorkerStatus = Literal[
     "starting",
@@ -28,6 +29,8 @@ class WorkerState(BaseModel):
     """Scheduler-visible state for one model worker."""
 
     worker_id: str
+    node_id: str = "node-0"
+    node_address: str | None = None
     status: WorkerStatus
     gpu_ids: list[str] = Field(default_factory=list)
     session_ids: list[str] = Field(default_factory=list)
@@ -36,6 +39,15 @@ class WorkerState(BaseModel):
     room_name: str | None = None
     last_heartbeat_at: float
     error: str | None = None
+
+    def endpoint(self) -> WorkerEndpoint:
+        """Return the globally identifiable endpoint for this worker."""
+        return WorkerEndpoint(
+            worker_id=self.worker_id,
+            node_id=self.node_id,
+            gpu_ids=tuple(self.gpu_ids),
+            address=self.node_address,
+        )
 
 
 class SchedulerAdmission(BaseModel):
@@ -63,6 +75,8 @@ class LiveKitScheduler:
         gpu_groups: list[list[str]] | None = None,
         queue_size: int = 0,
         max_sessions_per_worker: int = 1,
+        node_id: str = "node-0",
+        node_address: str | None = None,
     ) -> None:
         if num_workers < 1:
             raise ValueError("num_workers must be >= 1")
@@ -79,6 +93,8 @@ class LiveKitScheduler:
         self._workers: dict[str, WorkerState] = {
             f"worker-{idx}": WorkerState(
                 worker_id=f"worker-{idx}",
+                node_id=node_id,
+                node_address=node_address,
                 status="idle",
                 gpu_ids=list(groups[idx]),
                 session_capacity=max_sessions_per_worker,

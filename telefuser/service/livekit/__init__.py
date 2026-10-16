@@ -68,6 +68,13 @@ from .session_state_transfer import (
     SessionStateTransferRecord,
     SessionStateTransferRequest,
 )
+from .topology import ClusterTopology, NodeAgent, WorkerEndpoint, transport_scope
+from .node_agent import (
+    NodeAgentClient,
+    NodeAgentDirectory,
+    NodeAgentMigrationRequest,
+    NodeAgentMigrationResult,
+)
 from .turboserve import (
     TurboServeAutoscalingController,
     TurboServeOwnershipTable,
@@ -89,6 +96,14 @@ __all__ = [
     "SessionStateTransferManager",
     "SessionStateTransferRecord",
     "SessionStateTransferRequest",
+    "ClusterTopology",
+    "NodeAgent",
+    "WorkerEndpoint",
+    "transport_scope",
+    "NodeAgentClient",
+    "NodeAgentDirectory",
+    "NodeAgentMigrationRequest",
+    "NodeAgentMigrationResult",
     "DispatchCandidate",
     "DispatchLease",
     "GpuSchedulingState",

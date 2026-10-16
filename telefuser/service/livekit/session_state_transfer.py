@@ -38,6 +38,10 @@ class SessionStateTransferRequest:
     requested_at: float
     estimated_ready_at: float
     state_bytes: int = 0
+    source_node_id: str = "node-0"
+    target_node_id: str = "node-0"
+    source_address: str | None = None
+    target_address: str | None = None
 
     def __post_init__(self) -> None:
         if not self.session_id or not self.source_gpu or not self.target_gpu:
@@ -52,6 +56,17 @@ class SessionStateTransferRequest:
             raise ValueError("estimated_ready_at cannot precede requested_at")
         if self.state_bytes < 0:
             raise ValueError("state_bytes must be non-negative")
+        if not self.source_node_id or not self.target_node_id:
+            raise ValueError("source_node_id and target_node_id must be non-empty")
+
+    @property
+    def transport_scope(self) -> Literal["intra_node", "inter_node"]:
+        """Return the transport class needed by the backend."""
+        return "intra_node" if self.source_node_id == self.target_node_id else "inter_node"
+
+    @property
+    def crosses_node(self) -> bool:
+        return self.transport_scope == "inter_node"
 
 
 class SessionStateTransferBackend(Protocol):

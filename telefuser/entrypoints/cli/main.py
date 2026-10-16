@@ -155,6 +155,19 @@ def serve(
 @click.option(
     "--worker-gpu-map", default=None, type=str, help="GPU group for the current worker, for example '0,1,2,3'"
 )
+@click.option("--node-id", default=None, type=str, help="Stable identity of the host running this service")
+@click.option("--node-address", default=None, type=str, help="Reachable address of the host running this service")
+@click.option("--node-rank", default=None, type=int, help="Rank of this host in the multi-node deployment")
+@click.option("--cluster-world-size", default=None, type=int, help="Number of node agents in the deployment")
+@click.option(
+    "--cluster-topology",
+    default=None,
+    type=str,
+    help="Node map: 'node-0@host-a=0,1;node-1@host-b=0,1'",
+)
+@click.option("--nccl-master-address", default=None, type=str, help="NCCL rendezvous master address")
+@click.option("--nccl-master-port", default=None, type=int, help="NCCL rendezvous master port")
+@click.option("--nccl-world-size", default=None, type=int, help="Global NCCL worker count")
 @click.option(
     "--queue-size", default=0, type=int, help="Maximum queued sessions; 0 rejects when retained slots are full"
 )
@@ -249,6 +262,14 @@ def stream_serve(
     num_workers: int,
     max_sessions_per_worker: int | None,
     worker_gpu_map: str | None,
+    node_id: str | None,
+    node_address: str | None,
+    node_rank: int | None,
+    cluster_world_size: int | None,
+    cluster_topology: str | None,
+    nccl_master_address: str | None,
+    nccl_master_port: int | None,
+    nccl_world_size: int | None,
     queue_size: int,
     enable_autoscaling: bool,
     autoscaling_min_workers: int,
@@ -300,6 +321,14 @@ def stream_serve(
         num_workers=num_workers,
         max_sessions_per_worker=max_sessions_per_worker,
         worker_gpu_map=worker_gpu_map,
+        node_id=node_id,
+        node_address=node_address,
+        node_rank=node_rank,
+        cluster_world_size=cluster_world_size,
+        cluster_topology=cluster_topology,
+        nccl_master_address=nccl_master_address,
+        nccl_master_port=nccl_master_port,
+        nccl_world_size=nccl_world_size,
         queue_size=queue_size,
         autoscaling_enabled=enable_autoscaling,
         autoscaling_min_workers=autoscaling_min_workers,

@@ -7,6 +7,8 @@ from typing import Literal
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .topology import ClusterTopology, NodeAgent
+
 
 class LiveKitServeConfig(BaseSettings):
     """Runtime configuration for the LiveKit serving entrypoint."""
@@ -36,6 +38,28 @@ class LiveKitServeConfig(BaseSettings):
     worker_mode: Literal["in-process", "process", "process-nccl"] = Field(
         default="in-process",
         description="Worker isolation mode",
+    )
+    node_id: str = Field(default="node-0", description="Stable identity of the host running this service")
+    node_address: str = Field(default="127.0.0.1", description="Reachable control/data address of this host")
+    node_rank: int = Field(default=0, ge=0, description="Stable rank of this host within the cluster")
+    cluster_world_size: int = Field(default=1, ge=1, le=128, description="Number of node agents in the deployment")
+    cluster_topology: str | None = Field(
+        default=None,
+        description=(
+            "Optional node map: 'node-0@host-a=0,1,...;node-1@host-b=0,1,...'. "
+            "GPU ordinals are local to each node."
+        ),
+    )
+    nccl_master_address: str | None = Field(
+        default=None,
+        description="Rendezvous address for a multi-node NCCL process group; node-0 address is used by default",
+    )
+    nccl_master_port: int = Field(default=29500, ge=1, le=65535, description="Rendezvous port for multi-node NCCL")
+    nccl_world_size: int | None = Field(
+        default=None,
+        ge=1,
+        le=4096,
+        description="Optional global NCCL worker count; derived from cluster_topology when omitted",
     )
 
     dispatch_trace_path: str | None = Field(
@@ -174,6 +198,33 @@ class LiveKitServeConfig(BaseSettings):
         stripped = value.strip()
         return stripped or None
 
+    @field_validator("node_id", "node_address")
+    @classmethod
+    def validate_node_text(cls: type[LiveKitServeConfig], value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("node_id and node_address must be non-empty")
+        return normalized
+
+    @field_validator("nccl_master_address")
+    @classmethod
+    def validate_nccl_master_address(cls: type[LiveKitServeConfig], value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    @field_validator("cluster_topology")
+    @classmethod
+    def validate_cluster_topology(cls: type[LiveKitServeConfig], value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        ClusterTopology.from_spec(normalized)
+        return normalized
+
     @field_validator("max_sessions_per_worker", mode="before")
     @classmethod
     def validate_max_sessions_per_worker(cls: type[LiveKitServeConfig], value: object) -> int | str:
@@ -192,6 +243,22 @@ class LiveKitServeConfig(BaseSettings):
 
     @model_validator(mode="after")
     def validate_autoscaling_bounds(self) -> LiveKitServeConfig:
+        if self.cluster_world_size > 1 and self.cluster_topology is None:
+            raise ValueError("cluster_topology is required when cluster_world_size > 1")
+        if self.cluster_topology is not None:
+            topology_nodes = len(ClusterTopology.from_spec(self.cluster_topology).nodes)
+            if topology_nodes != self.cluster_world_size:
+                raise ValueError(
+                    "cluster_world_size must match cluster_topology: "
+                    f"expected {topology_nodes}, got {self.cluster_world_size}"
+                )
+        if self.cluster_world_size == 1 and self.node_rank != 0:
+            raise ValueError("node_rank must be 0 for a single-node deployment")
+        if self.cluster_world_size > 1:
+            if self.worker_mode != "process-nccl":
+                raise ValueError("multi-node serving currently requires worker_mode='process-nccl'")
+            if self.autoscaling_enabled and self.autoscaling_min_workers != self.num_workers:
+                raise ValueError("multi-node NCCL requires all local workers to start together")
         if self.autoscaling_min_workers > self.num_workers:
             raise ValueError("autoscaling_min_workers cannot exceed num_workers")
         if self.autoscaling_enabled and self.num_workers > 1 and self.queue_size == 0:
@@ -234,3 +301,67 @@ class LiveKitServeConfig(BaseSettings):
         if len(groups) != self.num_workers:
             raise ValueError(f"worker_gpu_map defines {len(groups)} worker groups, but num_workers={self.num_workers}")
         return groups
+
+    def topology(self) -> ClusterTopology:
+        """Return the configured cluster topology, defaulting to one local node."""
+        if self.cluster_topology is not None:
+            topology = ClusterTopology.from_spec(self.cluster_topology)
+            topology.node(self.node_id)
+            if self.cluster_world_size != len(topology.nodes):
+                raise ValueError(
+                    "cluster_world_size must match cluster_topology: "
+                    f"expected {len(topology.nodes)}, got {self.cluster_world_size}"
+                )
+            node = topology.node(self.node_id)
+            if node.rank != self.node_rank:
+                raise ValueError(
+                    f"node_rank={self.node_rank} does not match topology rank {node.rank} for {self.node_id!r}"
+                )
+            return topology
+        local_gpus = tuple(gpu for group in self.worker_gpu_groups() for gpu in group)
+        return ClusterTopology.single_node(
+            node_id=self.node_id,
+            address=self.node_address,
+            gpu_ids=local_gpus,
+            rank=self.node_rank,
+        )
+
+    def local_node(self) -> NodeAgent:
+        """Return this process's node record from the validated topology."""
+        return self.topology().node(self.node_id)
+
+    def effective_node_address(self) -> str:
+        """Return the topology address when one was supplied, else node_address."""
+        if self.cluster_topology is not None:
+            return self.local_node().address
+        return self.node_address
+
+    def nccl_rendezvous(self, *, local_worker_count: int) -> tuple[str, int, int, int]:
+        """Return ``(master, port, world_size, local_rank_offset)``.
+
+        Single-node deployments retain the caller's existing ephemeral
+        rendezvous behavior.  Multi-node deployments use the explicit
+        cluster topology and stable node rank so each host can launch its
+        local eight-worker shard into one 16-rank process group.
+        """
+        if local_worker_count < 1:
+            raise ValueError("local_worker_count must be positive")
+        if self.cluster_world_size == 1 and self.cluster_topology is None:
+            return "127.0.0.1", 0, local_worker_count, 0
+        topology = self.topology()
+        if len(topology.nodes) == 1:
+            return topology.nodes[0].address, self.nccl_master_port, local_worker_count, 0
+        counts = [len(node.gpu_ids) for node in topology.nodes]
+        if any(count == 0 for count in counts):
+            world_size = self.nccl_world_size or local_worker_count * len(topology.nodes)
+            offset = self.node_rank * local_worker_count
+        else:
+            if any(count != local_worker_count for count in counts):
+                raise ValueError("multi-node NCCL currently requires equal local worker counts on every node")
+            world_size = self.nccl_world_size or sum(counts)
+            offset = sum(counts[: self.node_rank])
+        required_world_size = sum(counts) if all(counts) else local_worker_count * len(topology.nodes)
+        if world_size < required_world_size:
+            raise ValueError("nccl_world_size is smaller than the configured node worker population")
+        master = self.nccl_master_address or topology.nodes[0].address
+        return master, self.nccl_master_port, world_size, offset

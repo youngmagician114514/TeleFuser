@@ -18,6 +18,7 @@ from .motivation_controller import MotivationRuntimeController
 from .motivation_execution import MotivationExecutionBridge, release_on_control_state
 from .multi_session_worker import MultiSessionLiveKitWorker as LiveKitWorker
 from .nccl_process_worker_pool import NCCLProcessLiveKitWorkerPool
+from .node_agent import NodeAgentMigrationRequest
 from .pipeline_adapter import LiveKitPipelineAdapter
 from .pipeline_router import TurboServePipelineRouter
 from .process_worker_pool import ProcessLiveKitWorkerPool, ProcessWorkerSpec
@@ -73,16 +74,30 @@ class _RuntimeSessionStateTransferBackend:
     def begin(self, request: SessionStateTransferRequest) -> _RuntimeTransferOperation:
         compute_ready: concurrent.futures.Future[None] = concurrent.futures.Future()
 
+        async def start_migration() -> object:
+            # The current worker pools are node-local.  Do not silently pass a
+            # remote worker ID into the local router: a future distributed
+            # pool can provide this optional hook once its node agent and
+            # transport bootstrap are ready.
+            if request.crosses_node:
+                remote_migrate = getattr(self._runtime.worker_pool, "migrate_session_remote", None)
+                if not callable(remote_migrate):
+                    raise RuntimeError(
+                        "cross-node session migration requires a WorkerPool.migrate_session_remote hook"
+                    )
+                return await remote_migrate(NodeAgentMigrationRequest.from_transfer_request(request))
+            return await self._runtime.migrate_session(
+                request.session_id,
+                request.target_gpu,
+                compute_ready_callback=publish_compute_ready,
+            )
+
         def publish_compute_ready() -> None:
             if not compute_ready.done():
                 compute_ready.set_result(None)
 
         migration = asyncio.run_coroutine_threadsafe(
-            self._runtime.migrate_session(
-                request.session_id,
-                request.target_gpu,
-                compute_ready_callback=publish_compute_ready,
-            ),
+            start_migration(),
             self._loop,
         )
 
@@ -181,6 +196,8 @@ class LiveKitServeRuntime:
             gpu_groups=config.worker_gpu_groups(),
             queue_size=config.queue_size,
             max_sessions_per_worker=config.session_capacity_limit() or 1,
+            node_id=config.node_id,
+            node_address=config.effective_node_address(),
         )
         self.token_service = token_service or LiveKitTokenService(
             api_key=config.livekit_api_key,
@@ -749,9 +766,17 @@ class LiveKitServeRuntime:
             security_level = SecurityLevel[security_level.upper()]
         initial_workers = self.config.autoscaling_min_workers if self.config.autoscaling_enabled else None
         if self.config.worker_mode in {"process", "process-nccl"}:
+            worker_states = self.scheduler.workers()
+            _, _, _, rank_offset = self.config.nccl_rendezvous(local_worker_count=len(worker_states))
             specs = [
-                ProcessWorkerSpec(worker_id=state.worker_id, gpu_ids=list(state.gpu_ids))
-                for state in self.scheduler.workers()
+                ProcessWorkerSpec(
+                    worker_id=state.worker_id,
+                    gpu_ids=list(state.gpu_ids),
+                    node_id=state.node_id,
+                    node_address=state.node_address,
+                    rank=rank_offset + index,
+                )
+                for index, state in enumerate(worker_states)
             ]
             pool_type = (
                 NCCLProcessLiveKitWorkerPool if self.config.worker_mode == "process-nccl" else ProcessLiveKitWorkerPool

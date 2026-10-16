@@ -1163,54 +1163,65 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
                             timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
                         ),
                     )
-                    base_metadata = dict(base_exported["result"])
-                    await self._run_migration_phase(
-                        token.token_id,
-                        "incremental_precopy_prepare",
-                        lambda: self._request(
-                            target_worker_id,
-                            "nccl_precopy_prepare_recv",
-                            session_id=pipeline_session_id,
-                            transfer_id=incremental_base_transfer_id,
-                            metadata=base_metadata,
-                            owner_worker_id=target_worker_id,
-                            ownership_epoch=token.source_epoch + 1,
-                            source_rank=self._nccl_ranks[source_worker_id],
-                            timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
-                        ),
-                    )
-                    pair_key = tuple(sorted((source_worker_id, target_worker_id)))
-                    pair_lock = self._nccl_pair_transfer_locks.setdefault(pair_key, asyncio.Lock())
+                    base_result = base_exported.get("result") if isinstance(base_exported, dict) else None
+                    if not isinstance(base_result, dict):
+                        # A worker from the pre-copy protocol may acknowledge
+                        # the command with a boolean result. Fall back to the
+                        # authoritative full snapshot instead of treating the
+                        # compatibility response as iterable metadata.
+                        incremental_enabled = False
+                    else:
+                        base_metadata = dict(base_result)
+                    if not incremental_enabled:
+                        base_metadata = {}
+                    if incremental_enabled:
+                        await self._run_migration_phase(
+                            token.token_id,
+                            "incremental_precopy_prepare",
+                            lambda: self._request(
+                                target_worker_id,
+                                "nccl_precopy_prepare_recv",
+                                session_id=pipeline_session_id,
+                                transfer_id=incremental_base_transfer_id,
+                                metadata=base_metadata,
+                                owner_worker_id=target_worker_id,
+                                ownership_epoch=token.source_epoch + 1,
+                                source_rank=self._nccl_ranks[source_worker_id],
+                                timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
+                            ),
+                        )
+                        pair_key = tuple(sorted((source_worker_id, target_worker_id)))
+                        pair_lock = self._nccl_pair_transfer_locks.setdefault(pair_key, asyncio.Lock())
 
-                    async def transfer_precopy() -> list[dict[str, Any]]:
-                        async with pair_lock:
-                            return await asyncio.gather(
-                                self._request(
-                                    source_worker_id,
-                                    "nccl_precopy_send",
-                                    transfer_id=incremental_base_transfer_id,
-                                    target_rank=self._nccl_ranks[target_worker_id],
-                                    timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
-                                ),
-                                self._request(
-                                    target_worker_id,
-                                    "nccl_precopy_recv",
-                                    session_id=pipeline_session_id,
-                                    transfer_id=incremental_base_transfer_id,
-                                    source_rank=self._nccl_ranks[source_worker_id],
-                                    timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
-                                ),
-                            )
+                        async def transfer_precopy() -> list[dict[str, Any]]:
+                            async with pair_lock:
+                                return await asyncio.gather(
+                                    self._request(
+                                        source_worker_id,
+                                        "nccl_precopy_send",
+                                        transfer_id=incremental_base_transfer_id,
+                                        target_rank=self._nccl_ranks[target_worker_id],
+                                        timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
+                                    ),
+                                    self._request(
+                                        target_worker_id,
+                                        "nccl_precopy_recv",
+                                        session_id=pipeline_session_id,
+                                        transfer_id=incremental_base_transfer_id,
+                                        source_rank=self._nccl_ranks[source_worker_id],
+                                        timeout=_MIGRATION_COMMAND_TIMEOUT_SECONDS,
+                                    ),
+                                )
 
-                    await self._run_migration_phase(
-                        token.token_id,
-                        "incremental_precopy_transfer",
-                        transfer_precopy,
-                    )
-                    self._migration_precopy_ms.append((time.monotonic() - started) * 1000.0)
-                    # Pre-copy is outside the user-visible route critical
-                    # path; only final quiesce/delta/ownership is charged.
-                    critical_started = time.monotonic()
+                        await self._run_migration_phase(
+                            token.token_id,
+                            "incremental_precopy_transfer",
+                            transfer_precopy,
+                        )
+                        self._migration_precopy_ms.append((time.monotonic() - started) * 1000.0)
+                        # Pre-copy is outside the user-visible route critical
+                        # path; only final quiesce/delta/ownership is charged.
+                        critical_started = time.monotonic()
                 # The child stops its output pump and takes the authoritative
                 # model-state boundary in one command. This removes a pause
                 # status round trip from the migration critical path.
@@ -1544,19 +1555,26 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         await super().aclose()
 
     async def _init_nccl(self) -> None:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-        sock.close()
         workers = sorted(self._active_workers)
+        master, configured_port, world_size, rank_offset = self._config.nccl_rendezvous(
+            local_worker_count=len(workers)
+        )
+        if configured_port == 0:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+            sock.close()
+        else:
+            port = configured_port
+        init_method = f"tcp://{master}:{port}"
         results = await asyncio.gather(
             *(
                 self._request(
                     worker_id,
                     "nccl_init",
-                    rank=rank,
-                    world_size=len(workers),
-                    init_method=f"tcp://127.0.0.1:{port}",
+                    rank=rank_offset + rank,
+                    world_size=world_size,
+                    init_method=init_method,
                     timeout=_NCCL_INIT_PARENT_TIMEOUT_SECONDS,
                 )
                 for rank, worker_id in enumerate(workers)
@@ -1570,7 +1588,7 @@ class NCCLProcessLiveKitWorkerPool(ProcessLiveKitWorkerPool):
         ]
         if failures:
             raise RuntimeError(f"NCCL process-group initialization failed: {'; '.join(failures)}")
-        ranks = {worker_id: rank for rank, worker_id in enumerate(workers)}
+        ranks = {worker_id: rank_offset + rank for rank, worker_id in enumerate(workers)}
         warmup_started = time.monotonic()
         collective_results = await asyncio.gather(
             *(

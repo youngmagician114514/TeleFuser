@@ -66,6 +66,7 @@ from .turboserve import (
     TurboServeSchedulingSnapshot,
     TurboServeSessionView,
 )
+from .topology import WorkerEndpoint
 
 EPSILON = 1e-9
 JobKind = Literal["action", "idle"]
@@ -630,28 +631,45 @@ class SessionSchedulingState:
             self.pending_idle = None
         self.in_flight = job
 
-    def rollback_dispatched(self, job: ActionJob) -> None:
+    def rollback_dispatched(self, job: ActionJob) -> ActionJob | None:
         """Return a synchronously rejected dispatch to the ready queue.
 
         Dispatch rollback is deliberately narrower than completion: it does
         not advance slack, quality, or cache ownership.  A newer action may
         already occupy ``pending_action`` in an unusual reentrant adapter; in
-        that case the latest action wins and the rejected older job is simply
-        cleared from the in-flight slot.
+        that case the rejected job is restored in front of the newer work.
+        When a newer action filled the bounded queue while the job was
+        reserved, the newest queued action is returned to the caller as a
+        capacity drop so the state remains bounded and the older job can be
+        retried in FIFO order.
         """
         if self.in_flight is None or self.in_flight.job_id != job.job_id:
             raise RuntimeError(f"job {job.job_id} is not in flight for session {self.session_id}")
         self.in_flight = None
+        dropped: ActionJob | None = None
         if job.kind == "action":
             if self.pending_action is None:
                 self.pending_action = job
                 self.state_version = job.state_version
+            elif self.pending_action_slots == 1:
+                # Baseline policies use explicit latest-wins semantics.  The
+                # rejected reservation was never executed, so retain the
+                # newer pending intent and avoid manufacturing a second slot.
+                return None
             else:
+                if len(self.pending_action_queue) >= self.pending_action_slots - 1:
+                    # The pending head is newer than ``job`` and must move
+                    # behind it.  Keep the bounded FIFO invariant by dropping
+                    # the newest queued item, which is the least-progressed
+                    # action and the one most naturally covered by capacity
+                    # accounting.
+                    dropped = self.pending_action_queue.pop()
                 self.pending_action_queue.appendleft(self.pending_action)
                 self.pending_action = job
                 self.state_version = job.state_version
         elif self.pending_action is None and self.pending_idle is None and not self.departed:
             self.pending_idle = job
+        return dropped
 
     def complete_job(self, *, completed_at: float, output_seconds: float, quality: float) -> ActionJob:
         """Complete the current job and update quality/idle consumption state."""
@@ -707,10 +725,19 @@ class GpuSchedulingState:
     # otherwise every future B>1 candidate is incorrectly rejected while the
     # GPU is busy even though the previous invocation has already completed.
     reserved_memory_gb: float = 0.0
+    # Node metadata is appended after the historical positional fields so
+    # existing single-host callers keep their constructor semantics.
+    node_id: str = "node-0"
+    endpoint_address: str | None = None
+    endpoint_port: int | None = None
 
     def __post_init__(self) -> None:
         if not self.gpu_id:
             raise ValueError("gpu_id must be non-empty")
+        if not self.node_id:
+            raise ValueError("node_id must be non-empty")
+        if self.endpoint_port is not None and not 1 <= self.endpoint_port <= 65535:
+            raise ValueError("endpoint_port must be in [1, 65535]")
         if not math.isfinite(self.free_at) or self.free_at < 0:
             raise ValueError("free_at must be finite and non-negative")
         if self.memory_free_gb != math.inf and (
@@ -719,6 +746,16 @@ class GpuSchedulingState:
             raise ValueError("memory_free_gb must be non-negative and finite")
         if not math.isfinite(self.reserved_memory_gb) or self.reserved_memory_gb < 0:
             raise ValueError("reserved_memory_gb must be non-negative and finite")
+
+    def endpoint(self) -> WorkerEndpoint:
+        """Return the globally identifiable endpoint represented by this state."""
+        return WorkerEndpoint(
+            worker_id=self.gpu_id,
+            node_id=self.node_id,
+            gpu_ids=(self.gpu_id,),
+            address=self.endpoint_address,
+            port=self.endpoint_port,
+        )
 
 
 @dataclass(frozen=True)
@@ -1220,10 +1257,16 @@ class MotivationScheduler:
                 previous.free_at != state.free_at
                 or previous.memory_free_gb != state.memory_free_gb
                 or previous.available != state.available
+                or previous.node_id != state.node_id
+                or previous.endpoint_address != state.endpoint_address
+                or previous.endpoint_port != state.endpoint_port
             ):
                 version = max(previous.version + 1, version)
             self._gpus[state.gpu_id] = GpuSchedulingState(
                 gpu_id=state.gpu_id,
+                node_id=state.node_id,
+                endpoint_address=state.endpoint_address,
+                endpoint_port=state.endpoint_port,
                 free_at=state.free_at,
                 memory_free_gb=state.memory_free_gb,
                 available=state.available,
@@ -1264,6 +1307,9 @@ class MotivationScheduler:
                 self._advance_to(now)
             state = GpuSchedulingState(
                 gpu_id=gpu_id,
+                node_id=current.node_id,
+                endpoint_address=current.endpoint_address,
+                endpoint_port=current.endpoint_port,
                 free_at=current.free_at if free_at is None else free_at,
                 memory_free_gb=current.memory_free_gb if memory_free_gb is None else memory_free_gb,
                 available=current.available if available is None else available,
@@ -1624,7 +1670,10 @@ class MotivationScheduler:
 
         with self._lock:
             observed_at = self._advance_to(observed_at)
-            snapshot_states = tuple(replace(state) for state in self._sessions.values())
+            snapshot_states = tuple(
+                replace(state, pending_action_queue=deque(state.pending_action_queue))
+                for state in self._sessions.values()
+            )
             snapshot_by_id = {state.session_id: state for state in snapshot_states}
             all_ready = tuple(
                 (snapshot_by_id[state.session_id], job)
@@ -1996,7 +2045,10 @@ class MotivationScheduler:
         with self._lock:
             observed_at = self._advance_to(observed_at)
             live_states = tuple(self._sessions.values())
-            snapshot_states = tuple(replace(state) for state in live_states)
+            snapshot_states = tuple(
+                replace(state, pending_action_queue=deque(state.pending_action_queue))
+                for state in live_states
+            )
             snapshot_by_id = {state.session_id: state for state in snapshot_states}
             all_ready = tuple(
                 (snapshot_by_id[state.session_id], job)
@@ -2337,7 +2389,10 @@ class MotivationScheduler:
         with self._lock:
             observed_at = self._advance_to(observed_at)
             live_states = tuple(self._sessions.values())
-            snapshot_states = tuple(replace(state) for state in live_states)
+            snapshot_states = tuple(
+                replace(state, pending_action_queue=deque(state.pending_action_queue))
+                for state in live_states
+            )
             snapshot_by_id = {state.session_id: state for state in snapshot_states}
             all_ready = tuple(
                 (snapshot_by_id[state.session_id], job)
@@ -2853,7 +2908,10 @@ class MotivationScheduler:
         with self._lock:
             observed_at = self._advance_to(observed_at)
             live_states = tuple(self._sessions.values())
-            snapshot_states = tuple(replace(state) for state in live_states)
+            snapshot_states = tuple(
+                replace(state, pending_action_queue=deque(state.pending_action_queue))
+                for state in live_states
+            )
             snapshot_by_id = {state.session_id: state for state in snapshot_states}
             all_ready = tuple(
                 (snapshot_by_id[state.session_id], job)
@@ -3663,6 +3721,9 @@ class MotivationScheduler:
             gpu = self._gpus[candidate.gpu_id]
             self._gpus[candidate.gpu_id] = GpuSchedulingState(
                 gpu_id=gpu.gpu_id,
+                node_id=gpu.node_id,
+                endpoint_address=gpu.endpoint_address,
+                endpoint_port=gpu.endpoint_port,
                 free_at=candidate.finish_at,
                 memory_free_gb=max(0.0, gpu.memory_free_gb - candidate.profile.memory_gb),
                 available=gpu.available,
@@ -3690,13 +3751,18 @@ class MotivationScheduler:
                 job = state.in_flight
                 if job is None or job.job_id != job_id:
                     raise RuntimeError(f"motivation reservation for {job_id} is no longer active")
-                state.rollback_dispatched(job)
+                dropped = state.rollback_dispatched(job)
+                if dropped is not None:
+                    self._action_jobs_dropped_capacity += 1
                 state.migration_target_gpu = None
                 jobs.append(job)
             gpu = self._gpus[candidate.gpu_id]
             released_memory = gpu.reserved_memory_gb
             self._gpus[candidate.gpu_id] = GpuSchedulingState(
                 gpu_id=gpu.gpu_id,
+                node_id=gpu.node_id,
+                endpoint_address=gpu.endpoint_address,
+                endpoint_port=gpu.endpoint_port,
                 free_at=observed_at,
                 memory_free_gb=gpu.memory_free_gb + released_memory,
                 available=gpu.available,
@@ -3741,6 +3807,9 @@ class MotivationScheduler:
             released_memory = gpu.reserved_memory_gb
             self._gpus[candidate.gpu_id] = GpuSchedulingState(
                 gpu_id=gpu.gpu_id,
+                node_id=gpu.node_id,
+                endpoint_address=gpu.endpoint_address,
+                endpoint_port=gpu.endpoint_port,
                 free_at=observed_at,
                 memory_free_gb=gpu.memory_free_gb + released_memory,
                 available=gpu.available,
@@ -3776,6 +3845,9 @@ class MotivationScheduler:
                 return False
             self._gpus[candidate.gpu_id] = GpuSchedulingState(
                 gpu_id=gpu.gpu_id,
+                node_id=gpu.node_id,
+                endpoint_address=gpu.endpoint_address,
+                endpoint_port=gpu.endpoint_port,
                 free_at=observed_at,
                 memory_free_gb=gpu.memory_free_gb + gpu.reserved_memory_gb,
                 available=gpu.available,

@@ -35,6 +35,14 @@ def run_stream_server(
     num_workers: int | None = None,
     max_sessions_per_worker: int | str | None = None,
     worker_gpu_map: str | None = None,
+    node_id: str | None = None,
+    node_address: str | None = None,
+    node_rank: int | None = None,
+    cluster_world_size: int | None = None,
+    cluster_topology: str | None = None,
+    nccl_master_address: str | None = None,
+    nccl_master_port: int | None = None,
+    nccl_world_size: int | None = None,
     queue_size: int | None = None,
     autoscaling_enabled: bool | None = None,
     autoscaling_min_workers: int | None = None,
@@ -69,6 +77,14 @@ def run_stream_server(
             "num_workers": num_workers,
             "max_sessions_per_worker": max_sessions_per_worker,
             "worker_gpu_map": worker_gpu_map,
+            "node_id": node_id,
+            "node_address": node_address,
+            "node_rank": node_rank,
+            "cluster_world_size": cluster_world_size,
+            "cluster_topology": cluster_topology,
+            "nccl_master_address": nccl_master_address,
+            "nccl_master_port": nccl_master_port,
+            "nccl_world_size": nccl_world_size,
             "queue_size": queue_size,
             "autoscaling_enabled": autoscaling_enabled,
             "autoscaling_min_workers": autoscaling_min_workers,
@@ -93,7 +109,12 @@ def run_stream_server(
         if normalized_policy == "slackserver":
             normalized_policy = "slackserve"
         gpu_states = [
-            GpuSchedulingState(f"worker-{index}", memory_free_gb=motivation_memory_free_gb)
+            GpuSchedulingState(
+                f"worker-{index}",
+                node_id=config.node_id,
+                endpoint_address=config.effective_node_address(),
+                memory_free_gb=motivation_memory_free_gb,
+            )
             for index in range(config.num_workers)
         ]
         diagnostics = MotivationDiagnosticsCollector(

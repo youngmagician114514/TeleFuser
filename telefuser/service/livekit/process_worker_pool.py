@@ -18,7 +18,9 @@ from telefuser.utils.logging import logger
 
 from .config import LiveKitServeConfig
 from .dispatch_trace import DispatchTraceWriter
+from .node_agent import NodeAgentMigrationRequest, NodeAgentMigrationResult
 from .session_registry import SessionRecord
+from .topology import WorkerEndpoint
 from .worker import WorkerEventSink
 
 _WORKER_SHUTDOWN_TIMEOUT_SECONDS = 60.0
@@ -34,6 +36,9 @@ class ProcessWorkerSpec:
 
     worker_id: str
     gpu_ids: list[str]
+    node_id: str = "node-0"
+    node_address: str | None = None
+    rank: int | None = None
 
 
 @dataclass
@@ -99,6 +104,39 @@ class ProcessLiveKitWorkerPool:
             )
             if trace_path
             else None
+        )
+
+    def worker_endpoint(self, worker_id: str) -> WorkerEndpoint:
+        """Return the stable node-qualified endpoint for a local worker."""
+        try:
+            spec = self._specs[worker_id]
+        except KeyError as exc:
+            raise KeyError(f"unknown worker {worker_id!r}") from exc
+        return WorkerEndpoint(
+            worker_id=spec.worker_id,
+            node_id=spec.node_id,
+            gpu_ids=tuple(spec.gpu_ids),
+            address=spec.node_address,
+            rank=spec.rank,
+        )
+
+    def worker_endpoints(self) -> tuple[WorkerEndpoint, ...]:
+        """Return all local worker endpoints in deterministic order."""
+        return tuple(self.worker_endpoint(worker_id) for worker_id in self._specs)
+
+    async def migrate_session_remote(
+        self,
+        request: NodeAgentMigrationRequest,
+    ) -> NodeAgentMigrationResult:
+        """Reject remote migration until a node-agent transport is attached.
+
+        Keeping this explicit avoids accidentally sending a remote GPU ordinal
+        to the node-local NCCL router.  ``NCCLProcessLiveKitWorkerPool`` can
+        override this hook once its node-agent RPC is connected.
+        """
+        raise RuntimeError(
+            "cross-node session migration requires a distributed worker pool "
+            f"for {request.source_node_id}->{request.target_node_id}"
         )
 
     async def start(self, *, skip_validation: bool = False) -> None:

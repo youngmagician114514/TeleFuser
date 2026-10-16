@@ -9,6 +9,7 @@ from typing import Any, Protocol
 from telefuser.utils.logging import logger
 
 from .pipeline_router import TurboServePipelineRouter
+from .node_agent import NodeAgentMigrationRequest, NodeAgentMigrationResult
 from .session_registry import SessionRecord
 from .turboserve import TurboServeOwnership
 from .worker import LiveKitWorker
@@ -26,6 +27,15 @@ class WorkerPool(Protocol):
     def dispatch_batch(self, lease: Any, payloads: Sequence[tuple[str, dict]]) -> None: ...
     async def stop_session(self, session_id: str) -> None: ...
     async def aclose(self) -> None: ...
+
+
+class DistributedWorkerPool(WorkerPool, Protocol):
+    """Optional extension implemented by a coordinator with node agents."""
+
+    async def migrate_session_remote(
+        self,
+        request: NodeAgentMigrationRequest,
+    ) -> NodeAgentMigrationResult: ...
 
 
 class InProcessLiveKitWorkerPool:

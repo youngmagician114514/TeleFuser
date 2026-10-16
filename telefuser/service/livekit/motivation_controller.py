@@ -190,6 +190,9 @@ class MotivationRuntimeController:
         gpu_id: str,
         *,
         memory_free_gb: float,
+        node_id: str = "node-0",
+        endpoint_address: str | None = None,
+        endpoint_port: int | None = None,
         free_at: float = 0.0,
         available: bool = True,
         version: int = 0,
@@ -197,6 +200,9 @@ class MotivationRuntimeController:
         """Register one GPU at the worker-start boundary."""
         state = GpuSchedulingState(
             gpu_id=gpu_id,
+            node_id=node_id,
+            endpoint_address=endpoint_address,
+            endpoint_port=endpoint_port,
             free_at=free_at,
             memory_free_gb=memory_free_gb,
             available=available,
@@ -852,6 +858,18 @@ class MotivationRuntimeController:
                     target_gpu=candidate.gpu_id,
                     requested_at=now,
                     estimated_ready_at=max(now, candidate.start_at),
+                    source_node_id=next(
+                        gpu.node_id for gpu in self.scheduler.gpus() if gpu.gpu_id == state.owner_gpu
+                    ),
+                    target_node_id=next(
+                        gpu.node_id for gpu in self.scheduler.gpus() if gpu.gpu_id == candidate.gpu_id
+                    ),
+                    source_address=next(
+                        gpu.endpoint_address for gpu in self.scheduler.gpus() if gpu.gpu_id == state.owner_gpu
+                    ),
+                    target_address=next(
+                        gpu.endpoint_address for gpu in self.scheduler.gpus() if gpu.gpu_id == candidate.gpu_id
+                    ),
                 )
                 backend = self.migration_backend_factory(request)
                 try:
