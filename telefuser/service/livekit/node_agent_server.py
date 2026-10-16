@@ -27,6 +27,7 @@ class _NodeAgentEventSink(NullWorkerEventSink):
         self.compute_completions: list[dict[str, Any]] = []
         self.dispatch_failures: list[dict[str, Any]] = []
         self.published_chunks: list[dict[str, Any]] = []
+        self.model_outputs: list[dict[str, Any]] = []
         self.capacities: dict[str, int] = {}
         self.control_received: list[dict[str, str]] = []
         self.control_messages: list[dict[str, Any]] = []
@@ -125,6 +126,36 @@ class _NodeAgentEventSink(NullWorkerEventSink):
                 "first_frame_at": first_frame_at,
             }
         )
+
+    def on_model_output(
+        self,
+        worker_id: str,
+        session_id: str,
+        payload: dict,
+        runtime_metrics: dict | None = None,
+        session_runtime_metrics: dict | None = None,
+    ) -> None:
+        # Forward only scheduler/metric metadata. PIL frames stay on the node
+        # and continue directly into its LiveKit publisher.
+        summary: dict[str, Any] = {
+            "worker_id": str(worker_id),
+            "session_id": str(session_id),
+            "payload": {
+                key: payload[key]
+                for key in ("type", "frame_count", "scheduler", "error")
+                if key in payload
+            },
+            "runtime_metrics": dict(runtime_metrics or {}),
+            "session_runtime_metrics": dict(session_runtime_metrics or {}),
+        }
+        frames = payload.get("frames")
+        if isinstance(frames, (list, tuple)):
+            summary["payload"]["frame_count"] = len(frames)
+        self.model_outputs.append(summary)
+
+    def drain_model_outputs(self) -> list[dict[str, Any]]:
+        values, self.model_outputs = self.model_outputs, []
+        return values
 
     def drain_published_chunks(self) -> list[dict[str, Any]]:
         values, self.published_chunks = self.published_chunks, []
@@ -240,6 +271,7 @@ class NodeAgentServer:
                 "published_chunks": self._sink.drain_published_chunks(),
                 "control_messages": self._sink.drain_control_messages(),
                 "control_received": self._sink.drain_control_received(),
+                "model_outputs": self._sink.drain_model_outputs(),
             }
         if method == "start_session":
             record = SessionRecord.model_validate(params["record"])

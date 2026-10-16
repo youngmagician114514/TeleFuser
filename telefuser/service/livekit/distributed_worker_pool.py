@@ -250,6 +250,14 @@ class DistributedLiveKitWorkerPool(WorkerPool):
                         # accounting instead of subtracting unrelated clocks.
                         None,
                     )
+                for output in health.get("model_outputs", ()):
+                    self._event_sink.on_model_output(
+                        str(output.get("worker_id", "")),
+                        str(output.get("session_id", "")),
+                        dict(output.get("payload", {})),
+                        runtime_metrics=dict(output.get("runtime_metrics", {})),
+                        session_runtime_metrics=dict(output.get("session_runtime_metrics", {})),
+                    )
                 for session_id, worker_id in tuple(self._session_workers.items()):
                     endpoint = self._endpoint_for_worker(worker_id)
                     if (
