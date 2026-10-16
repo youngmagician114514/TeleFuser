@@ -245,7 +245,10 @@ class DistributedLiveKitWorkerPool(WorkerPool):
                         str(chunk.get("worker_id", "")),
                         str(chunk.get("session_id", "")),
                         int(chunk.get("frames", 0)),
-                        chunk.get("first_frame_at"),
+                        # ``time.monotonic()`` has no cross-host epoch.  Use
+                        # the coordinator's receipt time for distributed A2F
+                        # accounting instead of subtracting unrelated clocks.
+                        None,
                     )
                 for session_id, worker_id in tuple(self._session_workers.items()):
                     endpoint = self._endpoint_for_worker(worker_id)
