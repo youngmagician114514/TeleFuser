@@ -20,11 +20,18 @@ TeleFuser 侧定义了窄的 `MatrixGameSessionBackend` 接口：
 * `step(session, action)` 消费一个规范化的键盘/鼠标动作并返回 `MatrixGameStep`；
 * `close_session` 释放模型状态。
 
-实际权重和 Matrix 专用依赖由外部模块提供。设置
+实际权重和 Matrix 专用依赖默认由外部模块提供。设置
 `TELEFUSER_MATRIX_GAME_BACKEND_MODULE=your_module` 后，该模块只需要暴露
 `create_backend(config)`。这样 Matrix 的 Python、CUDA、FlashAttention 和模型
 路径不会进入 TeleFuser 的基础导入路径，后续可以单独替换 backend 而无需修改
 LiveKit 控制面。
+
+如果 `MATRIX_GAME_ROOT` 指向官方 `Matrix-Game-2` 目录，入口会使用内置的
+`MatrixGameOfficialBackend`。它把官方 causal denoising loop 拆成单 session 的
+`step()`：每次调用推进一个 `num_frame_per_block` latent block，更新同一个
+session 的 DiT KV cache、action condition 和 causal VAE decoder cache，并返回
+解码后的 RGB 帧。它明确限制 `max_sessions=1`，因为官方模型的 cache 是单 batch
+张量；在没有显式 state/batch 拆分前，复制或共享 cache 都会破坏因果状态。
 
 ## 当前能力边界
 

@@ -103,10 +103,17 @@ def create_matrix_game_backend(
         return factory(config)
     module_name = os.getenv("TELEFUSER_MATRIX_GAME_BACKEND_MODULE")
     if not module_name:
+        if config.model_root:
+            # Load the official adapter lazily so TeleFuser imports do not
+            # require Matrix-Game's optional CUDA dependencies.
+            from .official_backend import MatrixGameOfficialBackend
+
+            return MatrixGameOfficialBackend(config)
         raise MatrixGameBackendUnavailableError(
             "Matrix-Game 2.0 needs a sessionized backend factory. Set "
             "TELEFUSER_MATRIX_GAME_BACKEND_MODULE to a module exposing "
-            "create_backend(config). The upstream inference script is a "
+            "create_backend(config), or set MATRIX_GAME_ROOT for the built-in "
+            "single-session adapter. The upstream inference script is a "
             "single-session application and cannot be safely shared by TeleFuser yet."
         )
     try:

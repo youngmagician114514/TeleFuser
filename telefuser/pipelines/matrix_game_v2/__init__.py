@@ -15,6 +15,7 @@ from .backend import (
     MatrixGameStep,
     create_matrix_game_backend,
 )
+from .official_backend import MatrixGameOfficialBackend
 from .service import MatrixGameV2Service
 
 __all__ = [
@@ -23,6 +24,7 @@ __all__ = [
     "MatrixGameBackendError",
     "MatrixGameBackendUnavailableError",
     "MatrixGameSessionBackend",
+    "MatrixGameOfficialBackend",
     "MatrixGameStep",
     "MatrixGameV2Service",
     "create_matrix_game_backend",
