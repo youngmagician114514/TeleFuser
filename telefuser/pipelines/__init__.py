@@ -6,4 +6,5 @@ This package contains pipeline implementations for various models including:
 - QwenImage: Image generation and editing pipelines
 - ZImage: Z-Image generation pipeline
 - FlashVSR: Video super-resolution pipeline
+- Matrix-Game 2.0: sessionized backend contract for interactive world serving
 """

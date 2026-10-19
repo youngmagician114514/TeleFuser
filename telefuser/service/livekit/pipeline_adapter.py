@@ -6,6 +6,7 @@ from collections.abc import AsyncGenerator
 
 from telefuser.service.core.config import ServerConfig
 from telefuser.service.core.stream_pipeline_service import StreamPipelineService
+from telefuser.service.livekit.model_contracts import ModelServingCapabilities
 from telefuser.service.security.security_validator import SecurityLevel
 
 
@@ -33,6 +34,20 @@ class LiveKitPipelineAdapter:
     def stream_mode(self) -> str | None:
         """Return the detected TeleFuser stream interaction mode."""
         return self.stream_service.stream_mode
+
+    @property
+    def serving_capabilities(self) -> ModelServingCapabilities | None:
+        """Expose optional model capabilities without coupling the adapter to a model.
+
+        Existing pipelines do not need to implement this property.  A new
+        backend such as Matrix-Game can publish its output contract and
+        feature limits for a future scheduler/runtime integration while the
+        ABot path keeps its historical defaults.
+        """
+
+        service = getattr(self.stream_service, "service", None)
+        capabilities = getattr(service, "serving_capabilities", None)
+        return capabilities if isinstance(capabilities, ModelServingCapabilities) else None
 
     @property
     def uses_relative_rope(self) -> bool | None:
