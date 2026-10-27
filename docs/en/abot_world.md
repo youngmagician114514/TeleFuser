@@ -1,9 +1,16 @@
 # ABot-World-0-5B-LF
 
 TeleFuser provides a TurboServe-style concurrent integration for the public
-ABot-World-0-5B-LF long-forcing checkpoint. Each model replica remains single-GPU,
+ABot-World-0-5B-LF long-forcing checkpoint. Serving replicas remain single-GPU,
 while a LiveKit deployment can run one replica per configured GPU and continuously
-batch compatible retained sessions. There are two supported transport entry points:
+batch compatible retained sessions. An opt-in [three-rank latent-parallel pipeline](#experimental-three-rank-latent-parallelism)
+is available for direct execution and benchmarking. There are two supported transport entry points:
+
+An additional opt-in [whole-latent step runtime](../zh/abot_world_latent_step_runtime.md)
+batches one complete latent at one diffusion step per row across an arbitrary
+rank count. It provides persistent task state and eager/per-step CUDA Graph
+backends without spatially splitting latents. This direct-pipeline path is not
+yet connected to the LiveKit worker dispatch protocol.
 
 * Native HTTP controller for local debugging:
 
@@ -89,7 +96,83 @@ Idle state can be suspended to CPU. A two-phase chunk-boundary migration snapsho
 contains prompt state, RNG, KV, VAE caches, counters, and ownership epoch; the
 in-process LiveKit router changes model ownership only after target import succeeds.
 
+## Experimental Three-Rank Latent Parallelism
+
+The direct pipeline can split each three-latent chunk over three GPUs. This is
+opt-in: `ABotWorldPipelineConfig.latent_parallel_enabled` defaults to `False`,
+and existing single-GPU workers and serving policies retain their execution path.
+The example loader accepts `latent_parallel=True` and optional
+`parallel_device_ids`; the caller must initialize a three-rank process group.
+The model and historical KV are replicated on each rank. Each rank computes
+only its current latent frame's queries, cross-attention and FFN. Current K/V
+are gathered per transformer layer; they are not independent per-latent models.
+
+The latent stays sharded through all denoising steps and the final KV-refresh
+forward, then is gathered once per chunk. The default sampler has four
+denoising steps **plus one KV-refresh forward**. Reusable communication storage
+and asynchronous K/V submissions permit projection/communication overlap.
+Only rank zero advances the temporal video decoder and returns frames; peers
+return empty frame lists but advance the same session counters. A one-latent
+initialization block uses replicated native execution. Multi-frame blocks must
+be divisible by three. Physical batches with multiple compatible sessions are
+supported; this is not restricted to one session per group.
+
+All ranks must create and advance the same sessions, in the same order, with
+the same controls, seed and fidelity configuration. Initial image/text
+conditioning is broadcast from rank zero. Each rank preserves the native
+full-shape session RNG draws before taking its shard. CUDA Graphs fall back to
+eager execution in this mode. The `sp_ulysses_degree=3` configuration represents
+the existing sequence-parallel degree; this path uses K/V all-gather rather than
+Ulysses head redistribution. It does not modify model weights, the denoising
+schedule or attention-window semantics.
+
+The offline entry point also fixes an existing chunk-offset error: after the
+single-frame initialization, continuations now start at latent 1, 4, 7, etc.,
+rather than skipping latents 1 and 2. This correction affects offline generation;
+the interactive replay path already advances its own correct chunk counters.
+
+This collective pipeline is not yet wired into the LiveKit scheduler's
+single-GPU worker placement and session migration. A group must be invoked
+collectively; independent worker commands cannot drive its ranks.
+CPU Gloo tests compare the actual DiT, cache eviction and sampler against native
+execution, including B=2, first-frame conditioning, reduced step configurations
+and RNG state. GPU timing and BF16 numerical/visual parity require a checkpoint
+run; CPU parity alone does not establish video-quality parity or a speedup.
+
+Run these commands sequentially, on otherwise idle GPUs, from the repository
+root. Use the same checkpoint, input and arguments for both runs:
+
+```bash
+CUDA_VISIBLE_DEVICES=3 python -m tools.validation.benchmark_abot_latent_parallel \
+  --mode single --model-root /path/to/ABot-World-0-5B-LF \
+  --image /path/to/initial.png --warmup 6 --chunks 12 --attention sdpa \
+  --save-decoded --output /tmp/abot-latent-single.json
+
+CUDA_VISIBLE_DEVICES=0,1,2 python -m torch.distributed.run --standalone \
+  --nproc-per-node=3 --module tools.validation.benchmark_abot_latent_parallel \
+  --mode latent --model-root /path/to/ABot-World-0-5B-LF \
+  --image /path/to/initial.png --warmup 6 --chunks 12 --attention sdpa \
+  --save-decoded --output /tmp/abot-latent-three.json
+```
+
+The JSON records per-batch wall time for the slowest rank, root denoising/decode
+time, actual DiT invocation counts and frames, and an explicitly labeled logical
+ring-all-gather byte model. Those bytes are not measured NCCL traffic or time.
+`--save-decoded` saves the last decoded batch outside the timing region. Host
+PIL conversion and LiveKit delivery are excluded from both runs. Increase
+`--batch-size` equally for a throughput comparison; a lower per-chunk latency
+on three GPUs alone does not imply higher throughput per GPU.
+
 ## Controls And Idle Behavior
+
+The direct interactive pipeline also has an opt-in
+[step-resumable continuous-batching driver](../zh/abot_world_step_latent_continuous_batching.md).
+Use `create_continuous_runtime(max_batch_size=...)` to admit chunks between DiT
+steps while preserving each chunk's coupled latent group. This driver is not yet
+connected to the LiveKit whole-chunk worker dispatch protocol. The benchmark
+accepts `--execution step` and optional logical `--stagger-steps` admission spacing.
+TAeW decode batches initialized streams with compatible state layouts even when
+their cumulative decoded-frame counts differ; individual counters remain separate.
 
 WASD and arrow keys control movement. IJKL controls camera rotation. Connect
 creates the image-conditioned session and displays the input preview; it does

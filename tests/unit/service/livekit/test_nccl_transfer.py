@@ -166,7 +166,8 @@ def test_streamed_transfer_rejects_duplicate_or_missing_paths(monkeypatch) -> No
         )
 
 
-def test_streamed_transfer_completes_groups_in_manifest_order(monkeypatch) -> None:
+@pytest.mark.parametrize("process_group", (None, object()))
+def test_streamed_transfer_completes_groups_in_manifest_order(monkeypatch, process_group) -> None:
     source = {
         "prompt_emb": torch.zeros((1, 2)),
         "self_cache": [{"k": torch.zeros((1, 3)), "v": torch.zeros((1, 3))}],
@@ -176,6 +177,7 @@ def test_streamed_transfer_completes_groups_in_manifest_order(monkeypatch) -> No
     groups = build_layer_transfer_groups(manifest)
     submitted_sizes = []
     completed = []
+    submitted_groups = []
 
     class _Request:
         def wait(self) -> None:
@@ -183,10 +185,12 @@ def test_streamed_transfer_completes_groups_in_manifest_order(monkeypatch) -> No
 
     monkeypatch.setattr("telefuser.service.livekit.nccl_transfer.dist.is_available", lambda: True)
     monkeypatch.setattr("telefuser.service.livekit.nccl_transfer.dist.is_initialized", lambda: True)
-    monkeypatch.setattr(
-        "telefuser.service.livekit.nccl_transfer.dist.P2POp",
-        lambda operation, tensor, peer_rank: (operation, tensor, peer_rank),
-    )
+
+    def p2p(operation, tensor, peer_rank, group=None):
+        submitted_groups.append(group)
+        return operation, tensor, peer_rank
+
+    monkeypatch.setattr("telefuser.service.livekit.nccl_transfer.dist.P2POp", p2p)
 
     def batch(ops):
         submitted_sizes.append(len(ops))
@@ -200,9 +204,11 @@ def test_streamed_transfer_completes_groups_in_manifest_order(monkeypatch) -> No
         send=True,
         groups=groups,
         on_group_complete=lambda group, event: completed.append((group.name, event)),
+        process_group=process_group,
     )
 
     assert submitted_sizes == [1, 4]
+    assert submitted_groups == [process_group] * 5
     assert completed == [("preamble", None), ("layer_00", None)]
     assert report.total_bytes == sum(tensor.numel() * tensor.element_size() for tensor in leaves.values())
     assert [group.name for group in report.groups] == ["preamble", "layer_00"]

@@ -89,6 +89,18 @@ def test_denoising_block_runs_four_model_updates_then_issues_context_cache_updat
     assert torch.equal(observed_timesteps[-1], torch.zeros(1, 3))
 
 
+def test_offline_generation_covers_every_latent_after_single_frame_initialization() -> None:
+    stage, timesteps = _stage_with_recording_dit()
+    noise = torch.randn(1, 4, 7, 4, 4)
+    first_frame = torch.randn_like(noise[:, :, :1])
+
+    output = stage.process(noise, torch.randn(1, 4, 16), torch.zeros(1, 32, 7, 8, 8), first_frame, 42)
+
+    assert output.shape == noise.shape
+    torch.testing.assert_close(output[:, :, :1], first_frame)
+    assert [value.shape[1] for value in timesteps] == [1] * 5 + [3] * 10
+
+
 def test_interactive_cuda_graph_wrapper_falls_back_cleanly_on_cpu() -> None:
     stage, observed_timesteps = _stage_with_recording_dit()
     stage.configure_cuda_graph(True)

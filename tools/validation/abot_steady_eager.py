@@ -232,7 +232,24 @@ class SteadyEagerHook:
             current_start: int,
             generator: torch.Generator,
             scheduler: Any,
+            timestep_positions: Sequence[int] | None = None,
+            layer_readiness: Any | None = None,
         ) -> torch.Tensor:
+            if timestep_positions is not None or layer_readiness is not None:
+                self.total_legacy_calls += 1
+                return self._original(
+                    session_id=session_id,
+                    latent=latent,
+                    prompt_emb=prompt_emb,
+                    action_context=action_context,
+                    self_cache=self_cache,
+                    cross_cache=cross_cache,
+                    current_start=current_start,
+                    generator=generator,
+                    scheduler=scheduler,
+                    timestep_positions=timestep_positions,
+                    layer_readiness=layer_readiness,
+                )
             if not _is_steady_eager_eligible(
                 stage,
                 latent=latent,

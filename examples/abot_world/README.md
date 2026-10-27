@@ -79,6 +79,10 @@ first and then ordered 12 FPS chunks only while controls are held.
 
 ## Test tiers
 
+For direct experimental three-GPU execution of the same session batch, see
+[latent-parallel pipeline and single/three-GPU comparison commands](../../docs/en/abot_world.md#experimental-three-rank-latent-parallelism).
+This opt-in path is separate from the single-GPU LiveKit worker deployment.
+
 CPU contract tests cover action-channel layout, checkpoint conversion, sink
 KV rolling, RoPE boundary validation, session cleanup, and the direct runtime
 idle/FIFO behavior:

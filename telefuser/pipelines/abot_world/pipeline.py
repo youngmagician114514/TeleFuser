@@ -1,4 +1,4 @@
-"""Native TeleFuser single-GPU pipeline for ABot-World."""
+"""Native ABot-World pipeline with optional frame-aligned latent parallelism."""
 
 from __future__ import annotations
 
@@ -35,10 +35,13 @@ class ABotWorldPipelineConfig:
     # continuation path. Dynamic first chunks, cache warmup, VAE and output
     # postprocessing remain eager.
     cuda_graph_enabled: bool = False
+    # Opt-in distributed execution. Whole-chunk frame sharding needs a divisor
+    # of the chunk length; the latent-step runtime supports any rank count.
+    latent_parallel_enabled: bool = False
 
 
 class ABotWorldPipeline(BasePipeline):
-    """Image-conditioned, action-controlled ABot-World inference on one GPU.
+    """Image-conditioned ABot inference with optional distributed latent tasks.
 
     ``latent_frames`` is the causal Wan latent-frame count (the shipped model
     configuration uses 31).  It must be ``1 mod 3`` because the first image
@@ -58,8 +61,12 @@ class ABotWorldPipeline(BasePipeline):
         return [self.vae_stage, self.text_encoding_stage, self.denoise_stage, self.taew_decode_stage]
 
     def init(self, module_manager: ModuleManager, config: ABotWorldPipelineConfig) -> None:
-        if config.dit_config.parallel_config.world_size != 1:
-            raise ValueError("ABot-World initial integration supports exactly one GPU")
+        world_size = config.dit_config.parallel_config.world_size
+        if config.latent_parallel_enabled:
+            if world_size < 2:
+                raise ValueError("ABot distributed latent execution requires at least two configured devices")
+        elif world_size != 1:
+            raise ValueError("ABot-World requires latent_parallel_enabled for a multi-GPU DiT")
         if config.local_attn_size < 1:
             raise ValueError("local_attn_size must be positive")
         if not 0 <= config.sink_size < config.local_attn_size:
@@ -77,9 +84,15 @@ class ABotWorldPipeline(BasePipeline):
             "abot_world_text_encoding", module_manager, config.text_encoding_config
         )
         self.denoise_stage = ABotWorldDenoisingStage("abot_world_denoise", module_manager, config.dit_config)
-        self.denoise_stage.parallel_models()
+        self.denoise_stage.parallel_models(latent_parallel=config.latent_parallel_enabled)
         self.denoise_stage.configure_cuda_graph(config.cuda_graph_enabled)
         self.denoise_stage.dit.set_causal_attention_window(config.local_attn_size, config.sink_size)
+
+    @property
+    def is_output_rank(self) -> bool:
+        """Return whether this replica owns video decoding and publication."""
+        runtime = getattr(self.denoise_stage, "latent_parallel_runtime", None)
+        return runtime is None or runtime.is_output_rank
 
     @classmethod
     def build_action_context(
@@ -139,12 +152,20 @@ class ABotWorldPipeline(BasePipeline):
             dtype=self.torch_dtype,
         )
         prompt_emb = self.text_encoding_stage.process([prompt])[0]
+        runtime = self.denoise_stage.latent_parallel_runtime
+        if runtime is not None:
+            runtime.broadcast_(first_frame_latent)
+            runtime.broadcast_(prompt_emb)
         latents = self.denoise_stage.process(noise, prompt_emb, action_context, first_frame_latent, seed)
+        if not self.is_output_rank:
+            return []
         frames = self.vae_stage.process("decode_video", latents)
         return self.tensor2video(frames[0])
 
     def close(self) -> None:
         """Release stage references explicitly for scripts that run once."""
+        if hasattr(self, "denoise_stage"):
+            self.denoise_stage.release_latent_parallel()
         for name in ("vae_stage", "text_encoding_stage", "denoise_stage"):
             if hasattr(self, name):
                 getattr(self, name).offload_models()

@@ -1,0 +1,1403 @@
+{
+  "admission": {
+    "expected_max_sessions_per_worker": 12,
+    "expected_queue_size": 0,
+    "require_immediate_assignment": true
+  },
+  "expected_num_workers": 4,
+  "expected_worker_mode": "process-nccl",
+  "lifecycle_trace": {
+    "duration_seconds": 1800.0,
+    "events": [
+      {
+        "arrival_reason": "staggered_initial_pool",
+        "event": "session_arrival",
+        "input_enabled": false,
+        "offset_seconds": 0.0,
+        "sequence": 0,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-00",
+        "virtual_session_slot": 0
+      },
+      {
+        "arrival_reason": "staggered_initial_pool",
+        "event": "session_arrival",
+        "input_enabled": false,
+        "offset_seconds": 3.0,
+        "sequence": 1,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-01",
+        "virtual_session_slot": 1
+      },
+      {
+        "arrival_reason": "staggered_initial_pool",
+        "event": "session_arrival",
+        "input_enabled": false,
+        "offset_seconds": 6.0,
+        "sequence": 2,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-02",
+        "virtual_session_slot": 2
+      },
+      {
+        "arrival_reason": "staggered_initial_pool",
+        "event": "session_arrival",
+        "input_enabled": false,
+        "offset_seconds": 9.0,
+        "sequence": 3,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-03",
+        "virtual_session_slot": 3
+      },
+      {
+        "arrival_reason": "staggered_initial_pool",
+        "event": "session_arrival",
+        "input_enabled": false,
+        "offset_seconds": 12.0,
+        "sequence": 4,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-04",
+        "virtual_session_slot": 4
+      },
+      {
+        "arrival_reason": "staggered_initial_pool",
+        "event": "session_arrival",
+        "input_enabled": false,
+        "offset_seconds": 15.0,
+        "sequence": 5,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-05",
+        "virtual_session_slot": 5
+      },
+      {
+        "arrival_reason": "staggered_initial_pool",
+        "event": "session_arrival",
+        "input_enabled": false,
+        "offset_seconds": 18.0,
+        "sequence": 6,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-06",
+        "virtual_session_slot": 6
+      },
+      {
+        "arrival_reason": "staggered_initial_pool",
+        "event": "session_arrival",
+        "input_enabled": false,
+        "offset_seconds": 21.0,
+        "sequence": 7,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-07",
+        "virtual_session_slot": 7
+      },
+      {
+        "arrival_reason": "staggered_initial_pool",
+        "event": "session_arrival",
+        "input_enabled": false,
+        "offset_seconds": 24.0,
+        "sequence": 8,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-08",
+        "virtual_session_slot": 8
+      },
+      {
+        "arrival_reason": "staggered_initial_pool",
+        "event": "session_arrival",
+        "input_enabled": false,
+        "offset_seconds": 27.0,
+        "sequence": 9,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-09",
+        "virtual_session_slot": 9
+      },
+      {
+        "arrival_reason": "staggered_initial_pool",
+        "event": "session_arrival",
+        "input_enabled": false,
+        "offset_seconds": 30.0,
+        "sequence": 10,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-10",
+        "virtual_session_slot": 10
+      },
+      {
+        "arrival_reason": "staggered_initial_pool",
+        "event": "session_arrival",
+        "input_enabled": false,
+        "offset_seconds": 33.0,
+        "sequence": 11,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-11",
+        "virtual_session_slot": 11
+      },
+      {
+        "arrival_reason": "staggered_initial_pool",
+        "event": "session_arrival",
+        "input_enabled": false,
+        "offset_seconds": 36.0,
+        "sequence": 12,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-12",
+        "virtual_session_slot": 12
+      },
+      {
+        "arrival_reason": "staggered_initial_pool",
+        "event": "session_arrival",
+        "input_enabled": false,
+        "offset_seconds": 39.0,
+        "sequence": 13,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-13",
+        "virtual_session_slot": 13
+      },
+      {
+        "arrival_reason": "staggered_initial_pool",
+        "event": "session_arrival",
+        "input_enabled": false,
+        "offset_seconds": 42.0,
+        "sequence": 14,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-14",
+        "virtual_session_slot": 14
+      },
+      {
+        "arrival_reason": "staggered_initial_pool",
+        "event": "session_arrival",
+        "input_enabled": false,
+        "offset_seconds": 45.0,
+        "sequence": 15,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-15",
+        "virtual_session_slot": 15
+      },
+      {
+        "aggregate_active_target": 14,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 75.0,
+        "sequence": 16,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-00"
+      },
+      {
+        "aggregate_active_target": 14,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 75.0,
+        "sequence": 17,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-01"
+      },
+      {
+        "aggregate_active_target": 14,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 75.0,
+        "sequence": 18,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-02"
+      },
+      {
+        "aggregate_active_target": 14,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 75.0,
+        "sequence": 19,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-03"
+      },
+      {
+        "aggregate_active_target": 14,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 75.0,
+        "sequence": 20,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-05"
+      },
+      {
+        "aggregate_active_target": 14,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 75.0,
+        "sequence": 21,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-06"
+      },
+      {
+        "aggregate_active_target": 14,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 75.0,
+        "sequence": 22,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-07"
+      },
+      {
+        "aggregate_active_target": 14,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 75.0,
+        "sequence": 23,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-08"
+      },
+      {
+        "aggregate_active_target": 14,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 75.0,
+        "sequence": 24,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-09"
+      },
+      {
+        "aggregate_active_target": 14,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 75.0,
+        "sequence": 25,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-11"
+      },
+      {
+        "aggregate_active_target": 14,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 75.0,
+        "sequence": 26,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-12"
+      },
+      {
+        "aggregate_active_target": 14,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 75.0,
+        "sequence": 27,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-13"
+      },
+      {
+        "aggregate_active_target": 14,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 75.0,
+        "sequence": 28,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-14"
+      },
+      {
+        "aggregate_active_target": 14,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 75.0,
+        "sequence": 29,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-15"
+      },
+      {
+        "aggregate_active_target": 13,
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 138.921287,
+        "sequence": 30,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-14"
+      },
+      {
+        "aggregate_active_target": 12,
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 206.728271,
+        "sequence": 31,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-01"
+      },
+      {
+        "aggregate_active_target": 13,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 266.866231,
+        "sequence": 32,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-10"
+      },
+      {
+        "aggregate_active_target": 6,
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 343.38325,
+        "sequence": 33,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-02"
+      },
+      {
+        "aggregate_active_target": 6,
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 343.38325,
+        "sequence": 34,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-03"
+      },
+      {
+        "aggregate_active_target": 6,
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 343.38325,
+        "sequence": 35,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-06"
+      },
+      {
+        "aggregate_active_target": 6,
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 343.38325,
+        "sequence": 36,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-09"
+      },
+      {
+        "aggregate_active_target": 6,
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 343.38325,
+        "sequence": 37,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-12"
+      },
+      {
+        "aggregate_active_target": 6,
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 343.38325,
+        "sequence": 38,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-13"
+      },
+      {
+        "aggregate_active_target": 6,
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 343.38325,
+        "sequence": 39,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-15"
+      },
+      {
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 359.95,
+        "pause_reason": "rolling_session_departure",
+        "sequence": 40,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-00"
+      },
+      {
+        "departure_reason": "rolling_session_replacement",
+        "event": "session_departure",
+        "offset_seconds": 360.0,
+        "sequence": 41,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-00"
+      },
+      {
+        "arrival_reason": "rolling_session_replacement",
+        "event": "session_arrival",
+        "input_enabled": false,
+        "offset_seconds": 360.05,
+        "sequence": 42,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-16",
+        "virtual_session_slot": 16
+      },
+      {
+        "departure_reason": "rolling_session_replacement",
+        "event": "session_departure",
+        "offset_seconds": 420.0,
+        "sequence": 43,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-01"
+      },
+      {
+        "arrival_reason": "rolling_session_replacement",
+        "event": "session_arrival",
+        "input_enabled": false,
+        "offset_seconds": 420.05,
+        "sequence": 44,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-17",
+        "virtual_session_slot": 17
+      },
+      {
+        "aggregate_active_target": 15,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 422.874349,
+        "sequence": 45,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-03"
+      },
+      {
+        "aggregate_active_target": 15,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 422.874349,
+        "sequence": 46,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-04"
+      },
+      {
+        "aggregate_active_target": 15,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 422.874349,
+        "sequence": 47,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-06"
+      },
+      {
+        "aggregate_active_target": 15,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 422.874349,
+        "sequence": 48,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-09"
+      },
+      {
+        "aggregate_active_target": 15,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 422.874349,
+        "sequence": 49,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-12"
+      },
+      {
+        "aggregate_active_target": 15,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 422.874349,
+        "sequence": 50,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-13"
+      },
+      {
+        "aggregate_active_target": 15,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 422.874349,
+        "sequence": 51,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-14"
+      },
+      {
+        "aggregate_active_target": 15,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 422.874349,
+        "sequence": 52,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-15"
+      },
+      {
+        "aggregate_active_target": 15,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 422.874349,
+        "sequence": 53,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-16"
+      },
+      {
+        "aggregate_active_target": 15,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 422.874349,
+        "sequence": 54,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-17"
+      },
+      {
+        "aggregate_active_target": 16,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 570.427659,
+        "sequence": 55,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-02"
+      },
+      {
+        "aggregate_active_target": 14,
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 652.483417,
+        "sequence": 56,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-05"
+      },
+      {
+        "aggregate_active_target": 14,
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 652.483417,
+        "sequence": 57,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-11"
+      },
+      {
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 719.95,
+        "pause_reason": "rolling_session_departure",
+        "sequence": 58,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-02"
+      },
+      {
+        "departure_reason": "rolling_session_replacement",
+        "event": "session_departure",
+        "offset_seconds": 720.0,
+        "sequence": 59,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-02"
+      },
+      {
+        "arrival_reason": "rolling_session_replacement",
+        "event": "session_arrival",
+        "input_enabled": false,
+        "offset_seconds": 720.05,
+        "sequence": 60,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-18",
+        "virtual_session_slot": 18
+      },
+      {
+        "aggregate_active_target": 12,
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 737.361203,
+        "sequence": 61,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-09"
+      },
+      {
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 779.95,
+        "pause_reason": "rolling_session_departure",
+        "sequence": 62,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-03"
+      },
+      {
+        "departure_reason": "rolling_session_replacement",
+        "event": "session_departure",
+        "offset_seconds": 780.0,
+        "sequence": 63,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-03"
+      },
+      {
+        "arrival_reason": "rolling_session_replacement",
+        "event": "session_arrival",
+        "input_enabled": false,
+        "offset_seconds": 780.05,
+        "sequence": 64,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-19",
+        "virtual_session_slot": 19
+      },
+      {
+        "aggregate_active_target": 12,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 806.094927,
+        "sequence": 65,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-11"
+      },
+      {
+        "aggregate_active_target": 13,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 955.798593,
+        "sequence": 66,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-18"
+      },
+      {
+        "aggregate_active_target": 8,
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 1039.533143,
+        "sequence": 67,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-06"
+      },
+      {
+        "aggregate_active_target": 8,
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 1039.533143,
+        "sequence": 68,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-08"
+      },
+      {
+        "aggregate_active_target": 8,
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 1039.533143,
+        "sequence": 69,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-13"
+      },
+      {
+        "aggregate_active_target": 8,
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 1039.533143,
+        "sequence": 70,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-17"
+      },
+      {
+        "aggregate_active_target": 8,
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 1039.533143,
+        "sequence": 71,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-18"
+      },
+      {
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 1079.95,
+        "pause_reason": "rolling_session_departure",
+        "sequence": 72,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-04"
+      },
+      {
+        "departure_reason": "rolling_session_replacement",
+        "event": "session_departure",
+        "offset_seconds": 1080.0,
+        "sequence": 73,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-04"
+      },
+      {
+        "arrival_reason": "rolling_session_replacement",
+        "event": "session_arrival",
+        "input_enabled": false,
+        "offset_seconds": 1080.05,
+        "sequence": 74,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-20",
+        "virtual_session_slot": 20
+      },
+      {
+        "aggregate_active_target": 14,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 1109.850254,
+        "sequence": 75,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-05"
+      },
+      {
+        "aggregate_active_target": 14,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 1109.850254,
+        "sequence": 76,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-06"
+      },
+      {
+        "aggregate_active_target": 14,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 1109.850254,
+        "sequence": 77,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-08"
+      },
+      {
+        "aggregate_active_target": 14,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 1109.850254,
+        "sequence": 78,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-09"
+      },
+      {
+        "aggregate_active_target": 14,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 1109.850254,
+        "sequence": 79,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-17"
+      },
+      {
+        "aggregate_active_target": 14,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 1109.850254,
+        "sequence": 80,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-18"
+      },
+      {
+        "aggregate_active_target": 14,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 1109.850254,
+        "sequence": 81,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-19"
+      },
+      {
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 1139.95,
+        "pause_reason": "rolling_session_departure",
+        "sequence": 82,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-05"
+      },
+      {
+        "departure_reason": "rolling_session_replacement",
+        "event": "session_departure",
+        "offset_seconds": 1140.0,
+        "sequence": 83,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-05"
+      },
+      {
+        "arrival_reason": "rolling_session_replacement",
+        "event": "session_arrival",
+        "input_enabled": false,
+        "offset_seconds": 1140.05,
+        "sequence": 84,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-21",
+        "virtual_session_slot": 21
+      },
+      {
+        "aggregate_active_target": 15,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 1175.903949,
+        "sequence": 85,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-13"
+      },
+      {
+        "aggregate_active_target": 15,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 1175.903949,
+        "sequence": 86,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-20"
+      },
+      {
+        "aggregate_active_target": 14,
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 1261.233783,
+        "sequence": 87,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-15"
+      },
+      {
+        "aggregate_active_target": 10,
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 1399.175093,
+        "sequence": 88,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-06"
+      },
+      {
+        "aggregate_active_target": 10,
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 1399.175093,
+        "sequence": 89,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-08"
+      },
+      {
+        "aggregate_active_target": 10,
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 1399.175093,
+        "sequence": 90,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-10"
+      },
+      {
+        "aggregate_active_target": 10,
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 1399.175093,
+        "sequence": 91,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-11"
+      },
+      {
+        "departure_reason": "rolling_session_replacement",
+        "event": "session_departure",
+        "offset_seconds": 1440.0,
+        "sequence": 92,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-06"
+      },
+      {
+        "arrival_reason": "rolling_session_replacement",
+        "event": "session_arrival",
+        "input_enabled": false,
+        "offset_seconds": 1440.05,
+        "sequence": 93,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-22",
+        "virtual_session_slot": 22
+      },
+      {
+        "aggregate_active_target": 12,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 1468.366753,
+        "sequence": 94,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-15"
+      },
+      {
+        "aggregate_active_target": 12,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 1468.366753,
+        "sequence": 95,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-22"
+      },
+      {
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 1499.95,
+        "pause_reason": "rolling_session_departure",
+        "sequence": 96,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-07"
+      },
+      {
+        "departure_reason": "rolling_session_replacement",
+        "event": "session_departure",
+        "offset_seconds": 1500.0,
+        "sequence": 97,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-07"
+      },
+      {
+        "arrival_reason": "rolling_session_replacement",
+        "event": "session_arrival",
+        "input_enabled": false,
+        "offset_seconds": 1500.05,
+        "sequence": 98,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-23",
+        "virtual_session_slot": 23
+      },
+      {
+        "aggregate_active_target": 12,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 1545.35748,
+        "sequence": 99,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-11"
+      },
+      {
+        "aggregate_active_target": 14,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 1608.430676,
+        "sequence": 100,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-21"
+      },
+      {
+        "aggregate_active_target": 14,
+        "event": "user_active",
+        "input_enabled": true,
+        "offset_seconds": 1608.430676,
+        "sequence": 101,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-23"
+      },
+      {
+        "aggregate_active_target": 13,
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 1732.291116,
+        "sequence": 102,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-15"
+      },
+      {
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 1798.0,
+        "pause_reason": "measurement_window_complete",
+        "sequence": 103,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-09"
+      },
+      {
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 1798.0,
+        "pause_reason": "measurement_window_complete",
+        "sequence": 104,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-11"
+      },
+      {
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 1798.0,
+        "pause_reason": "measurement_window_complete",
+        "sequence": 105,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-12"
+      },
+      {
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 1798.0,
+        "pause_reason": "measurement_window_complete",
+        "sequence": 106,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-13"
+      },
+      {
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 1798.0,
+        "pause_reason": "measurement_window_complete",
+        "sequence": 107,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-14"
+      },
+      {
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 1798.0,
+        "pause_reason": "measurement_window_complete",
+        "sequence": 108,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-16"
+      },
+      {
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 1798.0,
+        "pause_reason": "measurement_window_complete",
+        "sequence": 109,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-17"
+      },
+      {
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 1798.0,
+        "pause_reason": "measurement_window_complete",
+        "sequence": 110,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-18"
+      },
+      {
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 1798.0,
+        "pause_reason": "measurement_window_complete",
+        "sequence": 111,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-19"
+      },
+      {
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 1798.0,
+        "pause_reason": "measurement_window_complete",
+        "sequence": 112,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-20"
+      },
+      {
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 1798.0,
+        "pause_reason": "measurement_window_complete",
+        "sequence": 113,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-21"
+      },
+      {
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 1798.0,
+        "pause_reason": "measurement_window_complete",
+        "sequence": 114,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-22"
+      },
+      {
+        "event": "user_idle",
+        "input_enabled": false,
+        "offset_seconds": 1798.0,
+        "pause_reason": "measurement_window_complete",
+        "sequence": 115,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-23"
+      },
+      {
+        "departure_reason": "measurement_window_complete",
+        "event": "session_departure",
+        "offset_seconds": 1800.0,
+        "sequence": 116,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-08"
+      },
+      {
+        "departure_reason": "measurement_window_complete",
+        "event": "session_departure",
+        "offset_seconds": 1800.0,
+        "sequence": 117,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-09"
+      },
+      {
+        "departure_reason": "measurement_window_complete",
+        "event": "session_departure",
+        "offset_seconds": 1800.0,
+        "sequence": 118,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-10"
+      },
+      {
+        "departure_reason": "measurement_window_complete",
+        "event": "session_departure",
+        "offset_seconds": 1800.0,
+        "sequence": 119,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-11"
+      },
+      {
+        "departure_reason": "measurement_window_complete",
+        "event": "session_departure",
+        "offset_seconds": 1800.0,
+        "sequence": 120,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-12"
+      },
+      {
+        "departure_reason": "measurement_window_complete",
+        "event": "session_departure",
+        "offset_seconds": 1800.0,
+        "sequence": 121,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-13"
+      },
+      {
+        "departure_reason": "measurement_window_complete",
+        "event": "session_departure",
+        "offset_seconds": 1800.0,
+        "sequence": 122,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-14"
+      },
+      {
+        "departure_reason": "measurement_window_complete",
+        "event": "session_departure",
+        "offset_seconds": 1800.0,
+        "sequence": 123,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-15"
+      },
+      {
+        "departure_reason": "measurement_window_complete",
+        "event": "session_departure",
+        "offset_seconds": 1800.0,
+        "sequence": 124,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-16"
+      },
+      {
+        "departure_reason": "measurement_window_complete",
+        "event": "session_departure",
+        "offset_seconds": 1800.0,
+        "sequence": 125,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-17"
+      },
+      {
+        "departure_reason": "measurement_window_complete",
+        "event": "session_departure",
+        "offset_seconds": 1800.0,
+        "sequence": 126,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-18"
+      },
+      {
+        "departure_reason": "measurement_window_complete",
+        "event": "session_departure",
+        "offset_seconds": 1800.0,
+        "sequence": 127,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-19"
+      },
+      {
+        "departure_reason": "measurement_window_complete",
+        "event": "session_departure",
+        "offset_seconds": 1800.0,
+        "sequence": 128,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-20"
+      },
+      {
+        "departure_reason": "measurement_window_complete",
+        "event": "session_departure",
+        "offset_seconds": 1800.0,
+        "sequence": 129,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-21"
+      },
+      {
+        "departure_reason": "measurement_window_complete",
+        "event": "session_departure",
+        "offset_seconds": 1800.0,
+        "sequence": 130,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-22"
+      },
+      {
+        "departure_reason": "measurement_window_complete",
+        "event": "session_departure",
+        "offset_seconds": 1800.0,
+        "sequence": 131,
+        "source_session_id": null,
+        "source_user_id": null,
+        "trace_session_id": "world-23"
+      }
+    ],
+    "kind": "explicit_session_lifecycle_v1"
+  },
+  "measurement": {
+    "connect_timeout_seconds": 90.0,
+    "first_generation_grace_seconds": 15.0,
+    "http_timeout_seconds": 30.0,
+    "sample_interval_seconds": 1.0,
+    "shutdown_timeout_seconds": 20.0,
+    "slo_fps_tolerance": 0.25
+  },
+  "name": "abot_livekit_4gpu_lf3_12fps_realistic_interaction_burst16_long_window",
+  "phases": [
+    {
+      "active_input_fraction": 1.0,
+      "duration_seconds": 1800.0,
+      "name": "realistic_interaction_burst_replay",
+      "target_users": 16
+    }
+  ],
+  "seed": 20260917,
+  "server_url": "http://127.0.0.1:8088",
+  "session": {
+    "control": {
+      "action_states": [
+        [
+          "KeyW"
+        ],
+        [
+          "KeyW",
+          "KeyA"
+        ],
+        [
+          "KeyW",
+          "KeyD"
+        ],
+        [
+          "KeyI"
+        ]
+      ],
+      "idle_max_seconds": 0.0,
+      "idle_min_seconds": 0.0,
+      "idle_probability": 0.0,
+      "interval_seconds": 0.5,
+      "jitter_seconds": 0.1
+    },
+    "control_latent_frames": 3,
+    "delivery_mode": "latest",
+    "expected_preview_frames": 1,
+    "fps": 12,
+    "image_path": "examples/data/1.png",
+    "prompt": "A smooth first-person exploration through a vivid natural landscape."
+  },
+  "trace_contract": {
+    "design": {
+      "active_window_seconds": "60-90",
+      "activity": "randomized active-set transitions inside sustained overload and recovery phases",
+      "capacity_reference": "4 H100, approximately 4 * 36 FPS lossless",
+      "churn": "eight rolling replacements plus final teardown",
+      "duration_seconds": 1800.0,
+      "input_intensity": "16-session population with 60-90s active windows, 500ms per-session control interval",
+      "overload_target_fps": "12-16 active users * 12 FPS = 144-192 FPS",
+      "peak_retained_sessions": 16,
+      "unique_session_identities": 24
+    },
+    "interpretation": "This workload is intended to exercise placement, batching, quality selection, and migration. It is a controlled stress workload, not a claim about a production population distribution.",
+    "kind": "synthetic_realistic_interaction_burst_v1",
+    "not_a_production_user_trace": true,
+    "not_a_reproduction_of_private_turboserve_traces": true,
+    "seed": 20260917
+  }
+}

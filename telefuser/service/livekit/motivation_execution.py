@@ -451,8 +451,7 @@ class MotivationExecutionBridge:
             scheduler_payload = payload.get("scheduler")
             observed_job_id = (
                 str(scheduler_payload.get("motivation_job_id"))
-                if isinstance(scheduler_payload, dict)
-                and scheduler_payload.get("motivation_job_id")
+                if isinstance(scheduler_payload, dict) and scheduler_payload.get("motivation_job_id")
                 else None
             )
             if observed_job_id is not None:
@@ -467,8 +466,7 @@ class MotivationExecutionBridge:
             if lease_id is None or session_id is None or not self._lease_owner_matches(progress, observed_worker_id):
                 return
             if observed_job_id is not None and not any(
-                job.job_id == observed_job_id and job.session_id == session_id
-                for job in progress.lease.jobs
+                job.job_id == observed_job_id and job.session_id == session_id for job in progress.lease.jobs
             ):
                 return
             assert progress is not None
@@ -500,6 +498,7 @@ class MotivationExecutionBridge:
         job_ids: Sequence[str] = (),
         session_ids: Sequence[str] = (),
         compatibility_keys: Mapping[str, str] | None = None,
+        profile_timings: Sequence[Mapping[str, Any]] = (),
     ) -> bool:
         """Commit scheduler work when the child model invocation finishes.
 
@@ -555,6 +554,17 @@ class MotivationExecutionBridge:
                     scheduler_session_id,
                     exc_info=True,
                 )
+        for timing in profile_timings:
+            try:
+                self.controller.record_profile_timing(
+                    batch_size=int(timing["batch_size"]),
+                    fidelity=str(timing["fidelity"]),
+                    gpu_id=str(timing["gpu_id"]),
+                    latency_seconds=float(timing["latency_seconds"]),
+                    p95_seconds=(float(timing["p95_seconds"]) if timing.get("p95_seconds") is not None else None),
+                )
+            except (KeyError, TypeError, ValueError):
+                logger.debug("Ignoring malformed online profile timing: %r", timing, exc_info=True)
         released = False
         for lease_id in lease_ids:
             with self._lock:
@@ -978,11 +988,7 @@ class MotivationExecutionBridge:
         """Run one policy search/dispatch round and return its lease, if any."""
         observed_at = self._clock()
         try:
-            if (
-                not force_batch_gate
-                and not force_placement
-                and self._defer_singleton_action(observed_at)
-            ):
+            if not force_batch_gate and not force_placement and self._defer_singleton_action(observed_at):
                 return None
             lease = self.controller.schedule_once(
                 now=observed_at,
@@ -1304,9 +1310,7 @@ class MotivationExecutionBridge:
                 "owner_gpu": state.owner_gpu,
                 "departed": state.departed,
                 "pending_action": state.pending_action.job_id if state.pending_action else None,
-                "pending_action_queue": [
-                    job.job_id for job in state.pending_action_queue
-                ],
+                "pending_action_queue": [job.job_id for job in state.pending_action_queue],
                 "pending_action_count": state.pending_action_count,
                 "pending_action_slots": state.pending_action_slots,
                 "pending_idle": state.pending_idle.job_id if state.pending_idle else None,

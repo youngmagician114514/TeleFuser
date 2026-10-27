@@ -7,10 +7,12 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch.distributed as dist
 
 from telefuser.core.base_stage import BaseStage, with_model_offload
 from telefuser.core.config import AttnImplType, ModelRuntimeConfig
 from telefuser.core.module_manager import ModuleManager
+from telefuser.distributed.latent_parallel import LatentParallelRuntime
 from telefuser.models.abot_world_dit import ABotWorldDiT
 from telefuser.schedulers.flow_match import FlowMatchScheduler
 from telefuser.utils.logging import logger
@@ -389,6 +391,7 @@ class ABotWorldDenoisingStage(BaseStage):
         self._cuda_graph_replays = 0
         self._cuda_graph_capture_failures = 0
         self._cuda_graph_capture_disabled = False
+        self._latent_parallel_runtime: LatentParallelRuntime | None = None
         self._last_cuda_graph_metrics: dict[str, int] = {
             "cuda_graph_enabled": 0,
             "cuda_graph_eligible": 0,
@@ -478,10 +481,43 @@ class ABotWorldDenoisingStage(BaseStage):
             "cuda_graph_batched": int(batched),
         }
 
-    def parallel_models(self) -> None:
-        if self.model_runtime_config.parallel_config.world_size != 1:
-            raise ValueError("ABot-World initial integration supports exactly one DiT GPU")
+    @property
+    def latent_parallel_enabled(self) -> bool:
+        """Return whether this stage runs the opt-in frame-sharded path."""
+        return self._latent_parallel_runtime is not None
+
+    @property
+    def latent_parallel_runtime(self) -> LatentParallelRuntime | None:
+        """Return the optional process-group runtime owned by this stage."""
+        return self._latent_parallel_runtime
+
+    def parallel_models(self, *, latent_parallel: bool = False) -> None:
+        world_size = self.model_runtime_config.parallel_config.world_size
+        if not latent_parallel:
+            if world_size != 1:
+                raise ValueError("ABot-World requires latent_parallel=True for a multi-GPU DiT")
+            self._latent_parallel_runtime = None
+            self.dit.set_latent_parallel_runtime(None)
+        else:
+            if world_size < 2:
+                raise ValueError("ABot distributed latent execution requires at least two configured devices")
+            if not dist.is_available() or not dist.is_initialized():
+                raise RuntimeError("ABot latent parallelism requires an initialized torch.distributed process group")
+            if dist.get_world_size() != world_size:
+                raise ValueError(
+                    f"ABot latent parallel world size {world_size} does not match the process group "
+                    f"world size {dist.get_world_size()}"
+                )
+            self._latent_parallel_runtime = LatentParallelRuntime()
+            self.dit.set_latent_parallel_runtime(self._latent_parallel_runtime)
         self.dit.set_attention_config(self.model_runtime_config.attention_config)
+
+    def release_latent_parallel(self) -> None:
+        """Release communication storage without destroying the caller's process group."""
+        if self._latent_parallel_runtime is not None:
+            self._latent_parallel_runtime.clear_buffers()
+        self.dit.set_latent_parallel_runtime(None)
+        self._latent_parallel_runtime = None
 
     def _new_cache(self, batch_size: int, height: int, width: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         frame_tokens = (height // self.dit.patch_size[1]) * (width // self.dit.patch_size[2])
@@ -525,14 +561,21 @@ class ABotWorldDenoisingStage(BaseStage):
         latent: torch.Tensor,
         timestep: torch.Tensor,
         scheduler: FlowMatchScheduler,
+        *,
+        sigma: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if timestep.shape != (latent.shape[0], latent.shape[2]):
             raise ValueError("ABot timestep must have one value per latent frame")
-        flat_timestep = timestep.flatten().float()
-        sigma_index = (
-            (scheduler.timesteps.to(flat_timestep.device).unsqueeze(0) - flat_timestep.unsqueeze(1)).abs().argmin(dim=1)
-        )
-        sigma = scheduler.sigmas.to(device=latent.device, dtype=torch.float64)[sigma_index]
+        if sigma is None:
+            flat_timestep = timestep.flatten().float()
+            sigma_index = (
+                (scheduler.timesteps.to(flat_timestep.device).unsqueeze(0) - flat_timestep.unsqueeze(1))
+                .abs()
+                .argmin(dim=1)
+            )
+            sigma = scheduler.sigmas.to(device=latent.device, dtype=torch.float64)[sigma_index]
+        else:
+            sigma = sigma.to(device=latent.device, dtype=torch.float64)
         sigma = sigma.view(latent.shape[0], 1, latent.shape[2], 1, 1)
         return (latent.double() - sigma * flow_prediction.double()).to(flow_prediction.dtype)
 
@@ -754,7 +797,7 @@ class ABotWorldDenoisingStage(BaseStage):
         # Runtime-selected fidelity uses eager denoising with an explicit
         # subset of the four official sampler positions. CUDA Graph captures
         # are tied to the default four-step/static-window path.
-        if timestep_positions is not None:
+        if self._latent_parallel_runtime is not None or timestep_positions is not None:
             self._set_cuda_graph_last_metrics(eligible=False)
             return None
 
@@ -902,6 +945,21 @@ class ABotWorldDenoisingStage(BaseStage):
         therefore an unsupported PyTorch or attention backend safely falls
         back to the existing eager implementation.
         """
+        if self._latent_parallel_runtime is not None:
+            self._set_cuda_graph_last_metrics(eligible=False)
+            return self._denoise_block(
+                latent,
+                prompt_emb,
+                action_context,
+                None,
+                self_cache,
+                cross_cache,
+                current_start,
+                generator,
+                scheduler,
+                timestep_positions=timestep_positions,
+                layer_readiness=layer_readiness,
+            )
         if layer_readiness is not None:
             self._set_cuda_graph_last_metrics(eligible=False)
             return self._denoise_block(
@@ -1056,12 +1114,22 @@ class ABotWorldDenoisingStage(BaseStage):
         timestep_positions: Sequence[int] | None = None,
         layer_readiness: Any | None = None,
     ) -> torch.Tensor:
+        runtime = self._latent_parallel_runtime
+        sharded = runtime is not None and latent.shape[2] > 1
+        if sharded and latent.shape[2] % runtime.world_size:
+            raise ValueError("ABot multi-frame chunks must be divisible by the latent-parallel world size")
         current = latent
         batch, _, frames, height, width = current.shape
         replace_first = current_start == 0 and first_frame_latent is not None
         if replace_first:
             current = current.clone()
             current[:, :, :1].copy_(first_frame_latent)
+        if sharded:
+            current = runtime.frame_slice(current)
+            action_context = runtime.frame_slice(action_context)
+            frames = current.shape[2]
+            replace_first = replace_first and runtime.rank == 0
+        model_forward = self.dit.forward_latent_parallel if sharded else self.dit
         frame_tokens = (height // self.dit.patch_size[1]) * (width // self.dit.patch_size[2])
         timesteps = self._official_denoising_timesteps(scheduler)
         if timestep_positions is not None:
@@ -1079,7 +1147,7 @@ class ABotWorldDenoisingStage(BaseStage):
             if replace_first:
                 timestep[:, 0] = 0
             with torch.autocast(self.device.type, dtype=self.torch_dtype, enabled=self.device.type == "cuda"):
-                flow_prediction = self.dit(
+                flow_prediction = model_forward(
                     x=current.to(dtype=self.torch_dtype),
                     timestep=timestep,
                     context=prompt_emb,
@@ -1091,13 +1159,17 @@ class ABotWorldDenoisingStage(BaseStage):
                 )
             x0 = self._x0_prediction(flow_prediction, current, timestep, scheduler)
             if index < len(timesteps) - 1:
+                # Preserve the native full-shape RNG draws on every replica,
+                # then retain only the local shard. This keeps session seeds
+                # and generator advancement independent of the SP degree.
+                noise_shape = latent.shape if sharded else x0.shape
                 if isinstance(generator, Sequence):
                     if len(generator) != x0.shape[0]:
                         raise ValueError("ABot batched denoising requires one generator per session")
                     noise = torch.cat(
                         [
                             torch.randn(
-                                (1, *x0.shape[1:]),
+                                (1, *noise_shape[1:]),
                                 generator=item_generator,
                                 dtype=x0.dtype,
                                 device=self.device,
@@ -1107,14 +1179,16 @@ class ABotWorldDenoisingStage(BaseStage):
                         dim=0,
                     )
                 else:
-                    noise = torch.randn(x0.shape, generator=generator, dtype=x0.dtype, device=self.device)
+                    noise = torch.randn(noise_shape, generator=generator, dtype=x0.dtype, device=self.device)
+                if sharded:
+                    noise = runtime.frame_slice(noise)
                 current = scheduler.add_noise(x0, noise, timesteps[index + 1])
             else:
                 current = x0
             if replace_first:
                 current[:, :, :1].copy_(first_frame_latent)
         context_timestep = torch.zeros_like(timestep)
-        self.dit(
+        model_forward(
             x=current.to(dtype=self.torch_dtype),
             timestep=context_timestep,
             context=prompt_emb,
@@ -1124,7 +1198,7 @@ class ABotWorldDenoisingStage(BaseStage):
             current_start=current_start * frame_tokens,
             layer_readiness=layer_readiness,
         )
-        return current
+        return runtime.gather_frames(current) if sharded else current
 
     @with_model_offload(["dit"])
     @torch.inference_mode()
@@ -1148,7 +1222,9 @@ class ABotWorldDenoisingStage(BaseStage):
         scheduler = self._scheduler()
         generator = torch.Generator(device=self.device).manual_seed(seed)
         output = []
-        for start in range(0, noise.shape[2], 3):
+        # The first image occupies one frame; continuation chunks start at 1,
+        # not 3. Every input latent must be visited exactly once.
+        for start in (0, *range(1, noise.shape[2], 3)):
             frames = 1 if start == 0 else 3
             block = self._denoise_block(
                 noise[:, :, start : start + frames].to(device=self.device, dtype=self.torch_dtype),

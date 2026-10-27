@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import threading
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 from PIL import Image
@@ -21,6 +22,10 @@ from telefuser.service.livekit.model_contracts import SessionStateCodec
 from .fidelity import ABotWorldFidelity
 from .pipeline import ABotWorldPipeline
 from .taew_vae import ABotWorldTAEWDecodeState
+
+if TYPE_CHECKING:
+    from .continuous import ABotWorldContinuousRuntime, DecodeSubmitter, PostprocessSubmitter
+    from .latent_step_runtime import ABotWorldLatentStepRuntime
 
 
 class ABotWorldSessionLifecycle(str, Enum):
@@ -58,6 +63,8 @@ class ABotWorldInteractiveSession:
     migration_layer_readiness: Any | None = field(default=None, repr=False)
     closed: bool = False
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    step_task_active: bool = False
+    latent_runtime_owner: object | None = field(default=None, repr=False, compare=False)
 
     @property
     def is_resident(self) -> bool:
@@ -86,6 +93,14 @@ class ABotWorldSessionSnapshot:
     next_latent_frame: int
     emitted_frames: int
     ownership_epoch: int
+
+
+@dataclass(frozen=True)
+class ABotWorldGeneratedBatch:
+    """Decoded GPU output that can be converted outside the model critical path."""
+
+    decoded: torch.Tensor
+    frames_per_session: int
 
 
 class ABotWorldSessionStateCodec:
@@ -144,6 +159,19 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
         self._models_preloaded = False
         self._last_stage_metrics: dict[str, float | int] = {}
         self._session_state_codec: SessionStateCodec = ABotWorldSessionStateCodec(self)
+        self._conditioning_cache: dict[str, tuple[tuple, torch.Tensor]] = {}
+
+    def _conditioning(self, kind: str, key: tuple, encode: Callable[[], torch.Tensor]) -> torch.Tensor:
+        """Memoize one deterministic image/prompt per kind, never mutable state."""
+        previous = self._conditioning_cache.get(kind)
+        if previous is None or previous[0] != key:
+            value = encode().to(device=self.device, dtype=self.torch_dtype)
+            self._conditioning_cache[kind] = key, value
+        else:
+            value = previous[1]
+        # Callers can own and mutate their conditioning without corrupting a
+        # future session. KV, sampler, RNG and decoder state are never shared.
+        return value.clone()
 
     @property
     def session_state_codec(self) -> SessionStateCodec:
@@ -162,6 +190,43 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
                 stage.onload_models_flag = True
             self._models_preloaded = True
 
+    def create_continuous_runtime(
+        self,
+        *,
+        max_batch_size: int,
+        granularity: Literal["chunk_step", "latent_step"] = "chunk_step",
+        backend: Literal["eager", "cuda_graph"] = "eager",
+        max_graphs: int = 4,
+        postprocess_submitter: PostprocessSubmitter | None = None,
+        decode_submitter: DecodeSubmitter | None = None,
+        refresh_ranks: Sequence[int] = (),
+        local_execution: bool = False,
+    ) -> ABotWorldContinuousRuntime | ABotWorldLatentStepRuntime:
+        """Create an opt-in, step-resumable driver for retained sessions."""
+        if granularity == "latent_step":
+            from .latent_step_runtime import ABotWorldLatentStepRuntime
+
+            return ABotWorldLatentStepRuntime(
+                self,
+                max_batch_size=max_batch_size,
+                backend=backend,
+                max_graphs=max_graphs,
+                postprocess_submitter=postprocess_submitter,
+                decode_submitter=decode_submitter,
+                refresh_ranks=refresh_ranks,
+                local_execution=local_execution,
+            )
+        if granularity != "chunk_step" or backend != "eager" or refresh_ranks or local_execution:
+            raise ValueError("The selected backend requires granularity=latent_step")
+        from .continuous import ABotWorldContinuousRuntime
+
+        return ABotWorldContinuousRuntime(
+            self,
+            max_batch_size=max_batch_size,
+            postprocess_submitter=postprocess_submitter,
+            decode_submitter=decode_submitter,
+        )
+
     @torch.inference_mode()
     def create_interactive_session(
         self,
@@ -172,28 +237,53 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
         session_id: str | None = None,
     ) -> ABotWorldInteractiveSession:
         """Encode the start image and allocate session-owned causal caches."""
+        return self._create_interactive_session(image, prompt, seed=seed, session_id=session_id, cache_batch_size=1)
+
+    @torch.inference_mode()
+    def _create_interactive_session(
+        self,
+        image: Image.Image,
+        prompt: str,
+        *,
+        seed: int,
+        session_id: str | None,
+        cache_batch_size: int,
+    ) -> ABotWorldInteractiveSession:
+        """Share initialization while allowing a runtime-owned empty KV shell."""
         if not isinstance(image, Image.Image):
             raise TypeError("image must be a PIL Image")
         self.preload_models()
         with self._execution_lock:
-            pixels = self.preprocess_image(image.convert("RGB"), self.config.height, self.config.width)
+            image = image.convert("RGB")
+            shape = self.config.height, self.config.width, self.device, self.torch_dtype
             encode_started_at = time.monotonic()
-            start_latent, _ = self.vae_stage.process("encode_image", pixels, None, 1, concat_mask=False)
+            image_key = (*shape, id(self.vae_stage), image.size, hashlib.sha256(image.tobytes()).digest())
+
+            def encode_image() -> torch.Tensor:
+                pixels = self.preprocess_image(image, self.config.height, self.config.width)
+                start_latent, _ = self.vae_stage.process("encode_image", pixels, None, 1, concat_mask=False)
+                return start_latent.unsqueeze(0)
+
+            first_frame_latent = self._conditioning("image", image_key, encode_image)
             encode_seconds = time.monotonic() - encode_started_at
-            first_frame_latent = start_latent.unsqueeze(0).to(device=self.device, dtype=self.torch_dtype)
             text_started_at = time.monotonic()
-            prompt_emb = self.text_encoding_stage.process([prompt])[0].to(
-                device=self.device,
-                dtype=self.torch_dtype,
+            prompt_emb = self._conditioning(
+                "prompt",
+                (*shape, id(self.text_encoding_stage), prompt),
+                lambda: self.text_encoding_stage.process([prompt])[0],
             )
             text_seconds = time.monotonic() - text_started_at
+            runtime = self.denoise_stage.latent_parallel_runtime
+            if runtime is not None:
+                runtime.broadcast_(first_frame_latent)
+                runtime.broadcast_(prompt_emb)
             self._last_stage_metrics = {
                 "batch_size": 1,
                 "vae_encode_seconds": encode_seconds,
                 "text_encode_seconds": text_seconds,
             }
             self_cache, cross_cache = self.denoise_stage._new_cache(
-                first_frame_latent.shape[0],
+                cache_batch_size,
                 first_frame_latent.shape[-2],
                 first_frame_latent.shape[-1],
             )
@@ -207,7 +297,8 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
             generator=torch.Generator(device=self.device).manual_seed(seed),
         )
         session.taew_decode_state = self.taew_decode_stage.create_decode_state()
-        self.taew_decode_stage.warmup_first_frame(session.taew_decode_state, first_frame_latent)
+        if self.is_output_rank:
+            self.taew_decode_stage.warmup_first_frame(session.taew_decode_state, first_frame_latent)
         with self._lifecycle_lock:
             if session.session_id in self._interactive_sessions:
                 raise ValueError(f"ABot interactive session {session.session_id!r} already exists")
@@ -239,10 +330,14 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
         *,
         control_latent_frames: int = 3,
         fidelity: ABotWorldFidelity | None = None,
-    ) -> list[list[Image.Image]]:
+        _return_decoded: bool = False,
+    ) -> list[list[Image.Image]] | ABotWorldGeneratedBatch:
         """Generate one compatible causal block for every session in one model batch."""
         if not sessions or len(sessions) != len(actions):
             raise ValueError("sessions and actions must be non-empty and have equal length")
+        runtime = getattr(self.denoise_stage, "latent_parallel_runtime", None)
+        if runtime is not None and control_latent_frames > 1 and control_latent_frames % runtime.world_size:
+            raise ValueError("ABot multi-frame chunks must be divisible by the latent-parallel world size")
         if control_latent_frames not in {1, 2, 3}:
             raise ValueError("control_latent_frames must be 1, 2, or 3")
         first_flags = {session.next_latent_frame == 0 for session in sessions}
@@ -256,8 +351,7 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
 
         with self._lifecycle_lock:
             for session in sessions:
-                if self._interactive_sessions.get(session.session_id) is not session or session.closed:
-                    raise RuntimeError("ABot interactive session is no longer active")
+                self._require_session(session)
                 if not session.is_resident:
                     raise RuntimeError("ABot interactive session must be restored before generation")
 
@@ -358,9 +452,7 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
                     generator=sessions[0].generator,
                     scheduler=sessions[0].scheduler,
                     layer_readiness=(
-                        sessions[0].migration_layer_readiness
-                        if sessions[0].migration_transfer_in_progress
-                        else None
+                        sessions[0].migration_layer_readiness if sessions[0].migration_transfer_in_progress else None
                     ),
                     **denoise_kwargs,
                 )
@@ -470,10 +562,13 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
                 decode_started_at = time.monotonic()
             if any(session.taew_decode_state is None for session in sessions):
                 raise RuntimeError("ABot session is missing its TAeW2.2 decode state")
-            decoded = self.taew_decode_stage.decode_chunks(
-                latents,
-                [session.taew_decode_state for session in sessions],
-            )
+            if self.is_output_rank:
+                decoded = self.taew_decode_stage.decode_chunks(
+                    latents,
+                    [session.taew_decode_state for session in sessions],
+                )
+            else:
+                decoded = latents.new_empty((len(sessions), 3, 0, 0, 0))
             if use_cuda_events:
                 vae_finished.record()
                 vae_finished.synchronize()
@@ -481,13 +576,45 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
                 decode_seconds = vae_started.elapsed_time(vae_finished) / 1000.0
             else:
                 decode_seconds = time.monotonic() - decode_started_at
-            postprocess_started_at = time.monotonic()
-            results: list[list[Image.Image]] = []
-            for batch_index, session in enumerate(sessions):
-                frames = self.tensor2video(decoded[batch_index])
+            frames_per_session = int(decoded.shape[2])
+            if runtime is not None:
+                # One boundary exchange keeps counters consistent; only the
+                # output rank retains and advances the temporal decoder.
+                frame_count_tensor = torch.tensor(frames_per_session, dtype=torch.long, device=latents.device)
+                runtime.broadcast_(frame_count_tensor)
+                frames_per_session = int(frame_count_tensor.item())
+            for session in sessions:
                 session.next_latent_frame += frame_count
-                session.emitted_frames += len(frames)
-                results.append(frames)
+                session.emitted_frames += frames_per_session
+            if _return_decoded:
+                self._last_stage_metrics = {
+                    "batch_size": len(sessions),
+                    "input_prepare_seconds": input_prepare_seconds,
+                    "cache_collate_seconds": cache_collate_seconds,
+                    "denoise_seconds": denoise_seconds,
+                    "cache_scatter_seconds": cache_scatter_seconds,
+                    "vae_decode_seconds": decode_seconds,
+                    **self.taew_decode_stage.last_decode_metrics(),
+                    **self._last_cuda_graph_metrics(),
+                    # Host frame conversion is intentionally performed by the
+                    # service output worker after the model boundary.
+                    "postprocess_seconds": 0.0,
+                    "total_seconds": time.monotonic() - batch_started_at,
+                    "postprocess_deferred": 1,
+                }
+                return ABotWorldGeneratedBatch(
+                    decoded=decoded,
+                    frames_per_session=frames_per_session if self.is_output_rank else 0,
+                )
+            postprocess_started_at = time.monotonic()
+            # Preserve test/plugin overrides of the legacy single-video
+            # converter; native ABot uses the batched path by default.
+            if not self.is_output_rank:
+                results = [[] for _ in sessions]
+            elif "tensor2video" in self.__dict__:
+                results = [self.tensor2video(decoded[index]) for index in range(decoded.shape[0])]
+            else:
+                results = self.tensor2video_batch(decoded)
             self._last_stage_metrics = {
                 "batch_size": len(sessions),
                 "input_prepare_seconds": input_prepare_seconds,
@@ -502,9 +629,29 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
             }
             return results
 
-    def _restore_default_fidelity_locked(
-        self, sessions: Sequence[ABotWorldInteractiveSession]
-    ) -> None:
+    @torch.inference_mode()
+    def generate_next_blocks_raw(
+        self,
+        sessions: Sequence[ABotWorldInteractiveSession],
+        actions: Sequence[Mapping[str, bool] | None],
+        *,
+        control_latent_frames: int = 3,
+        fidelity: ABotWorldFidelity | None = None,
+    ) -> ABotWorldGeneratedBatch:
+        """Generate a decoded batch and defer tensor-to-frame conversion."""
+
+        result = self.generate_next_blocks(
+            sessions,
+            actions,
+            control_latent_frames=control_latent_frames,
+            fidelity=fidelity,
+            _return_decoded=True,
+        )
+        if not isinstance(result, ABotWorldGeneratedBatch):
+            raise RuntimeError("ABot raw generation returned materialized frames")
+        return result
+
+    def _restore_default_fidelity_locked(self, sessions: Sequence[ABotWorldInteractiveSession]) -> None:
         """Restore the fixed ABot runtime before a non-policy dispatch."""
         dit = getattr(self.denoise_stage, "dit", None)
         set_window = getattr(dit, "set_causal_attention_window", None)
@@ -519,9 +666,9 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
         self.config.sink_size = 6
         if not sessions:
             return
-        frame_tokens = (
-            sessions[0].first_frame_latent.shape[-2] // dit.patch_size[1]
-        ) * (sessions[0].first_frame_latent.shape[-1] // dit.patch_size[2])
+        frame_tokens = (sessions[0].first_frame_latent.shape[-2] // dit.patch_size[1]) * (
+            sessions[0].first_frame_latent.shape[-1] // dit.patch_size[2]
+        )
         for session in sessions:
             self._release_cuda_graph(session.session_id)
             self._resize_self_cache(
@@ -557,9 +704,9 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
         self.config.sink_size = fidelity.sink_size
         if not sessions:
             return
-        frame_tokens = (
-            sessions[0].first_frame_latent.shape[-2] // dit.patch_size[1]
-        ) * (sessions[0].first_frame_latent.shape[-1] // dit.patch_size[2])
+        frame_tokens = (sessions[0].first_frame_latent.shape[-2] // dit.patch_size[1]) * (
+            sessions[0].first_frame_latent.shape[-1] // dit.patch_size[2]
+        )
         for session in sessions:
             self._release_cuda_graph(session.session_id)
             self._resize_self_cache(
@@ -613,8 +760,8 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
                     new_key[:, :sink_tokens].copy_(key[:, :sink_tokens])
                     new_value[:, :sink_tokens].copy_(value[:, :sink_tokens])
                 if tail_tokens:
-                    new_key[:, sink_tokens:].copy_(key[:, -tail_tokens:])
-                    new_value[:, sink_tokens:].copy_(value[:, -tail_tokens:])
+                    new_key[:, sink_tokens:].copy_(key[:, valid - tail_tokens : valid])
+                    new_value[:, sink_tokens:].copy_(value[:, valid - tail_tokens : valid])
                 retained = new_capacity
             layer["k"] = new_key
             layer["v"] = new_value
@@ -641,14 +788,8 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
                 elif isinstance(values[0], torch.Tensor):
                     scalar_values = [int(value.item()) for value in values]
                     if key != "global_end_index" and len(set(scalar_values)) != 1:
-                        details = ", ".join(
-                            f"session_{index}={value}"
-                            for index, value in enumerate(scalar_values)
-                        )
-                        raise ValueError(
-                            f"ABot batch cache cursor {key!r} must match "
-                            f"(layer={layer_index}; {details})"
-                        )
+                        details = ", ".join(f"session_{index}={value}" for index, value in enumerate(scalar_values))
+                        raise ValueError(f"ABot batch cache cursor {key!r} must match (layer={layer_index}; {details})")
                     layer[key] = values[0].clone()
                 else:
                     if len(set(values)) != 1:
@@ -924,6 +1065,12 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
         with self._lifecycle_lock:
             if self._interactive_sessions.get(session.session_id) is not session or session.closed:
                 raise RuntimeError("ABot interactive session is no longer active")
+            if session.step_task_active:
+                raise RuntimeError("ABot session has an unfinished continuous-batching chunk")
+            if session.latent_runtime_owner is not None:
+                raise RuntimeError(
+                    "ABot session is owned by a latent-step runtime; release it before pipeline operations"
+                )
 
     def close_interactive_session(self, session: ABotWorldInteractiveSession | None = None) -> None:
         """Release only the requested session's retained state."""
@@ -947,4 +1094,5 @@ class ABotWorldInteractivePipeline(ABotWorldPipeline):
 
     def close(self) -> None:
         self.close_interactive_session()
+        self._conditioning_cache.clear()
         super().close()

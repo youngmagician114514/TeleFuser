@@ -430,11 +430,29 @@ class ProcessLiveKitWorkerPool:
             return
         callback = getattr(getattr(self, "_event_sink", None), "on_motivation_compute_complete", None)
         if callable(callback):
-            callback(
-                job_ids=tuple(job_ids),
-                session_ids=tuple(session_ids),
-                compatibility_keys=compatibility_keys,
-            )
+            profile_timings = []
+            duration = raw.get("model_duration_seconds")
+            batch_size = raw.get("batch_size")
+            worker_id = str(event.get("worker_id", ""))
+            if isinstance(duration, (int, float)) and duration > 0 and isinstance(batch_size, int) and batch_size > 0:
+                for item in raw.get("sessions", ()):
+                    if isinstance(item, dict) and item.get("fidelity"):
+                        profile_timings.append(
+                            {
+                                "batch_size": batch_size,
+                                "fidelity": str(item["fidelity"]),
+                                "gpu_id": str(item.get("gpu_id") or worker_id),
+                                "latency_seconds": float(duration),
+                            }
+                        )
+            callback_kwargs = {
+                "job_ids": tuple(job_ids),
+                "session_ids": tuple(session_ids),
+                "compatibility_keys": compatibility_keys,
+            }
+            if profile_timings:
+                callback_kwargs["profile_timings"] = tuple(profile_timings)
+            callback(**callback_kwargs)
 
     def _notify_model_dispatch_failed(self, event: dict[str, Any]) -> None:
         """Roll back a Motivation lease when child model execution fails.
@@ -834,9 +852,7 @@ async def _run_process_worker(
                                     "type": "motivation_dispatch_failed",
                                     "worker_id": spec.worker_id,
                                     "job_ids": [str(value) for value in command.get("motivation_job_ids", ())],
-                                    "session_ids": [
-                                        str(value) for value in command.get("motivation_session_ids", ())
-                                    ],
+                                    "session_ids": [str(value) for value in command.get("motivation_session_ids", ())],
                                     "error": repr(exc),
                                 }
                             )

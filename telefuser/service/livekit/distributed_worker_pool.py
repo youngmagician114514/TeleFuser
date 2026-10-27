@@ -23,8 +23,8 @@ from .node_agent import NodeAgentMigrationRequest, NodeAgentMigrationResult
 from .process_worker_pool import ProcessWorkerSpec
 from .session_registry import SessionRecord
 from .token_service import LiveKitTokenService
-from .turboserve import TurboServeOwnership
 from .topology import NodeAgent, WorkerEndpoint
+from .turboserve import TurboServeOwnership
 from .worker_pool import WorkerPool
 
 
@@ -82,9 +82,7 @@ class NodeAgentRpcClient:
                 return await self._call_unlocked(method, params, timeout=timeout)
         return await self._call_unlocked(method, params, timeout=timeout)
 
-    async def _call_unlocked(
-        self, method: str, params: dict[str, Any] | None, *, timeout: float | None
-    ) -> Any:
+    async def _call_unlocked(self, method: str, params: dict[str, Any] | None, *, timeout: float | None) -> Any:
         self._request_id += 1
         request = {
             "id": self._request_id,
@@ -93,9 +91,7 @@ class NodeAgentRpcClient:
             "secret": self.secret,
         }
         host, port = self.address
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=timeout or self.timeout
-        )
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout or self.timeout)
         try:
             writer.write((json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8"))
             await writer.drain()
@@ -116,10 +112,13 @@ class NodeAgentRpcClient:
         return dict(result) if isinstance(result, dict) else {"status": result}
 
     async def migrate_session(self, request: NodeAgentMigrationRequest) -> NodeAgentMigrationResult:
-        result = await self.call("migrate_session", {
-            "pipeline_session_id": request.session_id,
-            "target_worker_id": request.target_gpu,
-        })
+        result = await self.call(
+            "migrate_session",
+            {
+                "pipeline_session_id": request.session_id,
+                "target_worker_id": request.target_gpu,
+            },
+        )
         return NodeAgentMigrationResult(
             operation_id=str(result.get("session_id", request.session_id)),
             ready=True,
@@ -266,9 +265,7 @@ class DistributedLiveKitWorkerPool(WorkerPool):
                     chunk = dict(message.get("chunk") or {})
                     if chunk.get("type") == "stop":
                         with contextlib.suppress(Exception):
-                            await self._client_for_worker(worker_id).call(
-                                "stop_session", {"session_id": session_id}
-                            )
+                            await self._client_for_worker(worker_id).call("stop_session", {"session_id": session_id})
                         continue
                     handled = bool(self._event_sink.on_control_message(worker_id, session_id, chunk))
                     if not handled:
@@ -281,6 +278,7 @@ class DistributedLiveKitWorkerPool(WorkerPool):
                         job_ids=tuple(str(value) for value in completion.get("job_ids", ())),
                         session_ids=tuple(str(value) for value in completion.get("session_ids", ())),
                         compatibility_keys=dict(completion.get("compatibility_keys", {})),
+                        profile_timings=tuple(completion.get("profile_timings", ())),
                     )
                 for failure in health.get("dispatch_failures", ()):
                     self._event_sink.on_motivation_dispatch_failed(
@@ -366,7 +364,8 @@ class DistributedLiveKitWorkerPool(WorkerPool):
                 raise RuntimeError(f"Session {session_id!r} is not assigned to a distributed worker")
             if expected_worker_id is not None and worker_id != expected_worker_id:
                 raise RuntimeError(
-                    f"Motivation owner mismatch for {session_id!r}: candidate={expected_worker_id!r} actual={worker_id!r}"
+                    f"Motivation owner mismatch for {session_id!r}: "
+                    f"candidate={expected_worker_id!r} actual={worker_id!r}"
                 )
             grouped.setdefault(worker_id, []).append((session_id, dict(chunk)))
         for worker_id, items in grouped.items():
@@ -430,7 +429,9 @@ class DistributedLiveKitWorkerPool(WorkerPool):
             if api_id == session_id:
                 self._pipeline_sessions.pop(pipeline_id, None)
 
-    async def migrate_session(self, pipeline_session_id: str, target_worker_id: str, **kwargs: Any) -> TurboServeOwnership:
+    async def migrate_session(
+        self, pipeline_session_id: str, target_worker_id: str, **kwargs: Any
+    ) -> TurboServeOwnership:
         on_compute_ready = kwargs.get("on_compute_ready")
         api_session_id = self._pipeline_sessions.get(pipeline_session_id)
         source_worker_id = self._session_workers.get(api_session_id) if api_session_id is not None else None
@@ -609,9 +610,7 @@ class DistributedLiveKitWorkerPool(WorkerPool):
             if source.node_id == self._config.node_id:
                 await self._local.detach_transport(api_session_id)
             elif source_client is not None:
-                await source_client.call(
-                    "remote_detach_transport", {"session_id": api_session_id}, ordered=False
-                )
+                await source_client.call("remote_detach_transport", {"session_id": api_session_id}, ordered=False)
 
         async def source_finish() -> None:
             if source.node_id == self._config.node_id:

@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .migration_hysteresis import MigrationCooldownPolicy
+from .model_contracts import BatchCompatibilityProvider
 from .motivation_diagnostics import MotivationDiagnosticsSink, MotivationDispatchSummary
 from .motivation_scheduler import (
     EPSILON,
@@ -29,7 +30,6 @@ from .motivation_scheduler import (
     SessionSchedulingState,
     load_motivation_profiles_csv,
 )
-from .model_contracts import BatchCompatibilityProvider
 from .profile_quality import DEFAULT_QUALITY_REFERENCE_FIDELITY
 from .session_state_transfer import (
     SessionStateTransferBackend,
@@ -333,6 +333,7 @@ class MotivationRuntimeController:
                 )
                 self._owns_search_executor = True
             executor = self._search_executor
+
         def search() -> DispatchCandidate | None:
             pending_migrations, blocked_migrations = self._migration_filters(
                 now=max(observed_at, self.scheduler.current_time)
@@ -370,21 +371,15 @@ class MotivationRuntimeController:
                     return self.find_compute_candidate(
                         now=self.scheduler.current_time,
                         include_wait=False,
-                        exclude_session_ids=self._migration_filters(
-                            now=self.scheduler.current_time
-                        )[0],
+                        exclude_session_ids=self._migration_filters(now=self.scheduler.current_time)[0],
                         immediate_only=True,
                     )
                 return self.scheduler.find_best(
                     now=self.scheduler.current_time,
                     wait_seconds=wait_seconds,
                     include_wait=True,
-                    exclude_session_ids=self._migration_filters(
-                        now=self.scheduler.current_time
-                    )[0],
-                    blocked_migration_session_ids=self._migration_filters(
-                        now=self.scheduler.current_time
-                    )[1],
+                    exclude_session_ids=self._migration_filters(now=self.scheduler.current_time)[0],
+                    blocked_migration_session_ids=self._migration_filters(now=self.scheduler.current_time)[1],
                 )
 
         return executor.submit(search)
@@ -570,11 +565,7 @@ class MotivationRuntimeController:
         return tuple(
             gpu
             for gpu in self.scheduler.gpus()
-            if (
-                gpu.available
-                and gpu.free_at <= now + EPSILON
-                and gpu.reserved_memory_gb <= EPSILON
-            )
+            if (gpu.available and gpu.free_at <= now + EPSILON and gpu.reserved_memory_gb <= EPSILON)
         )
 
     def pending_migration_sessions(self) -> tuple[str, ...]:
@@ -620,9 +611,7 @@ class MotivationRuntimeController:
         if policy is None:
             return ()
         observed_at = self._observed(now)
-        session_ids = tuple(
-            state.session_id for state in self.scheduler.sessions() if not state.departed
-        )
+        session_ids = tuple(state.session_id for state in self.scheduler.sessions() if not state.departed)
         return policy.blocked_session_ids(session_ids, now=observed_at)
 
     def _pending_migration_sessions(self) -> tuple[str, ...]:
@@ -683,9 +672,7 @@ class MotivationRuntimeController:
             # migration candidates may proceed here: their asynchronous
             # transfer can overlap the current GPU invocation and is committed
             # before a fresh execution candidate is searched.
-            if not candidate.migration_count and not self.scheduler.candidate_ready_now(
-                candidate, now=observed_at
-            ):
+            if not candidate.migration_count and not self.scheduler.candidate_ready_now(candidate, now=observed_at):
                 self._record_dispatch(candidate, observed_at, "deferred", "gpu_busy")
                 return None
             if candidate.migration_count:
@@ -705,9 +692,7 @@ class MotivationRuntimeController:
                     self._record_dispatch(candidate, observed_at, "rejected", "owner_mismatch")
                     return None
             jobs = tuple(
-                self.scheduler.session(session_id).ready_job(
-                    include_idle=self.scheduler.config.include_idle_jobs
-                )
+                self.scheduler.session(session_id).ready_job(include_idle=self.scheduler.config.include_idle_jobs)
                 for session_id in candidate.session_ids
             )
             if any(job is None for job in jobs):
@@ -802,6 +787,24 @@ class MotivationRuntimeController:
             completed_at=self._observed(completed_at),
         )
 
+    def record_profile_timing(
+        self,
+        *,
+        batch_size: int,
+        fidelity: str,
+        gpu_id: str,
+        latency_seconds: float,
+        p95_seconds: float | None = None,
+    ) -> bool:
+        """Feed a completed model batch into the scheduler's online timing model."""
+        return self.scheduler.record_profile_timing(
+            batch_size=batch_size,
+            fidelity=fidelity,
+            gpu_id=gpu_id,
+            latency_seconds=latency_seconds,
+            p95_seconds=p95_seconds,
+        )
+
     def poll_migrations(self, *, now: float | None = None) -> tuple[SessionStateTransferRecord, ...]:
         """Poll active transfers and return records that became ready/completed."""
         if self.migration_manager is None:
@@ -826,11 +829,7 @@ class MotivationRuntimeController:
             if state.owner_gpu == candidate.gpu_id:
                 continue
             active = next(
-                (
-                    record
-                    for record in self.migration_manager.active()
-                    if record.request.session_id == session_id
-                ),
+                (record for record in self.migration_manager.active() if record.request.session_id == session_id),
                 None,
             )
             if active is None:
@@ -858,12 +857,8 @@ class MotivationRuntimeController:
                     target_gpu=candidate.gpu_id,
                     requested_at=now,
                     estimated_ready_at=max(now, candidate.start_at),
-                    source_node_id=next(
-                        gpu.node_id for gpu in self.scheduler.gpus() if gpu.gpu_id == state.owner_gpu
-                    ),
-                    target_node_id=next(
-                        gpu.node_id for gpu in self.scheduler.gpus() if gpu.gpu_id == candidate.gpu_id
-                    ),
+                    source_node_id=next(gpu.node_id for gpu in self.scheduler.gpus() if gpu.gpu_id == state.owner_gpu),
+                    target_node_id=next(gpu.node_id for gpu in self.scheduler.gpus() if gpu.gpu_id == candidate.gpu_id),
                     source_address=next(
                         gpu.endpoint_address for gpu in self.scheduler.gpus() if gpu.gpu_id == state.owner_gpu
                     ),

@@ -255,6 +255,7 @@ class BasePipeline(ABC):
         self.height_division_factor = 16
         self.width_division_factor = 16
         self._metrics_manager: StageMetricsManager | None = None
+        self._video_copy_stream: torch.cuda.Stream | None = None
 
     def _get_stages(self) -> list:
         """Get list of pipeline stages for metrics collection.
@@ -374,6 +375,49 @@ class BasePipeline(ABC):
         frames = rearrange(frames, "C T H W -> T H W C")
         frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
         return [Image.fromarray(frame) for frame in frames]
+
+    def tensor2video_batch(self, frames: torch.Tensor) -> list[list[Image.Image]]:
+        """Convert a ``[B,C,T,H,W]`` batch to CPU video frames in one transfer.
+
+        The interactive ABot path used to call :meth:`tensor2video` once per
+        session.  That repeated the dtype conversion, device synchronization,
+        and host allocation for every member of a physical batch.  This path
+        normalizes the complete batch once, copies it to pinned host memory on
+        a private CUDA stream, and only then constructs the CPU/PIL objects.
+        The caller may run this method in an output worker so the next model
+        invocation can use the default stream while the host conversion runs.
+        """
+
+        if frames.ndim != 5:
+            raise ValueError(f"batched video tensor must be [B,C,T,H,W], got {tuple(frames.shape)}")
+        # Layout conversion is a view for the usual contiguous decoder output.
+        # Keep normalization batched so there is one GPU launch sequence per
+        # physical batch instead of one sequence per session.
+        normalized = ((frames.float() + 1) * 127.5).clamp(0, 255).to(torch.uint8)
+        normalized = normalized.permute(0, 2, 3, 4, 1)
+        if normalized.device.type == "cuda":
+            host = torch.empty(
+                normalized.shape,
+                dtype=torch.uint8,
+                device="cpu",
+                pin_memory=True,
+            )
+            # A private stream lets the next DiT invocation use the default
+            # stream while this output copy drains. The tensor is retained by
+            # the caller/future until the event has completed.
+            if self._video_copy_stream is None or self._video_copy_stream.device != normalized.device:
+                self._video_copy_stream = torch.cuda.Stream(device=normalized.device)
+            copy_stream = self._video_copy_stream
+            with torch.cuda.stream(copy_stream):
+                normalized.record_stream(copy_stream)
+                host.copy_(normalized, non_blocking=True)
+            copy_done = torch.cuda.Event()
+            copy_done.record(copy_stream)
+            copy_done.synchronize()
+            host_array = host.numpy()
+        else:
+            host_array = normalized.detach().cpu().numpy()
+        return [[Image.fromarray(frame) for frame in session_frames] for session_frames in host_array]
 
     def generate_noise(
         self, shape: Sequence[int], seed: int | None = None, device: str = "cpu", dtype: torch.dtype = torch.float16

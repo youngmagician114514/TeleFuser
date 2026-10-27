@@ -60,9 +60,7 @@ class _NodeAgentEventSink(NullWorkerEventSink):
         # Always forward the raw control to the coordinator.  The coordinator
         # decides whether Motivation owns it; a non-Motivation policy can send
         # the same message back through the remote worker-pool RPC.
-        self.control_messages.append(
-            {"worker_id": str(worker_id), "session_id": str(session_id), "chunk": dict(chunk)}
-        )
+        self.control_messages.append({"worker_id": str(worker_id), "session_id": str(session_id), "chunk": dict(chunk)})
         return True
 
     def drain_control_messages(self) -> list[dict[str, Any]]:
@@ -87,12 +85,14 @@ class _NodeAgentEventSink(NullWorkerEventSink):
         job_ids: tuple[str, ...] = (),
         session_ids: tuple[str, ...] = (),
         compatibility_keys: dict[str, str] | None = None,
+        profile_timings: tuple[dict[str, object], ...] = (),
     ) -> None:
         self.compute_completions.append(
             {
                 "job_ids": list(job_ids),
                 "session_ids": list(session_ids),
                 "compatibility_keys": dict(compatibility_keys or {}),
+                "profile_timings": [dict(item) for item in profile_timings],
             }
         )
 
@@ -103,9 +103,7 @@ class _NodeAgentEventSink(NullWorkerEventSink):
         session_ids: tuple[str, ...] = (),
         error: str = "physical batch dispatch failed",
     ) -> None:
-        self.dispatch_failures.append(
-            {"job_ids": list(job_ids), "session_ids": list(session_ids), "error": str(error)}
-        )
+        self.dispatch_failures.append({"job_ids": list(job_ids), "session_ids": list(session_ids), "error": str(error)})
 
     def drain_compute_completions(self) -> list[dict[str, Any]]:
         values, self.compute_completions = self.compute_completions, []
@@ -140,11 +138,7 @@ class _NodeAgentEventSink(NullWorkerEventSink):
         summary: dict[str, Any] = {
             "worker_id": str(worker_id),
             "session_id": str(session_id),
-            "payload": {
-                key: payload[key]
-                for key in ("type", "frame_count", "scheduler", "error")
-                if key in payload
-            },
+            "payload": {key: payload[key] for key in ("type", "frame_count", "scheduler", "error") if key in payload},
             "runtime_metrics": dict(runtime_metrics or {}),
             "session_runtime_metrics": dict(session_runtime_metrics or {}),
         }
@@ -179,9 +173,7 @@ class NodeAgentServer:
         self.pipeline_file = pipeline_file
         self._secret = config.node_agent_secret
         self._sink = _NodeAgentEventSink()
-        master, _port, _world, rank_offset = config.nccl_rendezvous(
-            local_worker_count=config.num_workers
-        )
+        master, _port, _world, rank_offset = config.nccl_rendezvous(local_worker_count=config.num_workers)
         del master
         specs = [
             ProcessWorkerSpec(
@@ -286,7 +278,11 @@ class NodeAgentServer:
                     response = {"id": request.get("id"), "ok": True, "result": result}
                 except Exception as exc:
                     logger.warning("NodeAgent request failed: peer=%s error=%s", peer, exc)
-                    response = {"id": request.get("id") if isinstance(request, dict) else None, "ok": False, "error": str(exc)}
+                    response = {
+                        "id": request.get("id") if isinstance(request, dict) else None,
+                        "ok": False,
+                        "error": str(exc),
+                    }
                 writer.write((json.dumps(response, separators=(",", ":")) + "\n").encode("utf-8"))
                 await writer.drain()
         finally:
@@ -399,9 +395,7 @@ class NodeAgentServer:
             return {"finished": True}
         if method == "remote_abort_source":
             await self._ensure_pool_started()
-            await self.pool.abort_remote_source(
-                str(params["pipeline_session_id"]), str(params["transfer_id"])
-            )
+            await self.pool.abort_remote_source(str(params["pipeline_session_id"]), str(params["transfer_id"]))
             return {"aborted": True}
         if method == "remote_abort_target":
             await self._ensure_pool_started()

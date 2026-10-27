@@ -16,10 +16,11 @@ from telefuser.models.taew2_2 import TAEHV, StreamingTAEHV, TWorkItem
 # This is deliberately a numeric enum: stage metrics are forwarded through
 # process boundaries and exported as low-cardinality Prometheus facts.  Keep it
 # separate from the DiT scheduler batch size, which can be greater than one
-# even when causal TAeW state requires serial decode calls.
+# even when incompatible causal states require separate decode calls.
 _TAEW_DECODE_SINGLETON = 0
 _TAEW_DECODE_SYNCHRONIZED_BATCH = 1
 _TAEW_DECODE_SERIAL_FALLBACK = 2
+_TAEW_DECODE_GROUPED_BATCH = 3
 
 
 @dataclass
@@ -55,7 +56,8 @@ class ABotWorldTAEWDecodeStage(BaseStage):
 
         ``taew_decode_mode`` is numeric so it remains low-cardinality across
         worker IPC and Prometheus export: ``0`` = singleton, ``1`` = one
-        synchronized native LightVAE batch, and ``2`` = safe serial fallback.
+        synchronized native LightVAE batch, ``2`` = safe serial fallback,
+        and ``3`` = multiple compatible decoder groups.
         ``taew_decode_batch_size`` is the *effective native decoder* batch
         size, not the enclosing DiT scheduler batch size.
         """
@@ -134,11 +136,10 @@ class ABotWorldTAEWDecodeStage(BaseStage):
         latents: torch.Tensor,
         states: Sequence[ABotWorldTAEWDecodeState],
     ) -> torch.Tensor:
-        """Decode synchronized session chunks in one LightVAE batch when safe.
+        """Decode compatible session chunks in native LightVAE batches.
 
-        State is merged only when its causal queues and temporal-memory layout
-        are identical. Incompatible states retain correct per-session decoding
-        instead of forcing an invalid batch.
+        Causal queue and temporal-memory layouts must match; initialized
+        streams need not have the same cumulative decoded-frame count.
         """
         return self._decode_chunks_impl(latents, states)
 
@@ -170,18 +171,39 @@ class ABotWorldTAEWDecodeStage(BaseStage):
                 "taew_decode_mode": _TAEW_DECODE_SYNCHRONIZED_BATCH,
             }
         else:
-            decoded = self._decode_serial_batch(decoder_latents, states)
+            groups: dict[tuple[Any, ...], list[int]] = {}
+            for index, state in enumerate(states):
+                groups.setdefault(self._decode_state_batch_signature(state), []).append(index)
+            parts: list[torch.Tensor | None] = [None] * item_count
+            for indices in groups.values():
+                group_states = [states[index] for index in indices]
+                group_latents = decoder_latents[indices]
+                group_output = (
+                    self._decode_synchronized_batch(group_latents, group_states)
+                    if len(indices) > 1
+                    else group_states[0].stream.decode(group_latents)
+                )
+                if group_output is not None:
+                    for offset, index in enumerate(indices):
+                        parts[index] = group_output[offset : offset + 1]
+            if all(item is None for item in parts):
+                decoded = None
+            elif any(item is None for item in parts) or len({item.shape[1] for item in parts}) != 1:
+                raise RuntimeError("TAeW decoder states produced incompatible output frame counts")
+            else:
+                decoded = torch.cat(parts, dim=0)
+            largest_group = max(map(len, groups.values()))
             decode_metrics = {
                 "taew_decode_items": item_count,
-                "taew_decode_batch_size": 1,
-                "taew_decode_invocations": item_count,
-                "taew_decode_mode": _TAEW_DECODE_SERIAL_FALLBACK,
+                "taew_decode_batch_size": largest_group,
+                "taew_decode_invocations": len(groups),
+                "taew_decode_mode": _TAEW_DECODE_GROUPED_BATCH if largest_group > 1 else _TAEW_DECODE_SERIAL_FALLBACK,
             }
         # Only commit the telemetry after the native calls have completed.  A
         # failed decode must not be misreported as a successful batch/fallback.
         self._last_decode_metrics = decode_metrics
         if decoded is None:
-            return latents.new_empty((latents.shape[0], 0, 3, 0, 0))
+            return latents.new_empty((latents.shape[0], 3, 0, 0, 0))
         return decoded.mul(2).sub(1).clamp(-1, 1).permute(0, 2, 1, 3, 4).contiguous()
 
     def _decode_synchronized_batch(
@@ -190,21 +212,12 @@ class ABotWorldTAEWDecodeStage(BaseStage):
         states: Sequence[ABotWorldTAEWDecodeState],
     ) -> torch.Tensor | None:
         combined = self._combine_decode_states(states)
+        previous_count = combined.stream.n_frames_decoded
         decoded = combined.stream.decode(decoder_latents)
-        self._scatter_decode_state(combined, states)
+        self._scatter_decode_state(
+            combined, states, decoded_frame_increment=combined.stream.n_frames_decoded - previous_count
+        )
         return decoded
-
-    @staticmethod
-    def _decode_serial_batch(
-        decoder_latents: torch.Tensor,
-        states: Sequence[ABotWorldTAEWDecodeState],
-    ) -> torch.Tensor | None:
-        decoded_parts = [state.stream.decode(decoder_latents[index : index + 1]) for index, state in enumerate(states)]
-        if all(item is None for item in decoded_parts):
-            return None
-        if any(item is None for item in decoded_parts):
-            raise RuntimeError("TAeW decoder states produced incompatible output frame counts")
-        return torch.cat([item for item in decoded_parts if item is not None], dim=0)
 
     @classmethod
     def _states_are_batch_compatible(cls, states: Sequence[ABotWorldTAEWDecodeState]) -> bool:
@@ -215,7 +228,9 @@ class ABotWorldTAEWDecodeStage(BaseStage):
     def _decode_state_batch_signature(cls, state: ABotWorldTAEWDecodeState) -> tuple[Any, ...]:
         stream = state.stream
         return (
-            int(stream.n_frames_decoded),
+            # Only startup trimming depends on the counter. Once initialized,
+            # streams at different ages can share the same decoder invocation.
+            stream.n_frames_decoded == 0,
             tuple(
                 (int(item.block_index), cls._state_value_batch_signature(item.input_tensor))
                 for item in stream.decoder_work_queue
@@ -271,6 +286,8 @@ class ABotWorldTAEWDecodeStage(BaseStage):
         cls,
         combined: ABotWorldTAEWDecodeState,
         states: Sequence[ABotWorldTAEWDecodeState],
+        *,
+        decoded_frame_increment: int,
     ) -> None:
         batch_size = len(states)
         stream = combined.stream
@@ -288,7 +305,7 @@ class ABotWorldTAEWDecodeStage(BaseStage):
         for index, state in enumerate(states):
             state.stream.decoder_work_queue = queue_items[index]
             state.stream.decoder_memory = memory_items[index]
-            state.stream.n_frames_decoded = int(stream.n_frames_decoded)
+            state.stream.n_frames_decoded += decoded_frame_increment
 
     @classmethod
     def _split_state_value(cls, value: Any, batch_size: int) -> list[Any]:

@@ -6,12 +6,14 @@ import os
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 
 from telefuser.core.config import (
     AttentionConfig,
     AttnImplType,
     ModelRuntimeConfig,
     OffloadConfig,
+    ParallelConfig,
     WeightOffloadType,
 )
 from telefuser.core.module_manager import ModuleManager
@@ -77,9 +79,24 @@ def get_pipeline(
     latent_frames: int = 31,
     device_id: int = 0,
     pipeline_class: type[ABotWorldPipeline] = ABotWorldPipeline,
+    latent_parallel: bool = False,
+    parallel_device_ids: list[int] | None = None,
 ) -> ABotWorldPipeline:
     """Load the downloaded ABot checkpoint with VAE/T5 model CPU offload."""
     root = Path(model_root).expanduser()
+    if latent_parallel:
+        if not dist.is_available() or not dist.is_initialized():
+            raise RuntimeError("latent_parallel=True requires an initialized torch.distributed process group")
+        process_world_size = dist.get_world_size()
+        parallel_device_ids = (
+            list(range(process_world_size)) if parallel_device_ids is None else list(parallel_device_ids)
+        )
+        if process_world_size < 2 or len(parallel_device_ids) != process_world_size:
+            raise ValueError(
+                "ABot distributed latent execution requires matching ranks/device IDs and at least two ranks"
+            )
+    elif parallel_device_ids is not None:
+        raise ValueError("parallel_device_ids requires latent_parallel=True")
     required = (
         "diffusion_pytorch_model.safetensors",
         "Wan2.2_VAE.pth",
@@ -135,12 +152,17 @@ def get_pipeline(
                 device_id=device_id,
                 torch_dtype=torch.bfloat16,
                 attention_config=AttentionConfig.dense_attention(_attention_backend(device_id)),
+                parallel_config=ParallelConfig(
+                    device_ids=parallel_device_ids,
+                    sp_ulysses_degree=len(parallel_device_ids) if parallel_device_ids else 1,
+                ),
             ),
             height=height,
             width=width,
             latent_frames=latent_frames,
             local_attn_size=18,
             sink_size=6,
+            latent_parallel_enabled=latent_parallel,
             cuda_graph_enabled=_env_flag("TELEFUSER_ABOT_CUDA_GRAPH_ENABLED"),
         ),
     )

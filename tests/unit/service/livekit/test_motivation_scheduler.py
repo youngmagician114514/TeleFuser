@@ -14,6 +14,7 @@ from telefuser.service.livekit.motivation_scheduler import (
     MotivationProfile,
     MotivationScheduler,
     MotivationSchedulerConfig,
+    OnlineMotivationProfileProvider,
     SessionSchedulingState,
     StaticMotivationProfileTable,
     load_motivation_profiles_csv,
@@ -45,6 +46,23 @@ def _scheduler(
     scheduler.add_gpu(GpuSchedulingState("gpu-0", memory_free_gb=80.0))
     scheduler.add_gpu(GpuSchedulingState("gpu-1", memory_free_gb=80.0))
     return scheduler
+
+
+def test_online_profile_timing_updates_scheduler_latency_without_changing_quality() -> None:
+    table = StaticMotivationProfileTable([MotivationProfile(1, "high", 0.40, 0.68, 20.0)])
+    scheduler = MotivationScheduler(table, config=MotivationSchedulerConfig(max_batch_size=1))
+    before = scheduler.profile_provider.profiles_for(batch_size=1, gpu_id="gpu-0")[0]
+    assert isinstance(scheduler.profile_provider, OnlineMotivationProfileProvider)
+    assert scheduler.record_profile_timing(
+        batch_size=1,
+        fidelity="high",
+        gpu_id="gpu-0",
+        latency_seconds=0.20,
+    )
+    after = scheduler.profile_provider.profiles_for(batch_size=1, gpu_id="gpu-0")[0]
+    assert after.latency_seconds == pytest.approx(0.20)
+    assert after.quality == before.quality
+    assert scheduler.profile_timing_snapshot()["profiles"]
 
 
 def test_action_updates_replace_pending_without_releasing_a_second_job() -> None:
@@ -135,6 +153,35 @@ def test_multi_slot_pending_actions_preserve_fifo_order() -> None:
     next_candidate = scheduler.find_best(now=0.5, include_wait=False)
     assert next_candidate is not None
     assert next_candidate.job_ids == (queued[0].job_id,)
+
+
+def test_failed_dispatch_keeps_pending_queue_bounded_and_retries_oldest() -> None:
+    scheduler = _scheduler(pending_action_slots=4)
+    scheduler.register_session("s", owner_gpu="gpu-0", now=0.0)
+    first, _ = scheduler.submit_action("s", ["first"], now=0.0)
+    assert first is not None
+    running = scheduler.find_best(now=0.0, include_wait=False)
+    assert running is not None
+    scheduler.reserve(running, now=0.0)
+
+    # Fill all pending slots while the first reservation is in flight.  A
+    # failed rollback must restore ``first`` without allowing the bounded
+    # queue to grow to five jobs or corrupting the next snapshot search.
+    pending = []
+    for index in range(4):
+        job, _ = scheduler.submit_action("s", [f"queued-{index}"], now=0.1 + index * 0.1)
+        assert job is not None
+        pending.append(job)
+
+    scheduler.rollback_reservation(running, now=0.6)
+
+    state = scheduler.session("s")
+    assert state.pending_action is first
+    assert state.pending_action_count == 4
+    assert len(state.pending_action_queue) == 3
+    assert tuple(job.job_id for job in state.pending_action_queue) == tuple(job.job_id for job in pending[:3])
+    assert scheduler.diagnostics_snapshot()["action_lifecycle"]["dropped_pending_capacity"] == 1
+    assert scheduler.find_best(now=0.6, include_wait=False) is not None
 
 
 def test_pending_action_waits_out_in_flight_then_becomes_runnable() -> None:
@@ -467,9 +514,7 @@ def test_placement_does_not_move_a_session_without_late_next_work() -> None:
 
 def test_placement_requires_target_to_finish_next_work_earlier() -> None:
     scheduler = _scheduler(max_batch_size=1)
-    scheduler.register_session(
-        "urgent", owner_gpu="gpu-0", now=0.0, slack_seconds=0.1
-    )
+    scheduler.register_session("urgent", owner_gpu="gpu-0", now=0.0, slack_seconds=0.1)
     scheduler.submit_action("urgent", ["W"], now=0.0, release=True)
     scheduler.update_gpu("gpu-0", free_at=0.2, now=0.0)
     scheduler.update_gpu("gpu-1", free_at=0.5, now=0.0)
@@ -481,14 +526,10 @@ def test_placement_counts_pending_target_reservations_against_capacity() -> None
     # This regression intentionally models the historical eight-session
     # target cap; production defaults are twelve retained sessions per worker.
     scheduler = _scheduler(max_batch_size=1, load_balance_capacity_per_worker=8)
-    scheduler.register_session(
-        "urgent", owner_gpu="gpu-0", now=0.0, slack_seconds=0.1
-    )
+    scheduler.register_session("urgent", owner_gpu="gpu-0", now=0.0, slack_seconds=0.1)
     scheduler.submit_action("urgent", ["W"], now=0.0, release=True)
     scheduler.update_gpu("gpu-0", free_at=0.2, now=0.0)
-    scheduler.set_migration_ready(
-        "urgent", target_gpu="gpu-1", ready_at=0.2, now=0.0
-    )
+    scheduler.set_migration_ready("urgent", target_gpu="gpu-1", ready_at=0.2, now=0.0)
 
     # The target is already reserved by the in-flight move, so a second
     # session may not be planned into the same worker once it reaches cap.
@@ -663,9 +704,7 @@ def test_internal_gpu_timeline_blocks_stale_external_snapshot() -> None:
     scheduler.submit_action("s", ["W"], now=0.0)
     scheduler.update_gpu("gpu-0", free_at=2.0, now=0.0)
     internal_gpu = scheduler.gpus()[0]
-    stale_snapshot = GpuSchedulingState(
-        "gpu-0", free_at=0.0, memory_free_gb=80.0, version=internal_gpu.version
-    )
+    stale_snapshot = GpuSchedulingState("gpu-0", free_at=0.0, memory_free_gb=80.0, version=internal_gpu.version)
 
     candidate = scheduler.find_best(now=0.0, gpu_states=(stale_snapshot,), include_wait=False)
 

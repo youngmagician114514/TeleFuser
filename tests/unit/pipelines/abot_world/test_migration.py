@@ -5,6 +5,7 @@ from collections import deque
 from types import MethodType, SimpleNamespace
 from typing import Any
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -159,6 +160,30 @@ def test_taew_batched_decode_matches_independent_streams() -> None:
     assert [state.stream.n_frames_decoded for state in batched_states] == [
         state.stream.n_frames_decoded for state in serial_states
     ]
+
+
+@pytest.mark.parametrize("include_cold_stream", [False, True])
+def test_taew_batches_different_stream_ages_and_preserves_individual_counters(include_cold_stream) -> None:
+    torch.set_num_threads(1)
+    stage = _real_taew_stage()
+    independent = [stage.create_decode_state() for _ in range(3 if include_cold_stream else 2)]
+    ages = [0, 1, 7] if include_cold_stream else [1, 7]
+    for state, age in zip(independent, ages, strict=True):
+        if age:
+            stage._decode_chunks_impl(torch.randn(1, 2, age, 1, 1), [state])
+    batched = [stage.restore_decode_state(stage.snapshot_decode_state(state)) for state in independent]
+    latents = torch.randn(len(ages), 2, 3, 1, 1)
+    expected = torch.cat(
+        [stage._decode_chunks_impl(latents[index : index + 1], [state]) for index, state in enumerate(independent)]
+    )
+    actual = stage._decode_chunks_impl(latents, batched)
+
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
+    assert [state.stream.n_frames_decoded for state in batched] == [age + 3 for age in ages]
+    metrics = stage.last_decode_metrics()
+    assert metrics["taew_decode_batch_size"] == 2
+    assert metrics["taew_decode_invocations"] == (2 if include_cold_stream else 1)
+    assert metrics["taew_decode_mode"] == (3 if include_cold_stream else 1)
 
 
 def test_taew_snapshot_restore_preserves_real_causal_decode() -> None:

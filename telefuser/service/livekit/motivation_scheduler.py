@@ -58,6 +58,7 @@ from .slackserve import (
 from .slackserve import (
     urgency_tier as slackserve_urgency_tier,
 )
+from .topology import WorkerEndpoint
 from .turboserve import (
     TurboServeClusterScheduler,
     TurboServeLatencyModel,
@@ -66,7 +67,6 @@ from .turboserve import (
     TurboServeSchedulingSnapshot,
     TurboServeSessionView,
 )
-from .topology import WorkerEndpoint
 
 EPSILON = 1e-9
 JobKind = Literal["action", "idle"]
@@ -119,17 +119,13 @@ class MotivationProfile:
             raise ValueError("latency_seconds must be positive and finite")
         if not math.isfinite(self.quality) or self.quality <= 0:
             raise ValueError("quality must be positive and finite")
-        if self.raw_quality is not None and (
-            not math.isfinite(self.raw_quality) or self.raw_quality <= 0
-        ):
+        if self.raw_quality is not None and (not math.isfinite(self.raw_quality) or self.raw_quality <= 0):
             raise ValueError("raw_quality must be positive and finite when supplied")
         if not math.isfinite(self.memory_gb) or self.memory_gb <= 0:
             raise ValueError("memory_gb must be positive and finite")
         if not math.isfinite(self.output_seconds) or self.output_seconds <= 0:
             raise ValueError("output_seconds must be positive and finite")
-        if self.p95_seconds is not None and (
-            not math.isfinite(self.p95_seconds) or self.p95_seconds <= 0
-        ):
+        if self.p95_seconds is not None and (not math.isfinite(self.p95_seconds) or self.p95_seconds <= 0):
             raise ValueError("p95_seconds must be positive and finite when supplied")
 
 
@@ -167,11 +163,7 @@ def _pareto_profile_frontier(profiles: Sequence[MotivationProfile]) -> tuple[Mot
         )
         return no_worse and strictly_better
 
-    return tuple(
-        row
-        for row in rows
-        if not any(other is not row and dominates(other, row) for other in rows)
-    )
+    return tuple(row for row in rows if not any(other is not row and dominates(other, row) for other in rows))
 
 
 def load_motivation_profiles_csv(
@@ -296,8 +288,7 @@ def load_motivation_profiles_csv(
             if lower is not None and upper is not None and 3 not in neighbors:
                 latency = (lower.latency_seconds + upper.latency_seconds) / 2.0
                 p95 = (
-                    (lower.p95_seconds or lower.latency_seconds)
-                    + (upper.p95_seconds or upper.latency_seconds)
+                    (lower.p95_seconds or lower.latency_seconds) + (upper.p95_seconds or upper.latency_seconds)
                 ) / 2.0
                 memory = (lower.memory_gb + upper.memory_gb) / 2.0
                 # Quality is a semantic family property.  Once the measured
@@ -311,11 +302,7 @@ def load_motivation_profiles_csv(
                 raw_quality = (
                     lower.raw_quality
                     if quality_result.normalized and quality_result.batch_invariant
-                    else min(
-                        value
-                        for value in (lower.raw_quality, upper.raw_quality)
-                        if value is not None
-                    )
+                    else min(value for value in (lower.raw_quality, upper.raw_quality) if value is not None)
                 )
                 gpu_id_for_row = lower.gpu_id
                 rows.append(
@@ -388,6 +375,86 @@ class StaticMotivationProfileTable:
         merged = dict(shared)
         merged.update(specific)
         return tuple(merged[fidelity] for fidelity in sorted(merged))
+
+
+class OnlineMotivationProfileProvider:
+    """Overlay measured execution latency on an immutable profile table.
+
+    Quality, memory, and output credit remain sourced from the offline table.
+    Only latency and p95 are updated with an EMA after a completed physical
+    batch, so an outlier cannot permanently replace the measured profile.
+    """
+
+    def __init__(self, base: MotivationProfileProvider, *, ema: float = 0.2) -> None:
+        if not 0.0 < ema <= 1.0 or not math.isfinite(ema):
+            raise ValueError("ema must be finite and in (0, 1]")
+        self.base = base
+        self.ema = float(ema)
+        self._timings: dict[tuple[str | None, int, str], tuple[float, float]] = {}
+
+    def profiles_for(self, *, batch_size: int, gpu_id: str) -> tuple[MotivationProfile, ...]:
+        rows = []
+        for profile in self.base.profiles_for(batch_size=batch_size, gpu_id=gpu_id):
+            timing = self._timings.get((profile.gpu_id, batch_size, profile.fidelity))
+            if timing is None:
+                rows.append(profile)
+                continue
+            latency, p95 = timing
+            rows.append(replace(profile, latency_seconds=latency, p95_seconds=p95))
+        return tuple(rows)
+
+    def record_timing(
+        self,
+        *,
+        batch_size: int,
+        fidelity: str,
+        gpu_id: str,
+        latency_seconds: float,
+        p95_seconds: float | None = None,
+    ) -> bool:
+        """Record one completed batch and return whether a profile matched."""
+        latency = float(latency_seconds)
+        p95 = latency if p95_seconds is None else float(p95_seconds)
+        if (
+            batch_size < 1
+            or not fidelity
+            or not math.isfinite(latency)
+            or latency <= 0
+            or not math.isfinite(p95)
+            or p95 <= 0
+        ):
+            raise ValueError("online profile timing must be positive and finite")
+        matched = [
+            profile
+            for profile in self.base.profiles_for(batch_size=batch_size, gpu_id=gpu_id)
+            if profile.fidelity == fidelity
+        ]
+        if not matched:
+            return False
+        profile = matched[0]
+        key = (profile.gpu_id, batch_size, fidelity)
+        previous = self._timings.get(key)
+        if previous is None:
+            self._timings[key] = latency, p95
+        else:
+            rate = self.ema
+            self._timings[key] = (
+                previous[0] + rate * (latency - previous[0]),
+                previous[1] + rate * (p95 - previous[1]),
+            )
+        return True
+
+    def timing_snapshot(self) -> dict[str, object]:
+        return {
+            "ema": self.ema,
+            "profiles": {
+                f"{gpu or 'shared'}:b{batch}:{fidelity}": {
+                    "latency_seconds": latency,
+                    "p95_seconds": p95,
+                }
+                for (gpu, batch, fidelity), (latency, p95) in self._timings.items()
+            },
+        }
 
 
 @dataclass(frozen=True)
@@ -497,9 +564,7 @@ class SessionSchedulingState:
         if self.playback_active and not self.departed:
             self.slack_seconds -= elapsed
             if self.idle_video_remaining_seconds > EPSILON and not self.idle_video_held:
-                self.idle_video_remaining_seconds = max(
-                    0.0, self.idle_video_remaining_seconds - elapsed
-                )
+                self.idle_video_remaining_seconds = max(0.0, self.idle_video_remaining_seconds - elapsed)
         self.last_updated_at = now
 
     def submit_action(
@@ -673,26 +738,35 @@ class SessionSchedulingState:
 
     def complete_job(self, *, completed_at: float, output_seconds: float, quality: float) -> ActionJob:
         """Complete the current job and update quality/idle consumption state."""
-        self.advance_to(completed_at)
         job = self.in_flight
         if job is None:
             raise RuntimeError(f"session {self.session_id} has no in-flight job")
+        self.record_generated_output(job, completed_at=completed_at, output_seconds=output_seconds, quality=quality)
+        self.in_flight = None
+        return job
+
+    def record_generated_output(
+        self, job: ActionJob, *, completed_at: float, output_seconds: float, quality: float
+    ) -> None:
+        """Credit actual generated video independently of clean-state readiness.
+
+        An asynchronous decoder may finish an earlier Job after its successor
+        starts on committed KV. Crediting video must not clear that successor's
+        in-flight slot or count enqueue as playable output.
+        """
+        self.advance_to(completed_at)
         if output_seconds <= 0 or not math.isfinite(output_seconds):
             raise ValueError("output_seconds must be positive and finite")
         if quality <= 0 or not math.isfinite(quality):
             raise ValueError("quality must be positive and finite")
         self.slack_seconds += output_seconds
-        self.quality_ema = (1.0 - self.quality_update_rate) * self.quality_ema + (
-            self.quality_update_rate * quality
-        )
+        self.quality_ema = (1.0 - self.quality_update_rate) * self.quality_ema + (self.quality_update_rate * quality)
         self.quality_weight_seconds += output_seconds
         if job.kind == "idle":
             # The next idle sentinel is gated by actual playback consumption.
             self.idle_video_remaining_seconds = output_seconds
             self.idle_video_held = not self.idle_video_release_requested
             self.idle_video_release_requested = False
-        self.in_flight = None
-        return job
 
     def mark_departed(self, *, now: float) -> None:
         """Drop future work while allowing a reserved invocation to drain.
@@ -740,9 +814,7 @@ class GpuSchedulingState:
             raise ValueError("endpoint_port must be in [1, 65535]")
         if not math.isfinite(self.free_at) or self.free_at < 0:
             raise ValueError("free_at must be finite and non-negative")
-        if self.memory_free_gb != math.inf and (
-            not math.isfinite(self.memory_free_gb) or self.memory_free_gb < 0
-        ):
+        if self.memory_free_gb != math.inf and (not math.isfinite(self.memory_free_gb) or self.memory_free_gb < 0):
             raise ValueError("memory_free_gb must be non-negative and finite")
         if not math.isfinite(self.reserved_memory_gb) or self.reserved_memory_gb < 0:
             raise ValueError("reserved_memory_gb must be non-negative and finite")
@@ -825,9 +897,7 @@ class LocalMigrationEstimator:
                 raise ValueError(f"{name} must be non-negative and finite")
         self.migration_cost_seconds = float(migration_cost_seconds)
         self.first_layer_ready_seconds = (
-            self.migration_cost_seconds
-            if first_layer_ready_seconds is None
-            else float(first_layer_ready_seconds)
+            self.migration_cost_seconds if first_layer_ready_seconds is None else float(first_layer_ready_seconds)
         )
         self.transfer_seconds = float(transfer_seconds)
         self.drain_seconds = float(drain_seconds)
@@ -939,6 +1009,10 @@ class MotivationSchedulerConfig:
     # contract; another backend can provide its own values without changing
     # the scheduler implementation.
     model_capabilities: ModelServingCapabilities = ABOT_WORLD_CAPABILITIES
+    # Latency adaptation is independent from the session-quality EMA.  Keep
+    # it as a separate control so online timing can be tuned without changing
+    # quality smoothing semantics.
+    profile_timing_ema: float = 0.2
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_capabilities, ModelServingCapabilities):
@@ -972,9 +1046,9 @@ class MotivationSchedulerConfig:
             raise ValueError("load_balance_capacity_per_worker must be a positive integer")
         if not 0 < self.quality_ema <= 1:
             raise ValueError("quality_ema must be in (0, 1]")
-        if self.initial_quality is not None and (
-            not math.isfinite(self.initial_quality) or self.initial_quality <= 0
-        ):
+        if not 0 < self.profile_timing_ema <= 1 or not math.isfinite(self.profile_timing_ema):
+            raise ValueError("profile_timing_ema must be finite and in (0, 1]")
+        if self.initial_quality is not None and (not math.isfinite(self.initial_quality) or self.initial_quality <= 0):
             raise ValueError("initial_quality must be positive and finite")
         if not isinstance(self.policy_name, str) or not self.policy_name.strip():
             raise ValueError("policy_name must be a non-empty string")
@@ -1006,8 +1080,7 @@ class MotivationSchedulerConfig:
         if not isinstance(self.turboserve_fidelity_family, str) or not self.turboserve_fidelity_family.strip():
             raise ValueError("turboserve_fidelity_family must be a non-empty string")
         if self.slackserve_quality_floor is not None and (
-            not math.isfinite(float(self.slackserve_quality_floor))
-            or float(self.slackserve_quality_floor) <= 0
+            not math.isfinite(float(self.slackserve_quality_floor)) or float(self.slackserve_quality_floor) <= 0
         ):
             raise ValueError("slackserve_quality_floor must be positive and finite")
         for name in (
@@ -1021,9 +1094,7 @@ class MotivationSchedulerConfig:
         if self.slackserve_initial_slack_multiplier <= 0:
             raise ValueError("slackserve_initial_slack_multiplier must be positive")
         if self.slackserve_relaxed_multiplier <= self.slackserve_urgent_multiplier:
-            raise ValueError(
-                "slackserve_relaxed_multiplier must exceed slackserve_urgent_multiplier"
-            )
+            raise ValueError("slackserve_relaxed_multiplier must exceed slackserve_urgent_multiplier")
         if not isinstance(self.slackserve_rehoming_enabled, bool):
             raise ValueError("slackserve_rehoming_enabled must be a bool")
         if not isinstance(self.slackserve_include_idle_jobs, bool):
@@ -1137,13 +1208,17 @@ class MotivationScheduler:
         policy: SchedulingPolicy | None = None,
         batch_compatibility_provider: BatchCompatibilityProvider | None = None,
     ) -> None:
-        self.profile_provider = profile_provider
+        requested_config = config or MotivationSchedulerConfig()
+        self.profile_provider = (
+            profile_provider
+            if isinstance(profile_provider, OnlineMotivationProfileProvider)
+            else OnlineMotivationProfileProvider(profile_provider, ema=requested_config.profile_timing_ema)
+        )
         if batch_compatibility_provider is not None and not isinstance(
             batch_compatibility_provider, BatchCompatibilityProvider
         ):
             raise TypeError("batch_compatibility_provider must implement BatchCompatibilityProvider")
         self.batch_compatibility_provider = batch_compatibility_provider
-        requested_config = config or MotivationSchedulerConfig()
         self._policy = policy or create_scheduling_policy(requested_config.policy_name)
         # FIFO is a policy-level baseline, not Motivation with a one-session
         # candidate filter.  Normalize the coordinator knobs as a defensive
@@ -1245,6 +1320,39 @@ class MotivationScheduler:
         with self._lock:
             self._profile_frontier_cache.clear()
 
+    def record_profile_timing(
+        self,
+        *,
+        batch_size: int,
+        fidelity: str,
+        gpu_id: str,
+        latency_seconds: float,
+        p95_seconds: float | None = None,
+    ) -> bool:
+        """Feed a completed physical batch back into the online profile model."""
+        provider = self.profile_provider
+        record = getattr(provider, "record_timing", None)
+        if not callable(record):
+            return False
+        with self._lock:
+            matched = bool(
+                record(
+                    batch_size=batch_size,
+                    fidelity=fidelity,
+                    gpu_id=gpu_id,
+                    latency_seconds=latency_seconds,
+                    p95_seconds=p95_seconds,
+                )
+            )
+            if matched:
+                self._profile_frontier_cache.clear()
+            return matched
+
+    def profile_timing_snapshot(self) -> dict[str, object]:
+        """Return online profile timings for diagnostics and experiment traces."""
+        snapshot = getattr(self.profile_provider, "timing_snapshot", None)
+        return dict(snapshot()) if callable(snapshot) else {}
+
     def _estimate_migration(
         self,
         session: SessionSchedulingState,
@@ -1260,11 +1368,7 @@ class MotivationScheduler:
         through the node-agent process-NCCL data plane.
         """
         owner = self._gpus.get(session.owner_gpu)
-        if (
-            not self.config.allow_cross_node_migration
-            and owner is not None
-            and owner.node_id != target_gpu.node_id
-        ):
+        if not self.config.allow_cross_node_migration and owner is not None and owner.node_id != target_gpu.node_id:
             return MigrationEstimate(ready_at=now, required=False)
         estimate = self.migration_estimator.estimate(session, target_gpu=target_gpu.gpu_id, now=now)
         if owner is None or owner.node_id == target_gpu.node_id or not estimate.required:
@@ -1400,9 +1504,7 @@ class MotivationScheduler:
                 # SlackServe gives the first chunk a TTFC budget of four times
                 # its profiled high-quality chunk duration.  Use the measured
                 # B1 point rather than a model-independent constant.
-                first_chunk_profiles = tuple(
-                    self.profile_provider.profiles_for(batch_size=1, gpu_id=owner_gpu)
-                )
+                first_chunk_profiles = tuple(self.profile_provider.profiles_for(batch_size=1, gpu_id=owner_gpu))
                 if first_chunk_profiles:
                     highest_quality = max(
                         first_chunk_profiles,
@@ -1412,10 +1514,7 @@ class MotivationScheduler:
                             profile.fidelity,
                         ),
                     )
-                    initial_slack = (
-                        self.config.slackserve_initial_slack_multiplier
-                        * highest_quality.latency_seconds
-                    )
+                    initial_slack = self.config.slackserve_initial_slack_multiplier * highest_quality.latency_seconds
             normalized_compatibility_key = tuple(compatibility_key)
             if not normalized_compatibility_key and self.batch_compatibility_provider is not None:
                 try:
@@ -1431,9 +1530,7 @@ class MotivationScheduler:
                 session_id=session_id,
                 owner_gpu=owner_gpu,
                 quality_update_rate=self.config.quality_ema,
-                slack_seconds=(
-                    initial_slack if slack_seconds is None else slack_seconds
-                ),
+                slack_seconds=(initial_slack if slack_seconds is None else slack_seconds),
                 quality_ema=initial_quality,
                 compatibility_key=normalized_compatibility_key,
                 pending_action_slots=self.config.pending_action_slots,
@@ -1595,20 +1692,11 @@ class MotivationScheduler:
             observed_at = self._advance_to(observed_at)
             state = self._sessions[session_id]
             if self.policy_name == "slackserve" and state.owner_gpu != target_gpu:
-                bucket = int(
-                    math.floor(
-                        observed_at
-                        / self.config.slackserve_rehoming_control_interval_seconds
-                    )
-                )
+                bucket = int(math.floor(observed_at / self.config.slackserve_rehoming_control_interval_seconds))
                 source_key = (bucket, state.owner_gpu)
                 target_key = (bucket, target_gpu)
-                self._slackserve_rehome_sends[source_key] = (
-                    self._slackserve_rehome_sends.get(source_key, 0) + 1
-                )
-                self._slackserve_rehome_receives[target_key] = (
-                    self._slackserve_rehome_receives.get(target_key, 0) + 1
-                )
+                self._slackserve_rehome_sends[source_key] = self._slackserve_rehome_sends.get(source_key, 0) + 1
+                self._slackserve_rehome_receives[target_key] = self._slackserve_rehome_receives.get(target_key, 0) + 1
             state.migration_target_gpu = target_gpu
             state.migration_ready_at = ready_at
             self._epoch += 1
@@ -1711,13 +1799,8 @@ class MotivationScheduler:
                 for state in self._sessions.values()
             )
             snapshot_by_id = {state.session_id: state for state in snapshot_states}
-            all_ready = tuple(
-                (snapshot_by_id[state.session_id], job)
-                for state, job in self._ready_jobs()
-            )
-            ready = tuple(
-                item for item in all_ready if item[0].session_id not in excluded
-            )
+            all_ready = tuple((snapshot_by_id[state.session_id], job) for state, job in self._ready_jobs())
+            ready = tuple(item for item in all_ready if item[0].session_id not in excluded)
             gpus = tuple(gpu_states) if gpu_states is not None else tuple(self._gpus.values())
             rehome_sends = dict(self._slackserve_rehome_sends)
             rehome_receives = dict(self._slackserve_rehome_receives)
@@ -1753,9 +1836,7 @@ class MotivationScheduler:
                 ready_count=len(ready),
                 ready_action_count=sum(1 for _, job in ready if job.kind == "action"),
                 ready_idle_count=sum(1 for _, job in ready if job.kind == "idle"),
-                pending_action_count=sum(
-                    state.pending_action_count for state in snapshot_states if not state.departed
-                ),
+                pending_action_count=sum(state.pending_action_count for state in snapshot_states if not state.departed),
                 excluded_ready_count=len(all_ready) - len(ready),
                 gpu_count=len(gpus),
                 include_wait=include_wait,
@@ -1792,26 +1873,18 @@ class MotivationScheduler:
         profile_rows: dict[str, tuple[MotivationProfile, ...]] = {}
         unique_rows: dict[tuple[str, float, float], MotivationProfile] = {}
         for gpu in available_gpus:
-            rows = tuple(
-                self.profile_provider.profiles_for(batch_size=1, gpu_id=gpu.gpu_id)
-            )
+            rows = tuple(self.profile_provider.profiles_for(batch_size=1, gpu_id=gpu.gpu_id))
             profile_rows[gpu.gpu_id] = rows
             profiles_evaluated[1] += len(rows)
             for row in rows:
-                unique_rows.setdefault(
-                    (row.fidelity, row.latency_seconds, row.quality), row
-                )
+                unique_rows.setdefault((row.fidelity, row.latency_seconds, row.quality), row)
         if not unique_rows:
             reject("no_profile", len(ready))
             return record(None)
         quality_floor = self.config.slackserve_quality_floor
         if quality_floor is None:
             quality_floor = median_quality_floor(tuple(unique_rows.values()))
-        rehome_bucket = int(
-            math.floor(
-                observed_at / self.config.slackserve_rehoming_control_interval_seconds
-            )
-        )
+        rehome_bucket = int(math.floor(observed_at / self.config.slackserve_rehoming_control_interval_seconds))
 
         def assess(
             state: SessionSchedulingState,
@@ -1889,22 +1962,16 @@ class MotivationScheduler:
                         + assessment.profile.output_seconds
                     )
                 },
-                projected_quality={
-                    assessment.state.session_id: assessment.profile.quality
-                },
+                projected_quality={assessment.state.session_id: assessment.profile.quality},
                 snapshot_epoch=snapshot_epoch,
-                session_versions={
-                    assessment.state.session_id: assessment.state.state_version
-                },
+                session_versions={assessment.state.session_id: assessment.state.state_version},
                 gpu_version=assessment.gpu.version,
                 policy_name=policy_name,
             )
 
         # Build each worker's credit-ordered stream-head queue.  A session has
         # at most one ready head in the common coordinator.
-        local_queues: dict[str, list[_SlackServeAssessment]] = {
-            gpu.gpu_id: [] for gpu in available_gpus
-        }
+        local_queues: dict[str, list[_SlackServeAssessment]] = {gpu.gpu_id: [] for gpu in available_gpus}
         for state, job in ready:
             owner = gpu_by_id.get(state.owner_gpu)
             if owner is None:
@@ -1922,14 +1989,8 @@ class MotivationScheduler:
         # normal resident stream.  The finish-time check includes the actual
         # route-ready estimate, so a migration is never selected merely to
         # balance counts.
-        migration_options: list[
-            tuple[tuple[float, float, int, str, str], DispatchCandidate]
-        ] = []
-        if (
-            self.config.migration_enabled
-            and self.config.slackserve_rehoming_enabled
-            and allow_migrations
-        ):
+        migration_options: list[tuple[tuple[float, float, int, str, str], DispatchCandidate]] = []
+        if self.config.migration_enabled and self.config.slackserve_rehoming_enabled and allow_migrations:
             receiver_relaxed: dict[str, bool] = {}
             for receiver in available_gpus:
                 relaxed_only = True
@@ -1956,10 +2017,7 @@ class MotivationScheduler:
                 queue = local_queues[source.gpu_id]
                 if not queue:
                     continue
-                if (
-                    rehome_sends.get((rehome_bucket, source.gpu_id), 0)
-                    >= self.config.slackserve_max_rehomes_per_sender
-                ):
+                if rehome_sends.get((rehome_bucket, source.gpu_id), 0) >= self.config.slackserve_max_rehomes_per_sender:
                     reject("rehoming_sender_tick_limit")
                     continue
                 # If the worker can immediately run its sole head, migration
@@ -1978,23 +2036,17 @@ class MotivationScheduler:
                         if (
                             receiver.gpu_id == source.gpu_id
                             or not receiver_relaxed.get(receiver.gpu_id, False)
-                            or rehome_receives.get(
-                                (rehome_bucket, receiver.gpu_id), 0
-                            )
+                            or rehome_receives.get((rehome_bucket, receiver.gpu_id), 0)
                             >= self.config.slackserve_max_rehomes_per_receiver
                         ):
                             continue
                         target_item = assess(item.state, receiver, item.job)
                         if target_item is None:
                             continue
-                        estimate = self._estimate_migration(
-                            item.state, target_gpu=receiver, now=observed_at
-                        )
+                        estimate = self._estimate_migration(item.state, target_gpu=receiver, now=observed_at)
                         if not estimate.required:
                             continue
-                        target_start = max(
-                            observed_at, receiver.free_at, estimate.ready_at
-                        )
+                        target_start = max(observed_at, receiver.free_at, estimate.ready_at)
                         target_finish = target_start + target_item.profile.latency_seconds
                         if target_finish >= source_finish - EPSILON:
                             reject("rehoming_no_gain")
@@ -2022,9 +2074,7 @@ class MotivationScheduler:
         # worker that is physically available first.  This mirrors independent
         # per-worker queues while still using the common global drain loop to
         # fill several idle GPUs in one scheduling turn.
-        local_options: list[
-            tuple[tuple[float, int, float, int, str], DispatchCandidate]
-        ] = []
+        local_options: list[tuple[tuple[float, int, float, int, str], DispatchCandidate]] = []
         for gpu in available_gpus:
             queue = local_queues[gpu.gpu_id]
             if not queue:
@@ -2080,14 +2130,11 @@ class MotivationScheduler:
             observed_at = self._advance_to(observed_at)
             live_states = tuple(self._sessions.values())
             snapshot_states = tuple(
-                replace(state, pending_action_queue=deque(state.pending_action_queue))
-                for state in live_states
+                replace(state, pending_action_queue=deque(state.pending_action_queue)) for state in live_states
             )
             snapshot_by_id = {state.session_id: state for state in snapshot_states}
             all_ready = tuple(
-                (snapshot_by_id[state.session_id], job)
-                for state, job in self._ready_jobs()
-                if job.kind == "action"
+                (snapshot_by_id[state.session_id], job) for state, job in self._ready_jobs() if job.kind == "action"
             )
             ready = tuple(item for item in all_ready if item[0].session_id not in excluded)
             gpus = tuple(gpu_states) if gpu_states is not None else tuple(self._gpus.values())
@@ -2122,9 +2169,7 @@ class MotivationScheduler:
                 ready_count=len(ready),
                 ready_action_count=sum(1 for _, job in ready if job.kind == "action"),
                 ready_idle_count=sum(1 for _, job in ready if job.kind == "idle"),
-                pending_action_count=sum(
-                    state.pending_action_count for state in snapshot_states if not state.departed
-                ),
+                pending_action_count=sum(state.pending_action_count for state in snapshot_states if not state.departed),
                 excluded_ready_count=len(all_ready) - len(ready),
                 gpu_count=len(gpus),
                 include_wait=include_wait,
@@ -2194,11 +2239,7 @@ class MotivationScheduler:
             for gpu in available_gpus
             if (profile := fixed_profile(gpu.gpu_id, 1)) is not None
         )
-        base_chunk_latency_ms = (
-            sum(b1_latencies_ms) / len(b1_latencies_ms)
-            if b1_latencies_ms
-            else 0.0
-        )
+        base_chunk_latency_ms = sum(b1_latencies_ms) / len(b1_latencies_ms) if b1_latencies_ms else 0.0
         worker_order = tuple(gpu.gpu_id for gpu in available_gpus)
         active = {
             state.session_id: TurboServeSessionView(
@@ -2213,11 +2254,7 @@ class MotivationScheduler:
             )
             for state in snapshot_states
         }
-        placement = {
-            state.session_id: state.owner_gpu
-            for state in snapshot_states
-            if not state.departed
-        }
+        placement = {state.session_id: state.owner_gpu for state in snapshot_states if not state.departed}
         route_ready_ms = max(
             0.0,
             float(getattr(self.migration_estimator, "first_layer_ready_seconds", 0.0)) * 1000.0,
@@ -2338,9 +2375,7 @@ class MotivationScheduler:
                     or session_id in blocked
                 ):
                     continue
-                estimate = self._estimate_migration(
-                    state, target_gpu=gpu_by_id[target_id], now=observed_at
-                )
+                estimate = self._estimate_migration(state, target_gpu=gpu_by_id[target_id], now=observed_at)
                 if not estimate.required:
                     continue
                 move_options.append((job.sequence, state, job, target_id, estimate))
@@ -2363,11 +2398,7 @@ class MotivationScheduler:
         # There is intentionally no cross-session compatibility group.
         local_options: list[tuple[tuple[float, int, int, str], DispatchCandidate]] = []
         for gpu in available_gpus:
-            local = [
-                (state, job)
-                for state, job in ready
-                if state.owner_gpu == gpu.gpu_id
-            ]
+            local = [(state, job) for state, job in ready if state.owner_gpu == gpu.gpu_id]
             # A worker may have no local ready job while another worker does
             # (especially during session close or an in-flight migration).
             # TurboServe is a singleton placement policy; an empty local set
@@ -2422,18 +2453,13 @@ class MotivationScheduler:
             observed_at = self._advance_to(observed_at)
             live_states = tuple(self._sessions.values())
             snapshot_states = tuple(
-                replace(state, pending_action_queue=deque(state.pending_action_queue))
-                for state in live_states
+                replace(state, pending_action_queue=deque(state.pending_action_queue)) for state in live_states
             )
             snapshot_by_id = {state.session_id: state for state in snapshot_states}
             all_ready = tuple(
-                (snapshot_by_id[state.session_id], job)
-                for state, job in self._ready_jobs()
-                if job.kind == "action"
+                (snapshot_by_id[state.session_id], job) for state, job in self._ready_jobs() if job.kind == "action"
             )
-            ready = tuple(
-                item for item in all_ready if item[0].session_id not in excluded
-            )
+            ready = tuple(item for item in all_ready if item[0].session_id not in excluded)
             gpus = tuple(gpu_states) if gpu_states is not None else tuple(self._gpus.values())
             snapshot_epoch = self._epoch
 
@@ -2457,17 +2483,19 @@ class MotivationScheduler:
         def fixed_profile(gpu: GpuSchedulingState) -> MotivationProfile | None:
             if gpu.gpu_id in profile_cache:
                 return profile_cache[gpu.gpu_id]
-            profiles = tuple(
-                self.profile_provider.profiles_for(batch_size=1, gpu_id=gpu.gpu_id)
-            )
+            profiles = tuple(self.profile_provider.profiles_for(batch_size=1, gpu_id=gpu.gpu_id))
             if not profiles:
                 profile_cache[gpu.gpu_id] = None
                 return None
             requested = self.config.fifo_fidelity
-            profile = next(
-                (row for row in profiles if row.fidelity == requested),
-                None,
-            ) if requested is not None else None
+            profile = (
+                next(
+                    (row for row in profiles if row.fidelity == requested),
+                    None,
+                )
+                if requested is not None
+                else None
+            )
             if profile is None and len(profiles) == 1:
                 # A reduced test/profile table may contain only one B1 row.
                 # Accept that sole row, but never silently choose among
@@ -2487,15 +2515,18 @@ class MotivationScheduler:
         def reject(reason: str, count: int = 1) -> None:
             rejected[reason] = rejected.get(reason, 0) + count
 
-        best: tuple[
-            tuple[float, int, str],
-            SessionSchedulingState,
-            ActionJob,
-            GpuSchedulingState,
-            MotivationProfile,
-            float,
-            float,
-        ] | None = None
+        best: (
+            tuple[
+                tuple[float, int, str],
+                SessionSchedulingState,
+                ActionJob,
+                GpuSchedulingState,
+                MotivationProfile,
+                float,
+                float,
+            ]
+            | None
+        ) = None
 
         # FIFO order is global over currently runnable actions.  A session is
         # permanently tied to its admitted owner GPU; if that owner is busy,
@@ -2519,10 +2550,7 @@ class MotivationScheduler:
                 reject("fifo_fidelity_missing")
                 continue
             effective_memory_free_gb = gpu.memory_free_gb
-            if (
-                gpu.free_at > observed_at + EPSILON
-                and gpu.memory_free_gb != math.inf
-            ):
+            if gpu.free_at > observed_at + EPSILON and gpu.memory_free_gb != math.inf:
                 effective_memory_free_gb += gpu.reserved_memory_gb
             if profile.memory_gb > effective_memory_free_gb + EPSILON:
                 reject("memory")
@@ -2589,9 +2617,7 @@ class MotivationScheduler:
             ready_count=len(ready),
             ready_action_count=len(ready),
             ready_idle_count=0,
-            pending_action_count=sum(
-                state.pending_action_count for state in snapshot_states if not state.departed
-            ),
+            pending_action_count=sum(state.pending_action_count for state in snapshot_states if not state.departed),
             excluded_ready_count=len(all_ready) - len(ready),
             gpu_count=len(gpus),
             include_wait=False,
@@ -2639,8 +2665,7 @@ class MotivationScheduler:
         active_states = tuple(state for state in source if not state.departed)
         wait = max(0.0, wait_seconds)
         projected_slack = {
-            state.session_id: state.slack_seconds - (wait if state.playback_active else 0.0)
-            for state in active_states
+            state.session_id: state.slack_seconds - (wait if state.playback_active else 0.0) for state in active_states
         }
         score = sum(self._utility(value, self.config.utility_cap_seconds) for value in projected_slack.values())
         return DispatchCandidate(
@@ -2682,9 +2707,7 @@ class MotivationScheduler:
             include_wait=bool(include_wait),
             allow_migrations=bool(allow_migrations),
             exclude_session_ids=tuple(str(value) for value in exclude_session_ids),
-            blocked_migration_session_ids=tuple(
-                str(value) for value in blocked_migration_session_ids
-            ),
+            blocked_migration_session_ids=tuple(str(value) for value in blocked_migration_session_ids),
         )
         return self._policy.select(self, request)
 
@@ -2722,9 +2745,7 @@ class MotivationScheduler:
                 gpu.gpu_id: sum(
                     1
                     for state in self._sessions.values()
-                    if not state.departed
-                    and state.migration_target_gpu is None
-                    and state.owner_gpu == gpu.gpu_id
+                    if not state.departed and state.migration_target_gpu is None and state.owner_gpu == gpu.gpu_id
                 )
                 for gpu in gpus
             }
@@ -2737,8 +2758,7 @@ class MotivationScheduler:
                 gpu.gpu_id: sum(
                     1
                     for state in self._sessions.values()
-                    if not state.departed
-                    and state.migration_target_gpu == gpu.gpu_id
+                    if not state.departed and state.migration_target_gpu == gpu.gpu_id
                 )
                 for gpu in gpus
             }
@@ -2750,13 +2770,9 @@ class MotivationScheduler:
 
             def placement_profile(gpu_id: str) -> MotivationProfile | None:
                 if gpu_id not in profile_cache:
-                    rows = tuple(
-                        self.profile_provider.profiles_for(batch_size=1, gpu_id=gpu_id)
-                    )
+                    rows = tuple(self.profile_provider.profiles_for(batch_size=1, gpu_id=gpu_id))
                     profile_cache[gpu_id] = (
-                        min(rows, key=lambda row: (row.latency_seconds, row.fidelity))
-                        if rows
-                        else None
+                        min(rows, key=lambda row: (row.latency_seconds, row.fidelity)) if rows else None
                     )
                 return profile_cache[gpu_id]
 
@@ -2798,24 +2814,15 @@ class MotivationScheduler:
                 for target in gpus:
                     if target.gpu_id == source.gpu_id:
                         continue
-                    if (
-                        resident_counts[target.gpu_id]
-                        + pending_target_counts[target.gpu_id]
-                        >= capacity
-                    ):
+                    if resident_counts[target.gpu_id] + pending_target_counts[target.gpu_id] >= capacity:
                         continue
                     target_profile = placement_profile(target.gpu_id)
                     if target_profile is None:
                         continue
-                    estimate = self._estimate_migration(
-                        state, target_gpu=target, now=observed_at
-                    )
+                    estimate = self._estimate_migration(state, target_gpu=target, now=observed_at)
                     if not estimate.required:
                         continue
-                    target_finish = (
-                        max(observed_at, target.free_at, estimate.ready_at)
-                        + target_profile.latency_seconds
-                    )
+                    target_finish = max(observed_at, target.free_at, estimate.ready_at) + target_profile.latency_seconds
                     # This is the only rehoming gain test: moving must make
                     # this session's next job finish strictly earlier.  A
                     # lower aggregate GPU load by itself is not sufficient.
@@ -2888,9 +2895,7 @@ class MotivationScheduler:
             eligible = {
                 state.session_id
                 for state in self._sessions.values()
-                if not state.departed
-                and state.owner_gpu == gpu_id
-                and state.migration_target_gpu is None
+                if not state.departed and state.owner_gpu == gpu_id and state.migration_target_gpu is None
             }
         eligible.difference_update(str(value) for value in exclude_session_ids)
         if not eligible:
@@ -2939,19 +2944,14 @@ class MotivationScheduler:
             observed_at = self._advance_to(observed_at)
             live_states = tuple(self._sessions.values())
             snapshot_states = tuple(
-                replace(state, pending_action_queue=deque(state.pending_action_queue))
-                for state in live_states
+                replace(state, pending_action_queue=deque(state.pending_action_queue)) for state in live_states
             )
             snapshot_by_id = {state.session_id: state for state in snapshot_states}
-            all_ready = tuple(
-                (snapshot_by_id[state.session_id], job)
-                for state, job in self._ready_jobs()
-            )
+            all_ready = tuple((snapshot_by_id[state.session_id], job) for state, job in self._ready_jobs())
             ready = tuple(
                 item
                 for item in all_ready
-                if item[0].session_id not in excluded
-                and (eligible is None or item[0].session_id in eligible)
+                if item[0].session_id not in excluded and (eligible is None or item[0].session_id in eligible)
             )
             gpus = tuple(gpu_states) if gpu_states is not None else tuple(self._gpus.values())
             snapshot_epoch = self._epoch
@@ -2964,19 +2964,11 @@ class MotivationScheduler:
         # capacity so the two scheduler-visible signals have comparable scale.
         occupancy_capacity = max(1, self.config.load_balance_capacity_per_worker)
         resident_counts = {
-            gpu.gpu_id: sum(
-                1 for state in active_states if state.owner_gpu == gpu.gpu_id
-            )
-            for gpu in available_gpus
+            gpu.gpu_id: sum(1 for state in active_states if state.owner_gpu == gpu.gpu_id) for gpu in available_gpus
         }
-        timeline_loads = {
-            gpu.gpu_id: max(0.0, gpu.free_at - observed_at)
-            for gpu in available_gpus
-        }
+        timeline_loads = {gpu.gpu_id: max(0.0, gpu.free_at - observed_at) for gpu in available_gpus}
         base_loads = {
-            gpu_id: timeline_loads[gpu_id]
-            + resident_counts[gpu_id] / occupancy_capacity
-            for gpu_id in timeline_loads
+            gpu_id: timeline_loads[gpu_id] + resident_counts[gpu_id] / occupancy_capacity for gpu_id in timeline_loads
         }
         base_load_spread = _load_spread(base_loads)
         # Keep the hot loop on compact integer indexes.  Constructing state/job
@@ -3007,16 +2999,19 @@ class MotivationScheduler:
 
         # ``best_record`` is a lightweight descriptor.  Full candidate maps
         # are materialized once, after the exhaustive score search has ended.
-        best_record: tuple[
-            tuple[float, int, int, float, int],
-            tuple[int, ...],
-            str,
-            MotivationProfile,
-            float,
-            float,
-            int,
-            float,
-        ] | None = None
+        best_record: (
+            tuple[
+                tuple[float, int, int, float, int],
+                tuple[int, ...],
+                str,
+                MotivationProfile,
+                float,
+                float,
+                int,
+                float,
+            ]
+            | None
+        ) = None
         candidates_best_key: tuple[float, int, int, float, int] | None = None
         enumerated = empty_batch_counts()
         compatible = empty_batch_counts()
@@ -3039,9 +3034,7 @@ class MotivationScheduler:
                 with self._lock:
                     profiles = self._profile_frontier_cache.get(cache_key)
                 if profiles is None:
-                    raw_profiles = tuple(
-                        self.profile_provider.profiles_for(batch_size=size, gpu_id=gpu.gpu_id)
-                    )
+                    raw_profiles = tuple(self.profile_provider.profiles_for(batch_size=size, gpu_id=gpu.gpu_id))
                     profiles = _pareto_profile_frontier(raw_profiles)
                     with self._lock:
                         self._profile_frontier_cache[cache_key] = profiles
@@ -3052,22 +3045,14 @@ class MotivationScheduler:
         owner_b1_latency: dict[str, float | None] = {}
         batch_b1_latency: dict[tuple[str, str], float | None] = {}
 
-        def b1_latency_for_profile(
-            gpu: GpuSchedulingState, profile: MotivationProfile
-        ) -> float | None:
+        def b1_latency_for_profile(gpu: GpuSchedulingState, profile: MotivationProfile) -> float | None:
             """Return the measured B1 latency in the profile's family."""
             _, family = profile_batch_family(profile.fidelity)
             cache_key = (gpu.gpu_id, family)
             if cache_key not in batch_b1_latency:
                 rows = profiles_for(gpu, 1)
-                matching = tuple(
-                    row
-                    for row in rows
-                    if profile_batch_family(row.fidelity)[1] == family
-                )
-                batch_b1_latency[cache_key] = min(
-                    (row.latency_seconds for row in matching), default=None
-                )
+                matching = tuple(row for row in rows if profile_batch_family(row.fidelity)[1] == family)
+                batch_b1_latency[cache_key] = min((row.latency_seconds for row in matching), default=None)
             return batch_b1_latency[cache_key]
 
         def owner_finish_at(state: SessionSchedulingState, ordinal: int = 1) -> float:
@@ -3085,9 +3070,7 @@ class MotivationScheduler:
                 return math.inf
             if state.owner_gpu not in owner_b1_latency:
                 rows = profiles_for(owner_gpu, 1)
-                owner_b1_latency[state.owner_gpu] = (
-                    min((row.latency_seconds for row in rows), default=None)
-                )
+                owner_b1_latency[state.owner_gpu] = min((row.latency_seconds for row in rows), default=None)
             latency = owner_b1_latency[state.owner_gpu]
             if latency is None:
                 return math.inf
@@ -3117,9 +3100,7 @@ class MotivationScheduler:
         # therefore obtains the separable per-worker objective used by the
         # second scheduling stage.
         objective_gpu_ids = {gpu.gpu_id for gpu in available_gpus}
-        objective_mask = tuple(
-            state.owner_gpu in objective_gpu_ids for state in active_states
-        )
+        objective_mask = tuple(state.owner_gpu in objective_gpu_ids for state in active_states)
         playback_slacks = sorted(
             slack
             for slack, playback, in_scope in zip(
@@ -3170,9 +3151,7 @@ class MotivationScheduler:
                 if source_gpu_id == target_gpu_id:
                     continue
                 if source_gpu_id in projected_counts:
-                    projected_counts[source_gpu_id] = max(
-                        0, projected_counts[source_gpu_id] - 1
-                    )
+                    projected_counts[source_gpu_id] = max(0, projected_counts[source_gpu_id] - 1)
                 if target_gpu_id in projected_counts:
                     projected_counts[target_gpu_id] += 1
             projected_timeline = dict(timeline_loads)
@@ -3181,8 +3160,7 @@ class MotivationScheduler:
                 max(0.0, finish_at - observed_at),
             )
             projected_loads = {
-                gpu_id: projected_timeline[gpu_id]
-                + projected_counts[gpu_id] / occupancy_capacity
+                gpu_id: projected_timeline[gpu_id] + projected_counts[gpu_id] / occupancy_capacity
                 for gpu_id in projected_timeline
             }
             return base_load_spread - _load_spread(projected_loads)
@@ -3205,8 +3183,7 @@ class MotivationScheduler:
             estimates = estimates_by_gpu.get(gpu.gpu_id)
             if estimates is None:
                 estimates = tuple(
-                    self._estimate_migration(state, target_gpu=gpu, now=observed_at)
-                    for state in ready_states
+                    self._estimate_migration(state, target_gpu=gpu, now=observed_at) for state in ready_states
                 )
                 estimates_by_gpu[gpu.gpu_id] = estimates
             return estimates
@@ -3239,15 +3216,10 @@ class MotivationScheduler:
                     # the reclaimed value for future slots instead of treating
                     # the previous batch's peak as a permanent allocation.
                     effective_memory_free_gb = gpu.memory_free_gb
-                    if (
-                        gpu.free_at > observed_at + EPSILON
-                        and gpu.memory_free_gb != math.inf
-                    ):
+                    if gpu.free_at > observed_at + EPSILON and gpu.memory_free_gb != math.inf:
                         effective_memory_free_gb += gpu.reserved_memory_gb
                     usable_profiles = tuple(
-                        profile
-                        for profile in profiles
-                        if profile.memory_gb <= effective_memory_free_gb + EPSILON
+                        profile for profile in profiles if profile.memory_gb <= effective_memory_free_gb + EPSILON
                     )
                     memory_rejected = len(profiles) - len(usable_profiles)
                     if memory_rejected:
@@ -3268,8 +3240,7 @@ class MotivationScheduler:
                             group_qualities = sorted(
                                 (
                                     ready_quality[index]
-                                    + ready_quality_rate[index]
-                                    * (profile.quality - ready_quality[index])
+                                    + ready_quality_rate[index] * (profile.quality - ready_quality[index])
                                     for index in group
                                 ),
                                 reverse=True,
@@ -3312,11 +3283,7 @@ class MotivationScheduler:
                         for profile, optimistic_bound in profile_bounds:
                             if size > 1:
                                 b1_latency = b1_latency_for_profile(gpu, profile)
-                                if (
-                                    b1_latency is None
-                                    or profile.latency_seconds
-                                    >= size * b1_latency - EPSILON
-                                ):
+                                if b1_latency is None or profile.latency_seconds >= size * b1_latency - EPSILON:
                                     reject("batch_no_gain")
                                     continue
                             # A profile-level optimistic bound avoids walking
@@ -3344,18 +3311,12 @@ class MotivationScheduler:
                             # on its owner with the fastest measured B1 point.
                             # This is a strict gain test, not a generic
                             # load-balancing trigger.
-                            remote_indexes = tuple(
-                                index
-                                for index in indexes
-                                if gpu_estimates[index].required
-                            )
+                            remote_indexes = tuple(index for index in indexes if gpu_estimates[index].required)
                             if remote_indexes:
                                 local_finishes: list[float] = []
                                 by_owner: dict[str, list[int]] = {}
                                 for index in remote_indexes:
-                                    by_owner.setdefault(
-                                        ready_states[index].owner_gpu, []
-                                    ).append(index)
+                                    by_owner.setdefault(ready_states[index].owner_gpu, []).append(index)
                                 for owner_indexes in by_owner.values():
                                     owner_indexes.sort(
                                         key=lambda index: (
@@ -3375,10 +3336,7 @@ class MotivationScheduler:
                                 # serialized local continuation.  Comparing
                                 # against only the first local B1 would reject
                                 # valid B2/B3 gains from one source GPU.
-                                if not any(
-                                    finish_at < local_finish - EPSILON
-                                    for local_finish in local_finishes
-                                ):
+                                if not any(finish_at < local_finish - EPSILON for local_finish in local_finishes):
                                     reject("migration_no_gain")
                                     continue
                             duration = finish_at - observed_at
@@ -3399,9 +3357,7 @@ class MotivationScheduler:
                                 selected_quality_sum += updated_quality
                                 quality_delta_sum += updated_quality - ready_quality[index]
                             system_quality = (
-                                (active_quality_sum + quality_delta_sum) / active_count
-                                if active_count
-                                else 0.0
+                                (active_quality_sum + quality_delta_sum) / active_count if active_count else 0.0
                             )
                             fairness_limit = system_quality - fairness_delta - EPSILON
                             if any(value < fairness_limit for value in selected_qualities):
@@ -3479,9 +3435,7 @@ class MotivationScheduler:
             for index in best_indexes:
                 session_id = ready_states[index].session_id
                 projected_slack[session_id] += best_profile.output_seconds
-            projected_quality = {
-                state.session_id: state.quality_ema for state in active_states
-            }
+            projected_quality = {state.session_id: state.quality_ema for state in active_states}
             for index in best_indexes:
                 state = ready_states[index]
                 projected_quality[state.session_id] = state.quality_ema + state.quality_update_rate * (
@@ -3502,8 +3456,7 @@ class MotivationScheduler:
                 projected_quality=projected_quality,
                 snapshot_epoch=snapshot_epoch,
                 session_versions={
-                    ready_states[index].session_id: ready_states[index].state_version
-                    for index in best_indexes
+                    ready_states[index].session_id: ready_states[index].state_version for index in best_indexes
                 },
                 gpu_version=next(
                     (gpu.version for gpu in gpus if gpu.gpu_id == best_gpu_id),
@@ -3538,9 +3491,7 @@ class MotivationScheduler:
             ready_count=len(ready),
             ready_action_count=sum(1 for _, job in ready if job.kind == "action"),
             ready_idle_count=sum(1 for _, job in ready if job.kind == "idle"),
-            pending_action_count=sum(
-                state.pending_action_count for state in snapshot_states if not state.departed
-            ),
+            pending_action_count=sum(state.pending_action_count for state in snapshot_states if not state.departed),
             excluded_ready_count=len(all_ready) - len(ready),
             gpu_count=len(gpus),
             include_wait=include_wait,
@@ -3584,10 +3535,9 @@ class MotivationScheduler:
         except Exception:
             snapshot = {}
         with self._lock:
+            snapshot["online_profile_timing"] = self.profile_timing_snapshot()
             effective = (
-                self._action_jobs_released
-                - self._action_jobs_superseded_pending
-                - self._action_jobs_dropped_capacity
+                self._action_jobs_released - self._action_jobs_superseded_pending - self._action_jobs_dropped_capacity
             )
             snapshot["action_lifecycle"] = {
                 "released": self._action_jobs_released,
@@ -3648,10 +3598,7 @@ class MotivationScheduler:
                         or expected_version is None
                         or state.state_version != expected_version
                         or state.owner_gpu == candidate.gpu_id
-                        or (
-                            state.migration_target_gpu is not None
-                            and state.migration_target_gpu != candidate.gpu_id
-                        )
+                        or (state.migration_target_gpu is not None and state.migration_target_gpu != candidate.gpu_id)
                     ):
                         return False
                 # A migration-only candidate does not own a compute lease.

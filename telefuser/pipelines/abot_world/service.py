@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import concurrent.futures
 import contextlib
 import gc
 import io
@@ -22,8 +23,14 @@ from typing import Any
 import torch
 from PIL import Image
 
+from telefuser.pipelines.abot_world.async_decode import _AsyncVAEDecodeQueue
+from telefuser.pipelines.abot_world.continuous import (
+    ABotWorldCompletedChunk,
+    ABotWorldDecodedBatch,
+)
 from telefuser.pipelines.abot_world.fidelity import ABotWorldFidelity
 from telefuser.pipelines.abot_world.interactive import (
+    ABotWorldGeneratedBatch,
     ABotWorldInteractivePipeline,
     ABotWorldInteractiveSession,
     ABotWorldSessionLifecycle,
@@ -160,6 +167,10 @@ class _ABotWorldLiveKitSession:
     deadline_batch_force_singleton: bool = False
     last_error: str | None = None
     migrating: bool = False
+    # Frame conversion can finish after the model boundary. Keep one ordered
+    # queue per session so a later batch may compute while an earlier batch is
+    # copied/converted, without changing playback order.
+    pending_async_outputs: deque["_AsyncChunkOutput"] = field(default_factory=deque)
 
 
 @dataclass(frozen=True)
@@ -184,6 +195,16 @@ class _PolicyBatch:
     # only when this queue entry reaches the single physical lane; otherwise
     # accepting the lease would overwrite the running job's metadata.
     activate_on_pop: tuple[bool, ...] = ()
+
+
+@dataclass(frozen=True)
+class _AsyncChunkOutput:
+    """One ordered frame-conversion result waiting for publication."""
+
+    future: concurrent.futures.Future[list[list[Image.Image]]]
+    batch_index: int
+    frame_count: int
+    payload: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -319,10 +340,18 @@ class ABotWorldLiveKitService:
         if not math.isfinite(normalized_batch_compute_safety_factor) or normalized_batch_compute_safety_factor < 1.0:
             raise ValueError("batch_compute_safety_factor must be a finite number greater than or equal to 1")
         self.pipeline = pipeline
-        self.model_capabilities = model_capabilities
-        self.default_fps = int(
-            model_capabilities.output_fps if default_fps is None else default_fps
+        # One conversion worker is enough to overlap host frame handling with
+        # the next DiT invocation. A two-item bound keeps decoded GPU tensors
+        # and pinned host buffers from growing without limit when transport is
+        # slower than generation.
+        self._postprocess_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="abot-frame-output",
         )
+        self._postprocess_slots = threading.BoundedSemaphore(2)
+        self._postprocess_stopping = False
+        self.model_capabilities = model_capabilities
+        self.default_fps = int(model_capabilities.output_fps if default_fps is None else default_fps)
         self.batch_compatibility_provider = batch_compatibility_provider or ABotWorldBatchCompatibilityProvider(self)
         self.default_session_config = dict(default_session_config or {})
         self.output_queue_size = int(output_queue_size)
@@ -340,6 +369,16 @@ class ABotWorldLiveKitService:
         self.close_timeout = float(close_timeout)
         self.max_batch_size = int(max_batch_size)
         self.batching_window_seconds = float(batching_window_ms) / 1000.0
+        # TAeW owns mutable temporal decoder state per session.  A single
+        # service-local worker serializes state updates but batches rows from
+        # independent sessions, allowing DiT and host conversion to proceed
+        # while decode is in flight.
+        taew_decode_stage = getattr(pipeline, "taew_decode_stage", None)
+        self._vae_decode_queue = (
+            _AsyncVAEDecodeQueue(taew_decode_stage, max_batch_size=self.max_batch_size)
+            if taew_decode_stage is not None
+            else None
+        )
         # Offline profiles seed B>1 estimates before the first coalesced
         # dispatch. Without this, the generic fallback assumes B2 is two B1
         # calls and can make a deadline-aware rendezvous unable to bootstrap.
@@ -414,6 +453,78 @@ class ABotWorldLiveKitService:
         self._ensure_scheduler_started()
         logger.info("ABotWorldLiveKitService TurboServe scheduler started")
 
+    def create_latent_step_runtime(
+        self,
+        *,
+        max_batch_size: int,
+        backend: str = "eager",
+        max_graphs: int = 4,
+        refresh_ranks: Sequence[int] = (),
+    ) -> Any:
+        """Create a latent-step driver wired to this service's async output path.
+
+        The driver still owns model sessions explicitly, while this service
+        supplies the same bounded batch postprocess executor used by the
+        normal scheduler.  A caller can pass each returned chunk to
+        :meth:`publish_latent_step_output` to preserve per-session ordering.
+        """
+        return self.pipeline.create_continuous_runtime(
+            max_batch_size=max_batch_size,
+            granularity="latent_step",
+            backend=backend,
+            max_graphs=max_graphs,
+            postprocess_submitter=self._submit_frame_postprocess,
+            decode_submitter=self._submit_vae_decode,
+            refresh_ranks=refresh_ranks,
+        )
+
+    def publish_latent_step_output(
+        self,
+        completed: ABotWorldCompletedChunk,
+        payload: dict[str, Any],
+    ) -> bool:
+        """Publish a latent-step result through the existing ordered queue.
+
+        Conversion is normally already submitted as one batched future by the
+        runtime.  The synchronous fallback is retained for callers that use a
+        runtime without a service postprocess submitter.
+        """
+        state = self._session(completed.session_id)
+        if state is None:
+            return False
+        if completed.decode_future is not None:
+            future = self._chain_decode_postprocess(state, completed.decode_future)
+            pending = _AsyncChunkOutput(
+                future=future,
+                batch_index=0,
+                frame_count=0,
+                payload=payload,
+            )
+            with state.lock:
+                state.pending_async_outputs.append(pending)
+            future.add_done_callback(lambda _future, target=state: self._drain_async_output(target))
+            return True
+        future = completed.postprocess_future
+        if future is None:
+            converter = getattr(self.pipeline, "tensor2video_batch", None)
+            frames = (
+                converter(completed.decoded)[0]
+                if callable(converter)
+                else self.pipeline.tensor2video(completed.decoded[0])
+            )
+            payload["frames"] = frames
+            return self._put_output(state, payload)
+        pending = _AsyncChunkOutput(
+            future=future,
+            batch_index=completed.postprocess_batch_index,
+            frame_count=completed.frames_per_session,
+            payload=payload,
+        )
+        with state.lock:
+            state.pending_async_outputs.append(pending)
+        future.add_done_callback(lambda _future, target=state: self._drain_async_output(target))
+        return True
+
     def stop(self, *, close_pipeline: bool = True) -> None:
         """Stop admission and release retained sessions.
 
@@ -439,8 +550,15 @@ class ABotWorldLiveKitService:
             scheduler.join(timeout=self.close_timeout)
         with self._sessions_lock:
             session_ids = list(self._sessions)
+        # Finish/cancel queued TAeW work before close_session clears the
+        # mutable decoder streams it references.
+        if self._vae_decode_queue is not None:
+            self._vae_decode_queue.close()
         for session_id in session_ids:
             self.close_session(session_id)
+        if not self._postprocess_stopping:
+            self._postprocess_stopping = True
+            self._postprocess_executor.shutdown(wait=True, cancel_futures=True)
         if close_pipeline:
             self.pipeline.close()
 
@@ -660,9 +778,7 @@ class ABotWorldLiveKitService:
                 raise ValueError(f"Unsupported ABot control message type: {message_type}")
             now = time.monotonic()
             motivation = chunk.get("motivation")
-            state.motivation_one_shot = (
-                isinstance(motivation, dict) and bool(motivation.get("one_shot"))
-            )
+            state.motivation_one_shot = isinstance(motivation, dict) and bool(motivation.get("one_shot"))
             motivation_kind = str(motivation.get("kind", "")) if isinstance(motivation, dict) else ""
             state.motivation_kind = motivation_kind if state.motivation_one_shot else None
             state.motivation_job_id = (
@@ -705,9 +821,7 @@ class ABotWorldLiveKitService:
         if not entries:
             raise ValueError("policy batch must contain at least one session")
         if len(entries) > self.max_batch_size:
-            raise RuntimeError(
-                f"policy batch size {len(entries)} exceeds service max_batch_size={self.max_batch_size}"
-            )
+            raise RuntimeError(f"policy batch size {len(entries)} exceeds service max_batch_size={self.max_batch_size}")
         with self._scheduler_condition:
             if self._scheduler_stopping:
                 raise RuntimeError("ABot scheduler is stopping")
@@ -732,8 +846,7 @@ class ABotWorldLiveKitService:
                     if backpressure_reason is not None:
                         self._policy_batch_backpressure_rejections += 1
                         raise RuntimeError(
-                            f"ABot policy session {session_id!r} is output-backpressured: "
-                            f"{backpressure_reason}"
+                            f"ABot policy session {session_id!r} is output-backpressured: {backpressure_reason}"
                         )
                     if str(chunk.get("type", "")) != "control_state":
                         raise ValueError("policy batches require control_state messages")
@@ -746,9 +859,7 @@ class ABotWorldLiveKitService:
                         raise ValueError("policy batches require a one_shot motivation marker")
                     declared_size = motivation.get("batch_size")
                     if declared_size is not None and int(declared_size) != len(entries):
-                        raise RuntimeError(
-                            f"policy batch declares batch_size={declared_size}, got {len(entries)}"
-                        )
+                        raise RuntimeError(f"policy batch declares batch_size={declared_size}, got {len(entries)}")
                     kind = str(motivation.get("kind", "action"))
                     if kind == "idle" and canonical:
                         raise ValueError("idle policy jobs must carry empty controls")
@@ -772,8 +883,7 @@ class ABotWorldLiveKitService:
                 raise RuntimeError(
                     "policy batch contains incompatible model sessions: "
                     + "; ".join(
-                        f"{state.session_id}={key!r}"
-                        for state, key in zip(states, prospective_keys, strict=True)
+                        f"{state.session_id}={key!r}" for state, key in zip(states, prospective_keys, strict=True)
                     )
                 )
             # The service scheduler is the single physical invocation lane. A
@@ -1049,8 +1159,7 @@ class ABotWorldLiveKitService:
                 preview = ", ".join(repr(path) for path in non_cuda_paths[:4])
                 suffix = "..." if len(non_cuda_paths) > 4 else ""
                 raise RuntimeError(
-                    "NCCL migration source tensors must reside on CUDA; "
-                    f"found CPU leaves at {preview}{suffix}"
+                    f"NCCL migration source tensors must reside on CUDA; found CPU leaves at {preview}{suffix}"
                 )
         return {
             "session_id": session_id,
@@ -1105,10 +1214,7 @@ class ABotWorldLiveKitService:
             # chunk boundary and marked the source session MIGRATING.  Clone
             # on the same CUDA stream before releasing that marker so the
             # source cannot mutate the base while the clone is being made.
-            base_leaves = {
-                path: tensor.detach().clone()
-                for path, tensor in leaves.items()
-            }
+            base_leaves = {path: tensor.detach().clone() for path, tensor in leaves.items()}
             device = getattr(self.pipeline, "device", None)
             if device is not None and torch.device(device).type == "cuda" and torch.cuda.is_available():
                 torch.cuda.synchronize(torch.device(device))
@@ -1607,17 +1713,18 @@ class ABotWorldLiveKitService:
         self,
         trace: dict[str, Any],
         state: _ABotWorldLiveKitSession,
-        frames: Sequence[Image.Image],
+        frames: Sequence[Image.Image] | int,
         *,
         compatibility_key: tuple[object, ...] | None = None,
     ) -> None:
         """Fill output facts after the corresponding session's chunk commits."""
         session = state.pipeline_session
+        frame_count = int(frames) if isinstance(frames, int) else len(frames)
         trace.update(
             {
                 "next_latent_frame_after": self._trace_number(getattr(session, "next_latent_frame", None)),
                 "emitted_frames_after": self._trace_number(getattr(session, "emitted_frames", None)),
-                "frames": int(len(frames)),
+                "frames": frame_count,
             }
         )
         # Publish the post-compute KV/layout contract with the same trace as
@@ -2171,7 +2278,9 @@ class ABotWorldLiveKitService:
         queued chunk makes it the only chunk ahead of the one being played.
         """
         with state.output_queue.mutex:
-            return sum(item.get("type") == "chunk" for item in state.output_queue.queue)
+            queued = sum(item.get("type") == "chunk" for item in state.output_queue.queue)
+        with state.lock:
+            return queued + len(state.pending_async_outputs)
 
     def _policy_batch_block_reason(
         self,
@@ -2197,9 +2306,7 @@ class ABotWorldLiveKitService:
 
         frame_credit_enabled = self._uses_publisher_frame_credit(state)
         buffered_video_payloads = 0 if frame_credit_enabled else self._queued_video_payloads(state)
-        pacing_ready_at = (
-            self._frame_credit_ready_at(state, now) if frame_credit_enabled else state.pacing_ready_at
-        )
+        pacing_ready_at = self._frame_credit_ready_at(state, now) if frame_credit_enabled else state.pacing_ready_at
         pacing_ready = now + self._pacing_coalescing_slack_seconds(state) >= pacing_ready_at
         if buffered_video_payloads:
             return "queued_video_payload"
@@ -2293,9 +2400,7 @@ class ABotWorldLiveKitService:
     def _batch_key(self, state: _ABotWorldLiveKitSession) -> tuple[object, ...]:
         return self._batch_key_for_fidelity(state, state.motivation_fidelity or "")
 
-    def _batch_key_for_fidelity(
-        self, state: _ABotWorldLiveKitSession, fidelity: str
-    ) -> tuple[object, ...]:
+    def _batch_key_for_fidelity(self, state: _ABotWorldLiveKitSession, fidelity: str) -> tuple[object, ...]:
         session = state.pipeline_session
         local_end = 0
         if session.self_cache:
@@ -2319,6 +2424,105 @@ class ABotWorldLiveKitService:
             fidelity,
         )
 
+    def _submit_vae_decode(
+        self,
+        latents: torch.Tensor,
+        session: ABotWorldInteractiveSession,
+    ) -> concurrent.futures.Future[ABotWorldDecodedBatch]:
+        """Queue one session row for the serialized, cross-session TAeW batch."""
+
+        state = session.taew_decode_state
+        if state is None:
+            future: concurrent.futures.Future[ABotWorldDecodedBatch] = concurrent.futures.Future()
+            future.set_exception(RuntimeError(f"ABot session {session.session_id} has no TAeW decode state"))
+            return future
+        if self._vae_decode_queue is None:
+            future: concurrent.futures.Future[ABotWorldDecodedBatch] = concurrent.futures.Future()
+            future.set_exception(RuntimeError("pipeline has no TAeW decode stage"))
+            return future
+        return self._vae_decode_queue.submit(latents, session.session_id, state)
+
+    def _chain_decode_postprocess(
+        self,
+        state: _ABotWorldLiveKitSession,
+        decode_future: concurrent.futures.Future[ABotWorldDecodedBatch],
+    ) -> concurrent.futures.Future[list[list[Image.Image]]]:
+        """Start CPU conversion only after an asynchronous TAeW batch row lands."""
+
+        chained: concurrent.futures.Future[list[list[Image.Image]]] = concurrent.futures.Future()
+
+        def on_decode(done: concurrent.futures.Future[ABotWorldDecodedBatch]) -> None:
+            try:
+                result = done.result()
+                # The model boundary returned before decode, so account for
+                # generated frames at the actual decoder completion boundary.
+                with state.lock:
+                    state.pipeline_session.emitted_frames += result.frames_per_session
+                postprocess = self._submit_frame_postprocess(result.decoded)
+            except BaseException as exc:
+                chained.set_exception(exc)
+                return
+
+            def on_postprocess(converted: concurrent.futures.Future[list[list[Image.Image]]]) -> None:
+                try:
+                    chained.set_result(converted.result())
+                except BaseException as exc:
+                    chained.set_exception(exc)
+
+            postprocess.add_done_callback(on_postprocess)
+
+        decode_future.add_done_callback(on_decode)
+        return chained
+
+    def _submit_frame_postprocess(self, decoded: torch.Tensor) -> concurrent.futures.Future[list[list[Image.Image]]]:
+        """Convert one decoded GPU batch outside the model scheduler thread."""
+
+        self._postprocess_slots.acquire()
+
+        def convert() -> list[list[Image.Image]]:
+            try:
+                converter = getattr(self.pipeline, "tensor2video_batch", None)
+                if not callable(converter):
+                    # Keep lightweight test adapters and older model plugins
+                    # compatible while the native ABot pipeline uses the
+                    # single-transfer implementation.
+                    return [self.pipeline.tensor2video(decoded[index]) for index in range(decoded.shape[0])]
+                return converter(decoded)
+            finally:
+                self._postprocess_slots.release()
+
+        try:
+            return self._postprocess_executor.submit(convert)
+        except BaseException:
+            self._postprocess_slots.release()
+            raise
+
+    def _drain_async_output(self, state: _ABotWorldLiveKitSession) -> None:
+        """Publish completed frame conversions in per-session sequence order."""
+
+        while True:
+            with state.lock:
+                if not state.pending_async_outputs:
+                    return
+                pending = state.pending_async_outputs[0]
+                if not pending.future.done():
+                    return
+                state.pending_async_outputs.popleft()
+            try:
+                converted = pending.future.result()
+                frames = converted[pending.batch_index]
+                payload = dict(pending.payload)
+                payload["frames"] = frames
+                self._put_output(state, payload)
+            except Exception as exc:
+                logger.exception("ABot output postprocess failed for session %s", state.session_id)
+                with state.lock:
+                    state.last_error = str(exc)
+                self._put_output(
+                    state,
+                    {"type": "error", "error": str(exc), "timestamp": time.time()},
+                )
+
     def _execute_batch(
         self,
         batch: Sequence[_ABotWorldLiveKitSession],
@@ -2336,6 +2540,7 @@ class ABotWorldLiveKitService:
         model_started_wall_time: float | None = None
         control_latent_frames: int | None = None
         fidelity: ABotWorldFidelity | None = None
+        raw_generated: ABotWorldGeneratedBatch | None = None
         if members is None:
             execution_members = tuple(
                 _PolicyBatchMember(
@@ -2371,10 +2576,22 @@ class ABotWorldLiveKitService:
                 fidelity = ABotWorldFidelity.from_profile_name(fidelity_name)
             model_started_at = time.monotonic()
             model_started_wall_time = time.time()
-            if len(batch) == 1:
-                generate_kwargs = {"control_latent_frames": control_latent_frames}
-                if fidelity is not None:
-                    generate_kwargs["fidelity"] = fidelity
+            generate_kwargs = {"control_latent_frames": control_latent_frames}
+            if fidelity is not None:
+                generate_kwargs["fidelity"] = fidelity
+            raw_generator = getattr(self.pipeline, "generate_next_blocks_raw", None)
+            if callable(raw_generator):
+                raw_generated = raw_generator(
+                    [state.pipeline_session for state in batch],
+                    list(controls),
+                    **generate_kwargs,
+                )
+                # Every rank participates in model execution, but only the
+                # output rank owns decoded RGB frames.  Keep the historical
+                # empty result contract on other ranks and never submit an
+                # empty decoded tensor to the host postprocess executor.
+                results = None if self.pipeline.is_output_rank else [[] for _ in batch]
+            elif len(batch) == 1:
                 results = [
                     self.pipeline.generate_next_block(
                         batch[0].pipeline_session,
@@ -2383,9 +2600,6 @@ class ABotWorldLiveKitService:
                     )
                 ]
             else:
-                generate_kwargs = {"control_latent_frames": control_latent_frames}
-                if fidelity is not None:
-                    generate_kwargs["fidelity"] = fidelity
                 results = self.pipeline.generate_next_blocks(
                     [state.pipeline_session for state in batch],
                     list(controls),
@@ -2445,9 +2659,19 @@ class ABotWorldLiveKitService:
             self._batch_item_count += len(batch)
             self._maximum_batch_size = max(self._maximum_batch_size, len(batch))
             pending_outputs: list[tuple[_ABotWorldLiveKitSession, dict[str, Any]]] = []
-            for trace, state, frames, applied_controls, executed_job_id in zip(
-                session_traces, batch, results, controls, executed_motivation_job_ids, strict=True
+            async_output_entries: list[tuple[_ABotWorldLiveKitSession, _AsyncChunkOutput]] = []
+            postprocess_future = (
+                self._submit_frame_postprocess(raw_generated.decoded)
+                if raw_generated is not None and self.pipeline.is_output_rank
+                else None
+            )
+            for batch_index, (trace, state, applied_controls, executed_job_id) in enumerate(
+                zip(session_traces, batch, controls, executed_motivation_job_ids, strict=True)
             ):
+                frames = results[batch_index] if results is not None else None
+                frame_count = (
+                    len(frames) if frames is not None else int(raw_generated.frames_per_session)  # type: ignore[union-attr]
+                )
                 # Resolve the provider key before taking the per-session lock.
                 # The default provider looks the session up under
                 # ``_sessions_lock``; doing that while holding ``state.lock``
@@ -2468,7 +2692,10 @@ class ABotWorldLiveKitService:
                         "fps": int(state.config["fps"]),
                         "timestamp": time.time(),
                         "controls": sorted(applied_controls),
-                        "frames": frames,
+                        # Deferred native output is filled by the ordered
+                        # conversion callback below. Legacy adapters retain
+                        # the synchronous frame list here.
+                        "frames": frames if frames is not None else None,
                         "scheduler": {
                             "batch_size": len(batch),
                             "fidelity": fidelity.name if fidelity is not None else None,
@@ -2485,7 +2712,7 @@ class ABotWorldLiveKitService:
                             **self._last_stage_metrics,
                         },
                     }
-                    chunk_duration_seconds = max(1, len(frames)) / int(state.config["fps"])
+                    chunk_duration_seconds = max(1, frame_count) / int(state.config["fps"])
                     previous_compute_seconds = state.last_compute_seconds
                     state.next_chunk_index += 1
                     state.next_playout_deadline = (
@@ -2515,7 +2742,7 @@ class ABotWorldLiveKitService:
                     self._finish_dispatch_session_trace(
                         trace,
                         state,
-                        frames,
+                        frame_count,
                         compatibility_key=compatibility_key,
                     )
                 # A policy lease represents one model invocation. Clear the
@@ -2533,7 +2760,21 @@ class ABotWorldLiveKitService:
                         state.motivation_job_id = None
                         state.motivation_kind = None
                         state.motivation_fidelity = None
-                pending_outputs.append((state, payload))
+                if postprocess_future is None:
+                    pending_outputs.append((state, payload))
+                else:
+                    payload.pop("frames", None)
+                    async_output_entries.append(
+                        (
+                            state,
+                            _AsyncChunkOutput(
+                                future=postprocess_future,
+                                batch_index=batch_index,
+                                frame_count=frame_count,
+                                payload=payload,
+                            ),
+                        )
+                    )
             # The model invocation is complete for every member at this point.
             # Clear the whole physical batch before exposing any output to the
             # parent bridge; otherwise its completion callback can reserve the
@@ -2561,6 +2802,17 @@ class ABotWorldLiveKitService:
             )
             for state, payload in pending_outputs:
                 self._put_output(state, payload)
+            if async_output_entries:
+                # Append all entries before registering callbacks. If the
+                # conversion finishes immediately, callback execution still
+                # observes the complete per-session ordering queue.
+                for state, pending in async_output_entries:
+                    with state.lock:
+                        state.pending_async_outputs.append(pending)
+                for state, _ in async_output_entries:
+                    postprocess_future.add_done_callback(  # type: ignore[union-attr]
+                        lambda _future, target=state: self._drain_async_output(target)
+                    )
         finally:
             with self._scheduler_condition:
                 for state in batch:
@@ -2582,14 +2834,9 @@ class ABotWorldLiveKitService:
                 return False
             scheduler_metadata = payload.get("scheduler")
             motivation_kind = (
-                str(scheduler_metadata.get("motivation_kind", ""))
-                if isinstance(scheduler_metadata, Mapping)
-                else ""
+                str(scheduler_metadata.get("motivation_kind", "")) if isinstance(scheduler_metadata, Mapping) else ""
             )
-            is_idle_chunk = (
-                payload_type == "chunk"
-                and motivation_kind == "idle"
-            )
+            is_idle_chunk = payload_type == "chunk" and motivation_kind == "idle"
             is_action_chunk = payload_type == "chunk" and motivation_kind == "action"
             if _hold_idle and is_idle_chunk and (state.hold_idle_output or state.idle_resume_pending):
                 # The scheduler allows only one outstanding idle chunk per
@@ -2716,11 +2963,13 @@ class ABotWorldLiveKitService:
         """Return Fq: generated chunk frames not yet dequeued by the publisher."""
 
         with state.output_queue.mutex:
-            return sum(
+            queued = sum(
                 cls._payload_frame_count(item)
                 for item in state.output_queue.queue
                 if isinstance(item, Mapping) and item.get("type") == "chunk"
             )
+        with state.lock:
+            return queued + sum(item.frame_count for item in state.pending_async_outputs)
 
     def _uses_publisher_frame_credit(self, state: _ABotWorldLiveKitSession) -> bool:
         """Whether this continuation has an authoritative publisher credit."""
@@ -2797,7 +3046,7 @@ class ABotWorldLiveKitService:
         with self._scheduler_condition, state.lock:
             return {
                 "in_flight": bool(state.in_flight),
-                "output_queue_empty": state.output_queue.empty(),
+                "output_queue_empty": state.output_queue.empty() and not state.pending_async_outputs,
                 "held_idle_payloads": len(state.held_idle_payloads),
                 "output_queue_discardable": state.config.get("delivery_mode", "latest") != "lossless",
                 "publisher_unsubmitted_frames": int(state.publisher_unsubmitted_frames),

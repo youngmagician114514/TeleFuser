@@ -18,6 +18,8 @@ from einops import rearrange
 
 from telefuser.core.base_model import BaseModel
 from telefuser.core.config import AttentionConfig
+from telefuser.distributed.latent_parallel import LatentParallelRuntime
+from telefuser.distributed.latent_tasks import LatentTaskExchange
 from telefuser.ops.attention import attention as attention_fn
 from telefuser.ops.normalization import LayerNorm, RMSNorm
 
@@ -98,6 +100,32 @@ def _rope_apply_static(
     ).reshape(sequence_length, 1, -1)
     rotated = torch.view_as_real(
         torch.view_as_complex(x.float().reshape(x.shape[0], sequence_length, x.shape[2], -1, 2)) * expanded
+    ).flatten(3)
+    return rotated.to(dtype=x.dtype)
+
+
+def _rope_apply_rows(
+    x: torch.Tensor,
+    grid_size: tuple[int, int, int],
+    freqs: torch.Tensor,
+    frame_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Apply per-task temporal positions while preserving each full spatial grid."""
+    frames, height, width = grid_size
+    batch, sequence, heads, head_dim = x.shape
+    half_dim = head_dim // 2
+    spatial_dim = half_dim // 3
+    freq_t, freq_h, freq_w = freqs.split([half_dim - 2 * spatial_dim, spatial_dim, spatial_dim], dim=1)
+    expanded = torch.cat(
+        [
+            freq_t[frame_indices].view(batch, frames, 1, 1, -1).expand(-1, -1, height, width, -1),
+            freq_h[:height].view(1, 1, height, 1, -1).expand(batch, frames, -1, width, -1),
+            freq_w[:width].view(1, 1, 1, width, -1).expand(batch, frames, height, -1, -1),
+        ],
+        dim=-1,
+    ).reshape(batch, sequence, 1, half_dim)
+    rotated = torch.view_as_real(
+        torch.view_as_complex(x.float().reshape(batch, sequence, heads, half_dim, 2)) * expanded
     ).flatten(3)
     return rotated.to(dtype=x.dtype)
 
@@ -189,15 +217,23 @@ class CausalWanSelfAttention(nn.Module):
         value: torch.Tensor,
         current_start: int,
         frame_tokens: int,
+        *,
+        previous_indices: tuple[int, int] | None = None,
+        window: tuple[int, int] | None = None,
+        publish_cursors: bool = True,
     ) -> tuple[int, int]:
         """Store a block and return its local start/end positions."""
         token_count = key.shape[1]
         current_end = current_start + token_count
-        global_end = self._cursor(cache, "global_end_index")
-        local_end = self._cursor(cache, "local_end_index")
+        if previous_indices is None:
+            global_end = self._cursor(cache, "global_end_index")
+            local_end = self._cursor(cache, "local_end_index")
+        else:
+            global_end, local_end = previous_indices
         capacity = cache["k"].shape[1]
-        sink_tokens = self.sink_size * frame_tokens
-        if self.local_attn_size != -1 and current_end > global_end and token_count + local_end > capacity:
+        local_window, sink = window if window is not None else (self.local_attn_size, self.sink_size)
+        sink_tokens = sink * frame_tokens
+        if local_window != -1 and current_end > global_end and token_count + local_end > capacity:
             evicted = token_count + local_end - capacity
             rolled = local_end - evicted - sink_tokens
             if rolled < 0:
@@ -216,8 +252,9 @@ class CausalWanSelfAttention(nn.Module):
             raise RuntimeError(f"ABot KV cache write [{local_start}:{local_end}] exceeds capacity {capacity}")
         cache["k"][:, local_start:local_end].copy_(key.detach())
         cache["v"][:, local_start:local_end].copy_(value)
-        self._set_cursor(cache, "global_end_index", current_end)
-        self._set_cursor(cache, "local_end_index", local_end)
+        if publish_cursors:
+            self._set_cursor(cache, "global_end_index", current_end)
+            self._set_cursor(cache, "local_end_index", local_end)
         return local_start, local_end
 
     def forward_steady_state(
@@ -316,6 +353,7 @@ class CausalWanSelfAttention(nn.Module):
         freqs: torch.Tensor,
         kv_cache: dict[str, Any],
         current_start: int,
+        previous_indices: tuple[int, int] | None = None,
     ) -> torch.Tensor:
         batch, tokens, _ = x.shape
         frames, height, width = grid_size
@@ -325,7 +363,9 @@ class CausalWanSelfAttention(nn.Module):
         query = rearrange(self.norm_q(self.q(x)), "b s (h d) -> b s h d", h=self.num_heads)
         key = rearrange(self.norm_k(self.k(x)), "b s (h d) -> b s h d", h=self.num_heads)
         value = rearrange(self.v(x), "b s (h d) -> b s h d", h=self.num_heads)
-        local_start, local_end = self._update_cache(kv_cache, key, value, current_start, frame_tokens)
+        local_start, local_end = self._update_cache(
+            kv_cache, key, value, current_start, frame_tokens, previous_indices=previous_indices
+        )
         # A non-zero sink occupies the prefix of the fixed KV allocation.  The
         # remainder has already been compacted by _update_cache into a rolling
         # tail, so both pieces must stay visible to attention.
@@ -381,6 +421,205 @@ class CausalWanSelfAttention(nn.Module):
         )
         return self.o(rearrange(output, "b s h d -> b s (h d)"))
 
+    def _forward_paged_jobs(
+        self,
+        x: torch.Tensor,
+        grid_size: tuple[int, int, int],
+        freqs: torch.Tensor,
+        cache: dict[str, Any],
+    ) -> torch.Tensor:
+        """Attend with sibling query sequences and one history per Job."""
+        rows, tokens, _ = x.shape
+        frames = cache["sibling_frames"]
+        jobs, height, width = rows // frames, grid_size[1], grid_size[2]
+        frame_tokens = height * width
+
+        def pack(value: torch.Tensor) -> torch.Tensor:
+            return value.index_select(0, cache["query_rows"]).reshape(jobs, frames * tokens, *value.shape[2:])
+
+        key = pack(rearrange(self.norm_k(self.k(x)), "b s (h d) -> b s h d", h=self.num_heads))
+        value = pack(rearrange(self.v(x), "b s (h d) -> b s h d", h=self.num_heads))
+        query = pack(rearrange(self.norm_q(self.q(x)), "b s (h d) -> b s h d", h=self.num_heads))
+        layer = cache["layer_index"]
+        states = cache["paged_jobs"]
+        for job, state in enumerate(states):
+            state.write_layer(layer, key[job : job + 1], value[job : job + 1])
+        segments = []
+        for job, state in enumerate(states):
+            geometry = (len(state.table), 0 if self.use_relative_rope else state.global_end // frame_tokens)
+            if segments and segments[-1][1] == job and segments[-1][2] == geometry:
+                segments[-1] = (segments[-1][0], job + 1, geometry)
+            else:
+                segments.append((job, job + 1, geometry))
+        outputs = []
+        for begin, end, (visible_frames, global_frame_end) in segments:
+            # Only one layer is gathered. Historical KV remains in its
+            # physical pages across batch membership and phase changes.
+            cached_key, cached_value = (
+                torch.cat([page for state in states[begin:end] for page in state.layer_pages(layer, field)]).reshape(
+                    end - begin, visible_frames * frame_tokens, self.num_heads, -1
+                )
+                for field in (0, 1)
+            )
+            first = visible_frames - frames if self.use_relative_rope else global_frame_end - frames
+            if self.use_relative_rope:
+                cached_key = _rope_apply_static(
+                    cached_key,
+                    (visible_frames, height, width),
+                    freqs,
+                    torch.arange(visible_frames, device=x.device),
+                )
+            group_query = _rope_apply_static(
+                query[begin:end],
+                (frames, height, width),
+                freqs,
+                torch.arange(first, first + frames, device=x.device),
+            )
+            outputs.append(
+                attention_fn(
+                    group_query,
+                    cached_key,
+                    cached_value,
+                    attention_config=self.attention_config,
+                    input_layout="BSND",
+                    output_layout="BSND",
+                )
+            )
+        output = torch.cat(outputs).reshape(rows, tokens, self.num_heads, -1)
+        return self.o(rearrange(output.index_select(0, cache["restore_rows"]), "b s h d -> b s (h d)"))
+
+    def forward_latent_parallel(
+        self,
+        x: torch.Tensor,
+        grid_size: tuple[int, int, int],
+        freqs: torch.Tensor,
+        kv_cache: dict[str, Any],
+        current_start: int,
+        runtime: LatentParallelRuntime | LatentTaskExchange,
+        previous_indices: tuple[int, int],
+    ) -> torch.Tensor:
+        """Run local queries while exchanging only the current K/V frame shard."""
+        batch, tokens, _ = x.shape
+        frames, height, width = grid_size
+        frame_tokens = height * width
+        if tokens != frames * frame_tokens:
+            raise ValueError("ABot latent-parallel attention received inconsistent grid size")
+        if "paged_jobs" in kv_cache:
+            return self._forward_paged_jobs(x, grid_size, freqs, kv_cache)
+        key = rearrange(self.norm_k(self.k(x)), "b s (h d) -> b s h d", h=self.num_heads)
+        key_wait = runtime.gather_current_async(key, name="key")
+        value = rearrange(self.v(x), "b s (h d) -> b s h d", h=self.num_heads)
+        value_wait = runtime.gather_current_async(value, name="value")
+        query = rearrange(self.norm_q(self.q(x)), "b s (h d) -> b s h d", h=self.num_heads)
+        current_key, current_value = key_wait(), value_wait()
+        if isinstance(runtime, LatentTaskExchange) and runtime.attention_groups:
+            segments = []
+            for begin, end, metadata in runtime.attention_groups:
+                window, sink, start, global_end, local_end = metadata
+                group_cache = {
+                    **kv_cache,
+                    "k": kv_cache["k"][begin:end, : window * frame_tokens],
+                    "v": kv_cache["v"][begin:end, : window * frame_tokens],
+                }
+                local_start, updated_end = self._update_cache(
+                    group_cache,
+                    current_key[begin:end],
+                    current_value[begin:end],
+                    start,
+                    frame_tokens,
+                    previous_indices=(global_end, local_end),
+                    window=(window, sink),
+                    publish_cursors=False,
+                )
+                # Append/refinement may update KV differently while producing
+                # the same attention geometry. Merge adjacent rows after the
+                # independent writes, without padding their visible histories.
+                geometry = (local_start, updated_end, 0 if self.use_relative_rope else start)
+                if segments and segments[-1][1] == begin and segments[-1][2] == geometry:
+                    segments[-1] = (segments[-1][0], end, geometry)
+                else:
+                    segments.append((begin, end, geometry))
+            outputs = []
+            for begin, end, (local_start, updated_end, start) in segments:
+                visible_frames = updated_end // frame_tokens
+                cached_key = kv_cache["k"][begin:end, :updated_end]
+                cached_value = kv_cache["v"][begin:end, :updated_end]
+                group_query = query[begin:end]
+                if self.use_relative_rope:
+                    cached_key = _rope_apply_static(
+                        cached_key,
+                        (visible_frames, height, width),
+                        freqs,
+                        torch.arange(visible_frames, device=x.device),
+                    )
+                    query_start = local_start // frame_tokens
+                    indices = query_start + runtime.frame_indices[begin:end, None]
+                else:
+                    indices = start // frame_tokens + runtime.frame_indices[begin:end, None]
+                group_query = _rope_apply_rows(group_query, grid_size, freqs, indices)
+                outputs.append(
+                    attention_fn(
+                        group_query,
+                        cached_key,
+                        cached_value,
+                        attention_config=self.attention_config,
+                        input_layout="BSND",
+                        output_layout="BSND",
+                    )
+                )
+            return self.o(rearrange(torch.cat(outputs), "b s h d -> b s (h d)"))
+        local_start, local_end = self._update_cache(
+            kv_cache, current_key, current_value, current_start, frame_tokens, previous_indices=previous_indices
+        )
+        if self.local_attn_size == -1 or self.sink_size:
+            visible_start = 0
+        else:
+            visible_start = max(0, local_end - self.local_attn_size * frame_tokens)
+        visible_tokens = local_end - visible_start
+        if visible_tokens % frame_tokens:
+            raise RuntimeError("ABot latent-parallel KV cache lost frame alignment")
+        visible_frames = visible_tokens // frame_tokens
+        cached_key = kv_cache["k"][:, visible_start:local_end]
+        cached_value = kv_cache["v"][:, visible_start:local_end]
+        task_rows = isinstance(runtime, LatentTaskExchange)
+        if self.use_relative_rope:
+            cache_indices = torch.arange(visible_frames, device=x.device)
+            if visible_frames > freqs.shape[0]:
+                raise ValueError("ABot visible KV frames exceed the RoPE table")
+            cached_key = _rope_apply_static(cached_key, (visible_frames, height, width), freqs, cache_indices)
+            query_start = (
+                local_start // frame_tokens
+                if self.sink_size
+                else visible_frames - (runtime.frames_per_chunk if task_rows else frames * runtime.world_size)
+            )
+            if task_rows:
+                query_indices = query_start + runtime.frame_indices[:, None]
+                query = _rope_apply_rows(query, grid_size, freqs, query_indices)
+            else:
+                query_indices = query_start + runtime.rank * frames + torch.arange(frames, device=x.device)
+                query = _rope_apply_static(query, grid_size, freqs, query_indices)
+        else:
+            start_frame = current_start // frame_tokens
+            if task_rows:
+                query = _rope_apply_rows(query, grid_size, freqs, start_frame + runtime.frame_indices[:, None])
+            else:
+                start_frame += runtime.rank * frames
+            if start_frame + (runtime.frames_per_chunk if task_rows else frames) > freqs.shape[0]:
+                raise ValueError("ABot query frames exceed the RoPE table")
+            if not task_rows:
+                query = _rope_apply_static(
+                    query, grid_size, freqs, torch.arange(start_frame, start_frame + frames, device=x.device)
+                )
+        output = attention_fn(
+            query,
+            cached_key,
+            cached_value,
+            attention_config=self.attention_config,
+            input_layout="BSND",
+            output_layout="BSND",
+        )
+        return self.o(rearrange(output, "b s h d -> b s (h d)"))
+
 
 class CausalWanCrossAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, eps: float = 1e-6) -> None:
@@ -396,14 +635,46 @@ class CausalWanCrossAttention(nn.Module):
 
     def forward(self, x: torch.Tensor, context: torch.Tensor, cache: dict[str, Any]) -> torch.Tensor:
         query = rearrange(self.norm_q(self.q(x)), "b s (h d) -> b s h d", h=self.num_heads)
+        query_shape = query.shape
+        if "query_rows" in cache:
+            frames = cache["sibling_frames"]
+            query = query.index_select(0, cache["query_rows"]).reshape(
+                query.shape[0] // frames, frames * query.shape[1], *query.shape[2:]
+            )
+            context = context.index_select(0, cache["context_rows"])
+        if "paged_jobs" in cache:
+            layer = cache["layer_index"]
+            states = cache["paged_jobs"]
+            for job, state in enumerate(states):
+                if not state.cross_ready[layer]:
+                    prompt = context[job : job + 1]
+                    state.cross(layer, 0).copy_(
+                        rearrange(self.norm_k(self.k(prompt)), "b s (h d) -> b s h d", h=self.num_heads)
+                    )
+                    state.cross(layer, 1).copy_(rearrange(self.v(prompt), "b s (h d) -> b s h d", h=self.num_heads))
+                    state.cross_ready[layer] = True
+            output = attention_fn(
+                query,
+                torch.cat([state.cross(layer, 0) for state in states]),
+                torch.cat([state.cross(layer, 1) for state in states]),
+                attention_config=self.attention_config,
+                input_layout="BSND",
+                output_layout="BSND",
+            )
+            output = output.reshape(query_shape).index_select(0, cache["restore_rows"])
+            return self.o(rearrange(output, "b s h d -> b s (h d)"))
         if not bool(cache["is_init"]):
-            key = rearrange(self.norm_k(self.k(context)), "b s (h d) -> b s h d", h=self.num_heads)
-            value = rearrange(self.v(context), "b s (h d) -> b s h d", h=self.num_heads)
-            if cache["k"].shape[1] < key.shape[1]:
+            if cache["k"].shape[1] < context.shape[1]:
                 raise ValueError("ABot cross-attention cache is shorter than the text sequence")
-            cache["k"][:, : key.shape[1]].copy_(key)
-            cache["v"][:, : value.shape[1]].copy_(value)
-            cache["sequence_length"] = key.shape[1]
+            # A latent-step batch can mix new and retained sessions. Initialize
+            # only the new contiguous row spans; retained prompt KV is immutable.
+            for begin, end in cache.get("initialize_rows", ((0, context.shape[0]),)):
+                prompt = context[begin:end]
+                key = rearrange(self.norm_k(self.k(prompt)), "b s (h d) -> b s h d", h=self.num_heads)
+                value = rearrange(self.v(prompt), "b s (h d) -> b s h d", h=self.num_heads)
+                cache["k"][begin:end, : key.shape[1]].copy_(key)
+                cache["v"][begin:end, : value.shape[1]].copy_(value)
+            cache["sequence_length"] = context.shape[1]
             cache["is_init"] = True
         length = int(cache["sequence_length"])
         output = attention_fn(
@@ -414,6 +685,8 @@ class CausalWanCrossAttention(nn.Module):
             input_layout="BSND",
             output_layout="BSND",
         )
+        if "query_rows" in cache:
+            output = output.reshape(query_shape).index_select(0, cache["restore_rows"])
         return self.o(rearrange(output, "b s h d -> b s (h d)"))
 
     def forward_steady_state(
@@ -474,6 +747,8 @@ class CausalWanAttentionBlock(nn.Module):
         kv_cache: dict[str, Any],
         crossattn_cache: dict[str, Any],
         current_start: int,
+        latent_parallel: LatentParallelRuntime | LatentTaskExchange | None = None,
+        previous_indices: tuple[int, int] | None = None,
     ) -> torch.Tensor:
         frames, height, width = grid_size
         frame_tokens = height * width
@@ -482,7 +757,15 @@ class CausalWanAttentionBlock(nn.Module):
         ).chunk(6, dim=2)
         normed = self.norm1(x).unflatten(1, (frames, frame_tokens))
         attention_input = (normed * (1 + scale_msa) + shift_msa).flatten(1, 2)
-        attention = self.self_attn(attention_input, grid_size, freqs, kv_cache, current_start)
+        if latent_parallel is None:
+            attention = self.self_attn(
+                attention_input, grid_size, freqs, kv_cache, current_start, previous_indices=previous_indices
+            )
+        else:
+            assert previous_indices is not None
+            attention = self.self_attn.forward_latent_parallel(
+                attention_input, grid_size, freqs, kv_cache, current_start, latent_parallel, previous_indices
+            )
         x = x + (attention.unflatten(1, (frames, frame_tokens)) * gate_msa).flatten(1, 2)
         x = x + self.cross_attn(self.norm3(x), context, crossattn_cache)
         normed = self.norm2(x).unflatten(1, (frames, frame_tokens))
@@ -609,6 +892,11 @@ class ABotWorldDiT(BaseModel):
         )
         self.freqs = torch.cat(precompute_freqs_cis_3d(dim // num_heads), dim=1)
         self._freqs_by_device: dict[tuple[str, int | None], torch.Tensor] = {}
+        self._latent_parallel_runtime: LatentParallelRuntime | None = None
+
+    def set_latent_parallel_runtime(self, runtime: LatentParallelRuntime | None) -> None:
+        """Enable or disable frame-aligned latent parallel execution."""
+        self._latent_parallel_runtime = runtime
 
     def set_causal_attention_window(self, local_attn_size: int, sink_size: int = 0) -> None:
         if local_attn_size < 1:
@@ -736,6 +1024,9 @@ class ABotWorldDiT(BaseModel):
         current_start: int,
         act_context_scale: float = 1.0,
         layer_readiness: LayerReadiness | None = None,
+        latent_parallel: bool = False,
+        cache_indices: tuple[int, int] | None = None,
+        latent_task_runtime: LatentTaskExchange | None = None,
     ) -> torch.Tensor:
         if x.ndim != 5 or timestep.ndim != 2:
             raise ValueError("ABot expects x=[B,C,F,H,W] and timestep=[B,F]")
@@ -759,10 +1050,21 @@ class ABotWorldDiT(BaseModel):
         time_modulation = self.time_projection(time_embedding).unflatten(2, (6, self.dim))
         context = self.text_embedding(context)
         freqs = self._frequencies(tokens.device)
+        runtime = latent_task_runtime or (self._latent_parallel_runtime if latent_parallel else None)
+        if latent_parallel and runtime is None:
+            raise RuntimeError("ABot latent-parallel runtime is not configured")
+        previous_indices = cache_indices
         for index, block in enumerate(self.blocks):
             if layer_readiness is not None:
                 compute_stream = torch.cuda.current_stream(tokens.device) if tokens.device.type == "cuda" else None
                 layer_readiness.wait_layer(index, stream=compute_stream)
+            if runtime is not None and previous_indices is None and index == 0:
+                # All layers advance together. Read the shared position once,
+                # after any incoming first-layer transfer is ready.
+                previous_indices = (
+                    CausalWanSelfAttention._cursor(kv_cache[0], "global_end_index"),
+                    CausalWanSelfAttention._cursor(kv_cache[0], "local_end_index"),
+                )
             tokens = block(
                 tokens,
                 time_modulation,
@@ -772,8 +1074,82 @@ class ABotWorldDiT(BaseModel):
                 kv_cache[index],
                 crossattn_cache[index],
                 current_start,
+                latent_parallel=runtime,
+                previous_indices=previous_indices,
             )
         return self._unpatchify(self.head(tokens, time_embedding.unsqueeze(2)), grid_size)
+
+    def forward_latent_tasks(
+        self,
+        *,
+        x: torch.Tensor,
+        timestep: torch.Tensor,
+        context: torch.Tensor,
+        act_context: torch.Tensor,
+        kv_cache: list[dict[str, Any]],
+        crossattn_cache: list[dict[str, Any]],
+        current_start: int,
+        cache_indices: tuple[int, int],
+        exchange: LatentTaskExchange,
+    ) -> torch.Tensor:
+        """Run a physical batch whose rows are whole latent-step tasks.
+
+        Even a rank with no local tasks participates in the current-K/V
+        exchanges. It does not run convolutions, attention, or FFN for padding.
+        """
+        if x.shape[2] != 1:
+            raise ValueError("Each latent-step task must contain exactly one whole latent")
+        if not x.shape[0]:
+            tokens = (x.shape[-2] // self.patch_size[1]) * (x.shape[-1] // self.patch_size[2])
+            empty = x.new_empty((0, tokens, self.num_heads, self.dim // self.num_heads))
+            for _ in self.blocks:
+                key_wait = exchange.gather_current_async(empty, name="key")
+                value_wait = exchange.gather_current_async(empty, name="value")
+                key_wait()
+                value_wait()
+            return x.new_empty((0, self.out_dim, 1, *x.shape[-2:]))
+        return self(
+            x=x,
+            timestep=timestep,
+            context=context,
+            act_context=act_context,
+            kv_cache=kv_cache,
+            crossattn_cache=crossattn_cache,
+            current_start=current_start,
+            cache_indices=cache_indices,
+            latent_task_runtime=exchange,
+        )
+
+    def forward_latent_parallel(
+        self,
+        x: torch.Tensor,
+        timestep: torch.Tensor,
+        context: torch.Tensor,
+        act_context: torch.Tensor,
+        kv_cache: list[dict[str, Any]],
+        crossattn_cache: list[dict[str, Any]],
+        current_start: int,
+        act_context_scale: float = 1.0,
+        layer_readiness: LayerReadiness | None = None,
+    ) -> torch.Tensor:
+        """Run a frame-sharded forward while keeping the latent local.
+
+        The model weights and historical KV are replicated. Each rank computes
+        only its current frame shard, exchanges current K/V once per layer,
+        and returns a local output shard. The caller gathers only at chunk end.
+        """
+        return self(
+            x=x,
+            timestep=timestep,
+            context=context,
+            act_context=act_context,
+            kv_cache=kv_cache,
+            crossattn_cache=crossattn_cache,
+            current_start=current_start,
+            act_context_scale=act_context_scale,
+            layer_readiness=layer_readiness,
+            latent_parallel=True,
+        )
 
     @staticmethod
     def state_dict_converter() -> "ABotWorldDiTStateDictConverter":

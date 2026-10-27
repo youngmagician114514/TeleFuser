@@ -82,7 +82,7 @@ def test_action_context_rejects_unknown_keys() -> None:
                     parallel_config=ParallelConfig(device_ids=[0, 1], dp_degree=2),
                 )
             ),
-            "exactly one GPU",
+            "latent_parallel_enabled",
         ),
         (ABotWorldPipelineConfig(latent_frames=2), "1 mod 3"),
         (ABotWorldPipelineConfig(local_attn_size=6, sink_size=6), "smaller than local_attn_size"),

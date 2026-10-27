@@ -13,6 +13,7 @@ from telefuser.service.security.security_validator import SecurityLevel
 from telefuser.utils.logging import logger
 
 from .config import LiveKitServeConfig
+from .distributed_worker_pool import DistributedLiveKitWorkerPool
 from .metrics import LiveKitServingMetrics
 from .motivation_controller import MotivationRuntimeController
 from .motivation_execution import MotivationExecutionBridge, release_on_control_state
@@ -49,7 +50,6 @@ from .turboserve import (
     TurboServeWorkerLoad,
 )
 from .worker_pool import InProcessLiveKitWorkerPool, WorkerPool
-from .distributed_worker_pool import DistributedLiveKitWorkerPool
 
 
 @dataclass(frozen=True)
@@ -83,9 +83,7 @@ class _RuntimeSessionStateTransferBackend:
             if request.crosses_node:
                 remote_migrate = getattr(self._runtime.worker_pool, "migrate_session_remote", None)
                 if not callable(remote_migrate):
-                    raise RuntimeError(
-                        "cross-node session migration requires a WorkerPool.migrate_session_remote hook"
-                    )
+                    raise RuntimeError("cross-node session migration requires a WorkerPool.migrate_session_remote hook")
                 return await remote_migrate(NodeAgentMigrationRequest.from_transfer_request(request))
             return await self._runtime.migrate_session(
                 request.session_id,
@@ -192,9 +190,7 @@ class LiveKitServeRuntime:
         self.config = config
         self.pipeline_file = pipeline_file
         self.registry = registry or SessionRegistry()
-        scheduler_endpoints = (
-            config.cluster_worker_endpoints() if config.cluster_world_size > 1 else None
-        )
+        scheduler_endpoints = config.cluster_worker_endpoints() if config.cluster_world_size > 1 else None
         self.scheduler = scheduler or LiveKitScheduler(
             num_workers=len(scheduler_endpoints) if scheduler_endpoints is not None else config.num_workers,
             gpu_groups=None if scheduler_endpoints is not None else config.worker_gpu_groups(),
@@ -509,6 +505,7 @@ class LiveKitServeRuntime:
         job_ids: tuple[str, ...] = (),
         session_ids: tuple[str, ...] = (),
         compatibility_keys: dict[str, str] | None = None,
+        profile_timings: tuple[dict[str, object], ...] = (),
     ) -> None:
         """Release GPU policy reservations at child model completion."""
         bridge = self._motivation_bridge
@@ -517,6 +514,7 @@ class LiveKitServeRuntime:
                 job_ids=job_ids,
                 session_ids=session_ids,
                 compatibility_keys=compatibility_keys,
+                profile_timings=profile_timings,
             )
 
     def on_model_output(
@@ -753,8 +751,7 @@ class LiveKitServeRuntime:
         missing = sorted(worker_ids - controller_gpu_ids)
         if missing:
             raise ValueError(
-                "Motivation controller must register every LiveKit worker GPU; "
-                f"missing {', '.join(missing)}"
+                f"Motivation controller must register every LiveKit worker GPU; missing {', '.join(missing)}"
             )
 
     def _dispatch_motivation_batch(self, lease, payloads) -> None:

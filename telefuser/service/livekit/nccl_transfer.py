@@ -476,8 +476,7 @@ def flatten_tensor_tree_with_layout(
                 raise ValueError(f"mapping layout changed at {item_path!r}")
             return {
                 "__dict__": {
-                    key: visit(item[key], child, item_path + (key,))
-                    for key, child in template["__dict__"].items()
+                    key: visit(item[key], child, item_path + (key,)) for key, child in template["__dict__"].items()
                 }
             }
         if isinstance(template, dict) and "__list__" in template:
@@ -579,11 +578,7 @@ def select_incremental_tensor_delta(
             continue
         if not torch.equal(previous, tensor):
             changed.add(path)
-    delta_manifest = [
-        dict(entry)
-        for entry in manifest
-        if tuple(entry.get("path", ())) in changed
-    ]
+    delta_manifest = [dict(entry) for entry in manifest if tuple(entry.get("path", ())) in changed]
     return delta_manifest, {path: tensor for path, tensor in current_leaves.items() if path in changed}
 
 
@@ -630,6 +625,8 @@ def transfer_tensor_leaves_nccl_streamed(
     stream: torch.cuda.Stream | None = None,
     on_group_complete: TransferGroupCallback | None = None,
     submission_lock: threading.Lock | None = None,
+    source_ready_event: torch.cuda.Event | None = None,
+    process_group: Any | None = None,
 ) -> TensorTransferReport:
     """Transfer ordered state groups on an optional dedicated CUDA stream.
 
@@ -655,11 +652,17 @@ def transfer_tensor_leaves_nccl_streamed(
             # must be ordered before NCCL reads them. Receive buffers are fresh
             # allocations, so waiting on the target default stream would only
             # serialize SST behind unrelated inference work on that GPU.
-            stream.wait_stream(torch.cuda.default_stream(stream.device))
+            if source_ready_event is not None:
+                stream.wait_event(source_ready_event)
+            else:
+                stream.wait_stream(torch.cuda.default_stream(stream.device))
         for group in groups:
             group_started = time.monotonic()
             ordered = [leaves[path].contiguous() for path in group.paths]
-            ops = [dist.P2POp(dist.isend if send else dist.irecv, tensor, peer_rank) for tensor in ordered]
+            ops = [
+                dist.P2POp(dist.isend if send else dist.irecv, tensor, peer_rank, group=process_group)
+                for tensor in ordered
+            ]
             if ops:
                 # ``batch_isend_irecv`` updates process-group coalescing state
                 # that is not thread-safe.  Serialize only this short
